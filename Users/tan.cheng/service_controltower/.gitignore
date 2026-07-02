@@ -77,9 +77,11 @@ device_report.json
 **/enriched_data/*.csv
 **/enriched_data/*.parquet
 **/enriched_data/*.xlsx
+**/enriched_data/*.ipynb
 
 # Generated outputs
 **/data_preparation/output/
 *.parquet
 *.csv
 *.json
+
