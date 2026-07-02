@@ -1,0 +1,77 @@
+dataset,stage,column,dtype,row_count,missing_count,missing_pct,blank_or_null_string_count,non_missing_count,unique_non_missing_count,example_non_missing_values
+fault_codes,raw,bn_failure_code_id,object,682641,0,0.0,0,682641,682641,9b9530acec4737de8dc5ee09f5ee596e | e5d46f0fab0213b81adad1b0880460d8 | a5f64b02c0c850ddf0cefa8223fce558
+fault_codes,raw,serial_number,int64,682641,0,0.0,0,682641,2717,70002 | 70002 | 70002
+fault_codes,raw,full_model,object,682641,0,0.0,0,682641,5,D71PXI-24 | D71PXI-24 | D71PXI-24
+fault_codes,raw,machine_id,object,682641,0,0.0,0,682641,2717,D71PXI-24 70002 | D71PXI-24 70002 | D71PXI-24 70002
+fault_codes,raw,base_model_code_id,object,682641,0,0.0,0,682641,424,D71-DW7BKB | D71-CA1673 | D71-A1U0N3
+fault_codes,raw,abnormality_history_id,int64,682641,0,0.0,0,682641,682641,10178216344 | 10209532818 | 10210112120
+fault_codes,raw,event_time,object,682641,0,0.0,0,682641,627521,2023-05-25T19:28:06Z | 2023-10-06T12:33:25Z | 2023-10-09T16:03:44Z
+fault_codes,raw,event_date,object,682641,0,0.0,0,682641,1776,2023-05-25 | 2023-10-06 | 2023-10-09
+fault_codes,raw,fault_code,object,682641,0,0.0,0,682641,424,DW7BKB | CA1673 | A1U0N3
+fault_codes,raw,event_error_name_en,object,682641,0,0.0,0,682641,424,REVERSE FAN PUMP SOLENOID VALVE+SHORT CIRCUIT | AdBlue/DEF Level Low Error 3 | DPF+CLOGGING 1
+fault_codes,raw,event_action_level,object,682641,1,0.0001,0,682640,5,L01 | L03 | L01
+fault_codes,raw,logical_name,object,682641,1,0.0001,0,682640,5,HST | ENG/M | ENG/M
+fault_codes,raw,occurrence_count,float64,682641,0,0.0,0,682641,3861,1.0 | 2.0 | 27.0
+fault_codes,raw,log_occurrence_count,float64,682641,0,0.0,0,682641,2675,0.693 | 1.099 | 3.332
+fault_codes,raw,occurrence_boost,float64,682641,0,0.0,0,682641,4,0.0 | 0.0 | 0.0
+fault_codes,raw,occurrence_class,int64,682641,0,0.0,0,682641,5,1 | 1 | 2
+fault_codes,raw,engine_on_seconds,float64,682641,0,0.0,0,682641,21928,0.0 | 0.0 | 12900.0
+fault_codes,raw,engine_on_hours,float64,682641,0,0.0,0,682641,21928,0.0 | 0.0 | 3.583333333333333
+fault_codes,raw,engine_on_duration_class,object,682641,0,0.0,0,682641,6,NO_ENGINE_ON_DURATION | NO_ENGINE_ON_DURATION | LONG_ENGINE_ON_DURATION
+fault_codes,raw,engine_on_duration_boost,float64,682641,0,0.0,0,682641,6,0.0 | 0.0 | 0.06
+fault_codes,raw,smr_hours,float64,682641,0,0.0,0,682641,430980,575.8166666666667 | 963.3833333333332 | 976.8666666666668
+fault_codes,raw,failure_name_displayed,object,682641,0,0.0,0,682641,422,Fan Reverse Solenoid Short Circuit | DEF Level Low Error 3 | Hydrocarbon Desorb Request 1
+fault_codes,raw,applicable_component,object,682641,0,0.0,0,682641,4,HST | ENG | ENG
+fault_codes,raw,history_category,object,682641,0,0.0,0,682641,2,Electrical system | Electrical system | Electrical system
+fault_codes,raw,related_component,object,682641,0,0.0,0,682641,6,Power Train System | Urea SCR System | Urea SCR System
+fault_codes,raw,related_component_1,object,682641,376905,55.2128,0,305736,3,Power Train System | Engine | Engine
+fault_codes,raw,recommended_evidence_block,object,682641,0,0.0,0,682641,3,BN_EVD_FAULT_CODE_EVENT | BN_EVD_FAULT_CODE_EVENT | BN_EVD_FAULT_CODE_CONTEXT
+fault_codes,raw,evidence_strength_seed,float64,682641,0,0.0,0,682641,17,0.45 | 0.75 | 0.3
+fault_codes,raw,is_mechanical_failure_code,int64,682641,0,0.0,0,682641,2,0 | 0 | 0
+fault_codes,raw,is_electrical_failure_code,int64,682641,0,0.0,0,682641,2,1 | 1 | 1
+fault_codes,raw,action_level_boost,float64,682641,0,0.0,0,682641,4,0.0 | 0.07 | 0.0
+fault_codes,raw,action_level_num,int64,682641,0,0.0,0,682641,5,1 | 3 | 1
+fault_codes,raw,mechanical_electrical_boost,float64,682641,0,0.0,0,682641,2,-0.03 | -0.03 | -0.03
+fault_codes,raw,failure_code_evidence_score,float64,682641,0,0.0,0,682641,124,0.42 | 0.79 | 0.3299999999999999
+fault_codes,raw,failure_code_evidence_strength_class,object,682641,0,0.0,0,682641,4,WEAK | MEDIUM | VERY_WEAK
+fault_codes,raw,failure_code_evidence_group,object,682641,0,0.0,0,682641,3,EVENT | EVENT | CONTEXT
+fault_codes,raw,feature_domain,object,682641,0,0.0,0,682641,1,FAULT_CODE | FAULT_CODE | FAULT_CODE
+fault_codes,raw,evidence_source,object,682641,0,0.0,0,682641,1,KDS_T_ABNORMALITY_HISTORY | KDS_T_ABNORMALITY_HISTORY | KDS_T_ABNORMALITY_HISTORY
+fault_codes,cleaned,bn_failure_code_id,string,682641,0,0.0,0,682641,682641,9b9530acec4737de8dc5ee09f5ee596e | e5d46f0fab0213b81adad1b0880460d8 | a5f64b02c0c850ddf0cefa8223fce558
+fault_codes,cleaned,serial_number,int64,682641,0,0.0,0,682641,2717,70002 | 70002 | 70002
+fault_codes,cleaned,full_model,string,682641,0,0.0,0,682641,5,D71PXI-24 | D71PXI-24 | D71PXI-24
+fault_codes,cleaned,machine_id,string,682641,0,0.0,0,682641,2717,D71PXI-24 70002 | D71PXI-24 70002 | D71PXI-24 70002
+fault_codes,cleaned,base_model_code_id,string,682641,0,0.0,0,682641,424,D71-DW7BKB | D71-CA1673 | D71-A1U0N3
+fault_codes,cleaned,abnormality_history_id,int64,682641,0,0.0,0,682641,682641,10178216344 | 10209532818 | 10210112120
+fault_codes,cleaned,event_time,string,682641,0,0.0,0,682641,627521,2023-05-25T19:28:06Z | 2023-10-06T12:33:25Z | 2023-10-09T16:03:44Z
+fault_codes,cleaned,event_date,string,682641,0,0.0,0,682641,1776,2023-05-25 | 2023-10-06 | 2023-10-09
+fault_codes,cleaned,fault_code,string,682641,0,0.0,0,682641,424,DW7BKB | CA1673 | A1U0N3
+fault_codes,cleaned,event_error_name_en,string,682641,0,0.0,0,682641,424,REVERSE FAN PUMP SOLENOID VALVE+SHORT CIRCUIT | AdBlue/DEF Level Low Error 3 | DPF+CLOGGING 1
+fault_codes,cleaned,event_action_level,string,682641,1,0.0001,0,682640,5,L01 | L03 | L01
+fault_codes,cleaned,logical_name,string,682641,1,0.0001,0,682640,5,HST | ENG/M | ENG/M
+fault_codes,cleaned,occurrence_count,float64,682641,0,0.0,0,682641,3861,1.0 | 2.0 | 27.0
+fault_codes,cleaned,log_occurrence_count,float64,682641,0,0.0,0,682641,2675,0.693 | 1.099 | 3.332
+fault_codes,cleaned,occurrence_boost,float64,682641,0,0.0,0,682641,4,0.0 | 0.0 | 0.0
+fault_codes,cleaned,occurrence_class,int64,682641,0,0.0,0,682641,5,1 | 1 | 2
+fault_codes,cleaned,engine_on_seconds,float64,682641,0,0.0,0,682641,21928,0.0 | 0.0 | 12900.0
+fault_codes,cleaned,engine_on_hours,float64,682641,0,0.0,0,682641,21928,0.0 | 0.0 | 3.583333333333333
+fault_codes,cleaned,engine_on_duration_class,string,682641,0,0.0,0,682641,6,NO_ENGINE_ON_DURATION | NO_ENGINE_ON_DURATION | LONG_ENGINE_ON_DURATION
+fault_codes,cleaned,engine_on_duration_boost,float64,682641,0,0.0,0,682641,6,0.0 | 0.0 | 0.06
+fault_codes,cleaned,smr_hours,float64,682641,0,0.0,0,682641,430980,575.8166666666667 | 963.3833333333332 | 976.8666666666668
+fault_codes,cleaned,failure_name_displayed,string,682641,0,0.0,0,682641,422,Fan Reverse Solenoid Short Circuit | DEF Level Low Error 3 | Hydrocarbon Desorb Request 1
+fault_codes,cleaned,applicable_component,string,682641,0,0.0,0,682641,4,HST | ENG | ENG
+fault_codes,cleaned,history_category,string,682641,0,0.0,0,682641,2,Electrical system | Electrical system | Electrical system
+fault_codes,cleaned,related_component,string,682641,0,0.0,0,682641,6,Power Train System | Urea SCR System | Urea SCR System
+fault_codes,cleaned,related_component_1,string,682641,376905,55.2128,0,305736,3,Power Train System | Engine | Engine
+fault_codes,cleaned,recommended_evidence_block,string,682641,0,0.0,0,682641,3,BN_EVD_FAULT_CODE_EVENT | BN_EVD_FAULT_CODE_EVENT | BN_EVD_FAULT_CODE_CONTEXT
+fault_codes,cleaned,evidence_strength_seed,float64,682641,0,0.0,0,682641,17,0.45 | 0.75 | 0.3
+fault_codes,cleaned,is_mechanical_failure_code,int64,682641,0,0.0,0,682641,2,0 | 0 | 0
+fault_codes,cleaned,is_electrical_failure_code,int64,682641,0,0.0,0,682641,2,1 | 1 | 1
+fault_codes,cleaned,action_level_boost,float64,682641,0,0.0,0,682641,4,0.0 | 0.07 | 0.0
+fault_codes,cleaned,action_level_num,int64,682641,0,0.0,0,682641,5,1 | 3 | 1
+fault_codes,cleaned,mechanical_electrical_boost,float64,682641,0,0.0,0,682641,2,-0.03 | -0.03 | -0.03
+fault_codes,cleaned,failure_code_evidence_score,float64,682641,0,0.0,0,682641,124,0.42 | 0.79 | 0.3299999999999999
+fault_codes,cleaned,failure_code_evidence_strength_class,string,682641,0,0.0,0,682641,4,WEAK | MEDIUM | VERY_WEAK
+fault_codes,cleaned,failure_code_evidence_group,string,682641,0,0.0,0,682641,3,EVENT | EVENT | CONTEXT
+fault_codes,cleaned,feature_domain,string,682641,0,0.0,0,682641,1,FAULT_CODE | FAULT_CODE | FAULT_CODE
+fault_codes,cleaned,evidence_source,string,682641,0,0.0,0,682641,1,KDS_T_ABNORMALITY_HISTORY | KDS_T_ABNORMALITY_HISTORY | KDS_T_ABNORMALITY_HISTORY
