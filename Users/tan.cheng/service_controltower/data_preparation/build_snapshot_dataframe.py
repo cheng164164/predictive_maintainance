@@ -77,7 +77,7 @@ TARGET_MODEL_FAMILIES = tuple(
 # -----------------------------------------------------------------------------
 # Keep this inside the script so config.py does not need to change.
 # Increase this number if you want fewer progress messages.
-PROGRESS_EVERY_MACHINES = 100
+PROGRESS_EVERY_MACHINES = int(cfg("PROGRESS_EVERY_MACHINES", 100))
 
 
 def progress(message: str) -> None:
@@ -87,6 +87,13 @@ def progress(message: str) -> None:
     especially in VS Code terminals, remote compute, notebooks, or Azure jobs.
     """
     print(f"[snapshot-build] {message}", flush=True)
+
+
+# Source-standardization audit rows are written to source_standardization_summary.csv.
+# This is separate from missing_profile_*.csv because it records rows dropped by
+# date/id/model filters after raw CSV cleaning.
+SOURCE_STANDARDIZATION_SUMMARIES: list[dict] = []
+
 
 
 # -----------------------------------------------------------------------------
@@ -266,7 +273,7 @@ def resolve_project_input_path(
     if not required and not candidate.exists():
         return None
 
-    return candidate
+    return candidate 
 
 
 def resolve_feature_freeze_path(
@@ -586,18 +593,82 @@ def boolean_from_mixed_values(series: pd.Series, default: bool = False) -> pd.Se
     return result.fillna(default).astype(bool)
 
 
+
+def append_standardization_summary(summary: dict) -> None:
+    """Append one source-standardization audit record."""
+    SOURCE_STANDARDIZATION_SUMMARIES.append(summary)
+
+
+def write_source_standardization_summary(output_dir: str | Path) -> None:
+    """Save row-drop audit information from source standardization."""
+    if not SOURCE_STANDARDIZATION_SUMMARIES:
+        return
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = Path(cfg("SOURCE_STANDARDIZATION_SUMMARY_PATH", output_dir / "source_standardization_summary.csv"))
+    if not summary_path.is_absolute():
+        summary_path = output_dir / summary_path
+    pd.DataFrame(SOURCE_STANDARDIZATION_SUMMARIES).to_csv(summary_path, index=False)
+    progress(f"Source standardization summary saved to: {summary_path}")
+
+
+def normalize_serial_list(values: Optional[Iterable[object]]) -> list[str]:
+    """Normalize configured MINI_RUN_SERIALS values."""
+    if not values:
+        return []
+    out: list[str] = []
+    for value in values:
+        if value is None or pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def save_mini_validation_outputs(df: pd.DataFrame, output_dir: str | Path) -> None:
+    """Write small QA files for mini validation mode."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_path = Path(cfg("MINI_VALIDATION_SAMPLE_ROWS_PATH", output_dir / "mini_snapshot_validation_sample_rows.csv"))
+    by_machine_path = Path(cfg("MINI_VALIDATION_BY_MACHINE_PATH", output_dir / "mini_snapshot_validation_by_machine.csv"))
+
+    df.head(200).to_csv(sample_path, index=False)
+
+    if not df.empty:
+        agg = (
+            df.groupby(["SERIAL", "full_model", "model_family"], dropna=False)
+            .agg(
+                snapshot_rows=("snapshot_date", "size"),
+                first_snapshot_date=("snapshot_date", "min"),
+                last_snapshot_date=("snapshot_date", "max"),
+            )
+            .reset_index()
+        )
+        if "claim_next_45d" in df.columns:
+            target_summary = df.groupby("SERIAL", dropna=False)["claim_next_45d"].sum(min_count=1).reset_index()
+            target_summary = target_summary.rename(columns={"claim_next_45d": "positive_claim_labels"})
+            agg = agg.merge(target_summary, on="SERIAL", how="left")
+    else:
+        agg = pd.DataFrame(columns=["SERIAL", "full_model", "model_family", "snapshot_rows", "first_snapshot_date", "last_snapshot_date"])
+
+    agg.to_csv(by_machine_path, index=False)
+    progress(f"Mini validation sample saved to: {sample_path}")
+    progress(f"Mini validation by-machine summary saved to: {by_machine_path}")
+
 # -----------------------------------------------------------------------------
 # Source standardization
 # -----------------------------------------------------------------------------
 def standardize_faults(fault: pd.DataFrame) -> pd.DataFrame:
     """Convert the raw fault/event file into a standardized event table.
 
-    Required downstream columns created here include:
-        SERIAL, full_model, model_family, fault_event_date, fault_code_clean,
-        event_action_level_clean, occurrence features, SMR, evidence fields,
-        and component text fields.
+    This function explicitly detects fault-code rows with no usable event date.
+    Those rows are dropped before feature generation and the counts are written
+    to source_standardization_summary.csv.
     """
     f = fault.copy()
+    rows_before = len(f)
 
     f["SERIAL"] = normalize_key(first_existing_col(f, ["serial_number", "SERIAL", "Serial", "ZZSERNR"]))
     f["full_model"] = first_existing_col(
@@ -612,6 +683,17 @@ def standardize_faults(fault: pd.DataFrame) -> pd.DataFrame:
     event_time = parse_dt(first_existing_col(f, ["event_time", "UPDATE_DATETIME", "update_datetime"], pd.NaT))
     event_date = parse_dt(first_existing_col(f, ["event_date", "LOCAL_DATE", "local_date"], pd.NaT))
     f["fault_event_date"] = event_time.fillna(event_date)
+
+    missing_date_rows = int(f["fault_event_date"].isna().sum())
+    missing_serial_rows = int(f["SERIAL"].isna().sum())
+    non_target_model_rows = int(~f["model_family"].isin(TARGET_MODEL_FAMILIES).sum()) if False else 0
+    non_target_model_rows = int((~f["model_family"].isin(TARGET_MODEL_FAMILIES)).sum())
+
+    progress(
+        "Fault date quality: "
+        f"raw rows={rows_before:,}; rows with no usable date={missing_date_rows:,}; "
+        f"rows with missing SERIAL={missing_serial_rows:,}"
+    )
 
     # Standardize field variants used by the feature functions below.
     f["fault_code_clean"] = first_existing_col(
@@ -689,13 +771,32 @@ def standardize_faults(fault: pd.DataFrame) -> pd.DataFrame:
     ).fillna(0)
 
     # Keep only usable D51/D61/D71 fault records with a machine id and date.
-    f = f[
+    keep_mask = (
         f["fault_event_date"].notna()
         & f["SERIAL"].notna()
         & f["model_family"].isin(TARGET_MODEL_FAMILIES)
-    ]
-    return f.sort_values(["SERIAL", "fault_event_date"]).reset_index(drop=True)
+    )
+    dropped_total = int((~keep_mask).sum())
+    f = f[keep_mask]
 
+    append_standardization_summary(
+        {
+            "dataset": "fault_codes",
+            "rows_before_standardization": rows_before,
+            "rows_after_standardization": len(f),
+            "rows_dropped_total": dropped_total,
+            "rows_missing_usable_date_dropped": missing_date_rows,
+            "rows_missing_serial": missing_serial_rows,
+            "rows_non_target_model_family": non_target_model_rows,
+            "target_model_families": ",".join(TARGET_MODEL_FAMILIES),
+        }
+    )
+    progress(
+        "Fault standardization complete: "
+        f"kept {len(f):,} rows; dropped {dropped_total:,} rows "
+        f"including {missing_date_rows:,} rows with no usable date"
+    )
+    return f.sort_values(["SERIAL", "fault_event_date"]).reset_index(drop=True)
 
 def standardize_maintenance(pm: pd.DataFrame) -> pd.DataFrame:
     """Convert the raw maintenance-monitor file into a standardized event table."""
@@ -777,6 +878,9 @@ def build_machine_universe(
     machine: pd.DataFrame,
     pm: pd.DataFrame,
     max_machines: Optional[int] = None,
+    mini_run_enabled: bool = False,
+    mini_run_machine_count: int = 3,
+    mini_run_serials: Optional[Iterable[object]] = None,
 ) -> pd.DataFrame:
     """Create the D51/D61/D71 machine universe.
 
@@ -806,7 +910,19 @@ def build_machine_universe(
         .reset_index(drop=True)
     )
 
-    if max_machines is not None:
+    if mini_run_enabled:
+        selected_serials = normalize_serial_list(mini_run_serials)
+        if selected_serials:
+            before_filter = len(universe)
+            universe = universe[universe["SERIAL"].isin(selected_serials)].copy()
+            progress(
+                f"Mini run enabled with configured serials: kept {len(universe):,} "
+                f"of {before_filter:,} machines"
+            )
+        else:
+            universe = universe.head(int(mini_run_machine_count)).copy()
+            progress(f"Mini run enabled: using first {len(universe):,} machines")
+    elif max_machines is not None:
         universe = universe.head(max_machines).copy()
 
     return universe
@@ -1288,6 +1404,9 @@ def build_snapshot_dataframe(
     max_snapshot_date: Optional[str] = None,
     write_cleaning_reports: bool = True,
     max_machines: Optional[int] = None,
+    mini_run_enabled: bool = False,
+    mini_run_machine_count: int = 3,
+    mini_run_serials: Optional[Iterable[object]] = None,
 ) -> pd.DataFrame:
     """Build the final model-ready snapshot dataframe.
 
@@ -1359,14 +1478,24 @@ def build_snapshot_dataframe(
         progress(f"Cleaning reports saved to: {output_dir}")
 
     progress("Step 4/7: Standardizing source tables...")
+    SOURCE_STANDARDIZATION_SUMMARIES.clear()
     fault = standardize_faults(raw_fault)
     pm = standardize_maintenance(raw_pm)
+    write_source_standardization_summary(output_dir)
 
     progress(f"Standardized fault rows after filtering: {len(fault):,}")
     progress(f"Standardized maintenance rows after filtering: {len(pm):,}")
 
     progress("Step 5/7: Building machine universe...")
-    universe = build_machine_universe(fault, raw_machine, pm, max_machines=max_machines)
+    universe = build_machine_universe(
+        fault,
+        raw_machine,
+        pm,
+        max_machines=max_machines,
+        mini_run_enabled=mini_run_enabled,
+        mini_run_machine_count=mini_run_machine_count,
+        mini_run_serials=mini_run_serials,
+    )
     progress(f"Machine universe size: {len(universe):,}")
 
     warranty = None
@@ -1404,12 +1533,58 @@ def build_snapshot_dataframe(
     return features
 
 
+def _search_existing_file(filename: str) -> Optional[Path]:
+    """Search likely project roots for a required input file.
+
+    This protects against Azure ML / VS Code resolving the project through a
+    different mount path than the one shown in the Explorer.
+    """
+    search_roots: list[Path] = []
+
+    if run_config is not None:
+        for attr in ["PROJECT_ROOT", "INPUT_DIR", "DATA_PREPARATION_DIR"]:
+            value = getattr(run_config, attr, None)
+            if value is not None:
+                p = Path(value)
+                search_roots.extend([p, p.parent])
+
+    script_dir = Path(__file__).absolute().parent
+    cwd = Path.cwd().absolute()
+    for base in [script_dir, cwd, script_dir.parent, cwd.parent]:
+        search_roots.append(base)
+        search_roots.extend(list(base.parents)[:5])
+
+    seen: set[str] = set()
+    for root in search_roots:
+        for candidate in [root / filename, root / "enriched_data" / filename, root / "data_preparation" / filename]:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists():
+                return candidate
+    return None
+
+
 def require_existing_path(path_value: str | Path, label: str) -> Path:
     """Validate required input paths from config.py before running the build."""
     path = Path(path_value)
-    if not path.exists():
-        raise FileNotFoundError(f"{label} not found: {path}")
-    return path
+    if path.exists():
+        return path
+
+    fallback = _search_existing_file(path.name)
+    if fallback is not None:
+        progress(f"{label} not found at configured path: {path}")
+        progress(f"Using discovered {label}: {fallback}")
+        return fallback
+
+    raise FileNotFoundError(
+        f"{label} not found: {path}\n"
+        f"Current working directory: {Path.cwd().absolute()}\n"
+        f"Script directory: {Path(__file__).absolute().parent}\n"
+        "Expected current structure: service_controltower/enriched_data/<file>.csv "
+        "and service_controltower/data_preparation/*.py"
+    )
 
 
 def optional_existing_path(path_value: Optional[str | Path]) -> Optional[Path]:
@@ -1417,7 +1592,9 @@ def optional_existing_path(path_value: Optional[str | Path]) -> Optional[Path]:
     if path_value in (None, "", "None"):
         return None
     path = Path(path_value)
-    return path if path.exists() else None
+    if path.exists():
+        return path
+    return _search_existing_file(path.name)
 
 
 def main() -> None:
@@ -1454,11 +1631,20 @@ def main() -> None:
         cfg("FEATURE_FREEZE_PATH", input_dir / "xgb_feature_freeze.xlsx")
     )
 
-    output_path = Path(cfg("OUTPUT_PATH", output_dir / "snapshot_dataframe.parquet"))
+    mini_run_enabled = bool(cfg("MINI_RUN_ENABLED", False))
+    output_path = Path(
+        cfg("MINI_OUTPUT_PATH", output_dir / "snapshot_dataframe_mini.parquet")
+        if mini_run_enabled
+        else cfg("OUTPUT_PATH", output_dir / "snapshot_dataframe.parquet")
+    )
 
     print("Using config.py" if run_config is not None else "config.py not found; using built-in defaults")
     print(f"Input folder: {input_dir}")
     print(f"Output path: {output_path}")
+    print(f"Mini run enabled: {mini_run_enabled}")
+    if mini_run_enabled:
+        print(f"Mini run serials: {cfg('MINI_RUN_SERIALS', [])}")
+        print(f"Mini run machine count: {cfg('MINI_RUN_MACHINE_COUNT', 3)}")
     print(f"Target model families: {', '.join(TARGET_MODEL_FAMILIES)}")
 
     df = build_snapshot_dataframe(
@@ -1474,10 +1660,15 @@ def main() -> None:
         max_snapshot_date=cfg("MAX_SNAPSHOT_DATE", None),
         write_cleaning_reports=bool(cfg("WRITE_CLEANING_REPORTS", True)),
         max_machines=cfg("MAX_MACHINES", None),
+        mini_run_enabled=mini_run_enabled,
+        mini_run_machine_count=int(cfg("MINI_RUN_MACHINE_COUNT", 3)),
+        mini_run_serials=cfg("MINI_RUN_SERIALS", []),
     )
 
     progress("Saving snapshot dataframe...")
     saved_path = save_snapshot_dataframe(df, output_path)
+    if mini_run_enabled:
+        save_mini_validation_outputs(df, output_dir)
 
     print(f"Saved snapshot dataframe: {saved_path}")
     print(f"Rows: {len(df):,}")

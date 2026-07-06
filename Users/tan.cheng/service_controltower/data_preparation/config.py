@@ -1,91 +1,182 @@
 """
-Configuration for build_snapshot_dataframe.py.
+Configuration for the predictive-maintenance snapshot build.
 
-Edit this file instead of typing long command-line arguments.
-Keep this file in the same folder as build_snapshot_dataframe.py, then run:
+Current project layout supported by this config:
+
+    service_controltower/
+        data_preparation/
+            config.py
+            build_snapshot_dataframe.py
+            log_compute_device.py
+            submit_snapshot_build_aml_job.py
+            output/
+        enriched_data/
+            fault_codes.csv
+            machine.csv
+            maintenance.csv
+            warranty.csv                 # optional
+            xgb_feature_freeze.xlsx       # optional
+        requirements.txt
+
+Run locally from the repository root or from data_preparation/:
+
+    python data_preparation/build_snapshot_dataframe.py
+
+or, if your terminal is already inside data_preparation/:
 
     python build_snapshot_dataframe.py
-
-Folder assumptions requested for this project:
-    - Input CSV files are in: enriched_data/
-    - Generated outputs are saved in: data_preparation/output/
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
 
 # -----------------------------------------------------------------------------
-# Project folders
+# Project-folder detection
 # -----------------------------------------------------------------------------
-# Paths are relative to the folder that contains this config.py file.
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _candidate_project_roots() -> list[Path]:
+    """Return likely service_controltower root folders.
 
-# Raw/enriched input data folder.
+    Azure ML sometimes exposes the same folder through both a /home/azureuser path
+    and a /mnt/batch/... path.  Using absolute() instead of resolve() avoids
+    forcing symlink resolution too early, and the scripts also validate the final
+    files before running.
+    """
+    config_dir = Path(__file__).absolute().parent
+    cwd = Path.cwd().absolute()
+
+    candidates: list[Path] = []
+
+    # Expected layout: service_controltower/data_preparation/config.py
+    candidates.append(config_dir.parent)
+
+    # Useful when running from service_controltower/ or data_preparation/.
+    candidates.append(cwd)
+    candidates.append(cwd.parent)
+
+    # Walk upward from both locations and keep any folder that looks like project root.
+    for base in (config_dir, cwd):
+        for parent in [base, *base.parents]:
+            candidates.append(parent)
+
+    # Preserve order and remove duplicates.
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for p in candidates:
+        key = str(p)
+        if key not in seen:
+            unique.append(p)
+            seen.add(key)
+    return unique
+
+
+def _detect_project_root() -> Path:
+    """Find the root folder that contains both data_preparation and enriched_data."""
+    for root in _candidate_project_roots():
+        if (root / "data_preparation").exists() and (root / "enriched_data").exists():
+            return root
+
+    # Fallback to the expected parent of data_preparation.  The build script will
+    # raise a clear FileNotFoundError if the input files are still not found.
+    return Path(__file__).absolute().parent.parent
+
+
+PROJECT_ROOT = _detect_project_root()
+DATA_PREPARATION_DIR = PROJECT_ROOT / "data_preparation"
 INPUT_DIR = PROJECT_ROOT / "enriched_data"
-
-# Output folder for the snapshot dataframe and missing-value reports.
-OUTPUT_DIR = PROJECT_ROOT / "data_preparation" / "output"
+OUTPUT_DIR = DATA_PREPARATION_DIR / "output"
 
 
 # -----------------------------------------------------------------------------
 # Input files
 # -----------------------------------------------------------------------------
-# Required files.
 FAULT_CODES_PATH = INPUT_DIR / "fault_codes.csv"
 MACHINE_PATH = INPUT_DIR / "machine.csv"
 MAINTENANCE_PATH = INPUT_DIR / "maintenance.csv"
 
-# Optional files.
-# If WARRANTY_PATH does not exist, the script still runs but claim_next_45d is blank.
+# Optional files. If warranty.csv does not exist, claim_next_45d is left blank.
 WARRANTY_PATH = INPUT_DIR / "warranty.csv"
-
-# Optional validation file. The script already contains the frozen feature list,
-# but this file is used as an extra check when it exists.
 FEATURE_FREEZE_PATH = INPUT_DIR / "xgb_feature_freeze.xlsx"
 
 
 # -----------------------------------------------------------------------------
-# Output file
+# Output files
 # -----------------------------------------------------------------------------
-# Use .parquet for the main pipeline. If your environment does not have a parquet
-# engine installed, the script automatically falls back to .csv.
 OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe.parquet"
+SOURCE_STANDARDIZATION_SUMMARY_PATH = OUTPUT_DIR / "source_standardization_summary.csv"
 
 
 # -----------------------------------------------------------------------------
 # Snapshot and target settings
 # -----------------------------------------------------------------------------
-# One snapshot every 14 days per machine.
 SNAPSHOT_FREQ_DAYS = 14
-
-# Label = 1 when a warranty failure happens within the next 45 days.
 HORIZON_DAYS = 45
-
-# Limit snapshots by date when you want a smaller development run.
-# Use strings like "2025-01-01", or leave as None for no limit.
 MIN_SNAPSHOT_DATE = None
 MAX_SNAPSHOT_DATE = None
 
-# Development limiter. Example: set MAX_MACHINES = 50 for a quick test.
-# Leave as None for all machines.
+# Optional development limiter for all runs. Leave None for all machines.
 MAX_MACHINES = None
+
+
+# -----------------------------------------------------------------------------
+# Mini validation mode
+# -----------------------------------------------------------------------------
+# Turn this on to build output for only a few machines before spending time on
+# the full snapshot dataframe.
+MINI_RUN_ENABLED = True
+
+# Used only when MINI_RUN_ENABLED=True and MINI_RUN_SERIALS is empty.
+MINI_RUN_MACHINE_COUNT = 2
+
+# Optional exact serials to validate. Example: ["70356", "B11204", "30948"]
+MINI_RUN_SERIALS = []
+
+# Separate mini output files so a mini run does not overwrite the full output.
+MINI_OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe_mini.parquet"
+MINI_VALIDATION_SAMPLE_ROWS_PATH = OUTPUT_DIR / "mini_snapshot_validation_sample_rows.csv"
+MINI_VALIDATION_BY_MACHINE_PATH = OUTPUT_DIR / "mini_snapshot_validation_by_machine.csv"
 
 
 # -----------------------------------------------------------------------------
 # Data cleaning/report settings
 # -----------------------------------------------------------------------------
-# When True, the script writes:
-#   - missing_profile_fault_codes.csv
-#   - missing_profile_machine.csv
-#   - missing_profile_maintenance.csv
-#   - missing_profile_warranty.csv, if warranty data exists
-#   - missing_profile_all_files.csv
-#   - cleaning_summary.csv
 WRITE_CLEANING_REPORTS = True
 
 
 # -----------------------------------------------------------------------------
-# Machine population
+# Machine population and progress
 # -----------------------------------------------------------------------------
-# The snapshot universe is restricted to these model families.
 TARGET_MODEL_FAMILIES = ("D51", "D61", "D71")
+PROGRESS_EVERY_MACHINES = 100
+
+
+# -----------------------------------------------------------------------------
+# Azure ML job submission settings
+# -----------------------------------------------------------------------------
+# Fill these in before running:
+#     python data_preparation/submit_snapshot_build_aml_job.py
+AML_SUBSCRIPTION_ID = "7f07baf7-8bba-4b88-b300-74ba5b15f52d"
+AML_RESOURCE_GROUP = "ai-servicecontroltower"
+AML_WORKSPACE_NAME = "ai-controltower-aml"
+AML_COMPUTE_NAME = "tan-dev-gpu-cluster"
+
+# Curated GPU environment. This avoids manually pinning CUDA wheels.
+# If you run on CPU compute, you may switch to an AzureML sklearn/pandas curated env.
+AML_ENVIRONMENT = "AzureML-acpt-pytorch-2.8-cuda12.6@latest"
+AML_EXPERIMENT_NAME = "snapshot-data-preparation"
+AML_DISPLAY_NAME = "build-snapshot-dataframe"
+
+# Upload the whole project folder as the AML code snapshot so data_preparation/
+# scripts and enriched_data/ are both reachable inside the job.
+AML_CODE_DIR = PROJECT_ROOT
+BUILD_SNAPSHOT_SCRIPT_PATH = DATA_PREPARATION_DIR / "build_snapshot_dataframe.py"
+LOG_DEVICE_SCRIPT_PATH = DATA_PREPARATION_DIR / "log_compute_device.py"
+REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
+
+AML_INSTALL_REQUIREMENTS = True
+AML_STREAM_LOGS = True
+AML_REQUIRE_GPU = False
+
+# Local device requirement if you run log_compute_device.py outside Azure ML.
+REQUIRE_GPU = False
