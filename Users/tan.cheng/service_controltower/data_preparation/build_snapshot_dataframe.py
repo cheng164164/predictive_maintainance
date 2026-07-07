@@ -1,42 +1,47 @@
 """
-Build a leakage-safe snapshot dataframe for D51 / D61 / D71 predictive maintenance.
+Build leakage-safe source-level and unified snapshot dataframes for predictive maintenance.
 
-Default project layout expected by this script:
+Current supported source files:
+    1. machine.csv          canonical model_id + snapshot_date backbone
+    2. fault_codes.csv      fault/event history
+    3. maintenance.csv      maintenance-monitor / PM history
 
-    enriched_data/
-        fault_codes.csv
-        machine.csv
-        maintenance.csv
-        warranty.csv                 # optional, only needed for claim_next_45d labels
-        xgb_feature_freeze.xlsx       # optional, used only for validation
+Designed for future extension:
+    - oil / fluid sample data
+    - warranty data / target labels
+    - service/work-order data
 
-    data_preparation/output/
-        snapshot_dataframe.parquet
-        missing_profile_all_files.csv
-        missing_profile_fault_codes.csv
-        missing_profile_machine.csv
-        missing_profile_maintenance.csv
-        missing_profile_warranty.csv  # only if warranty is provided
-        cleaning_summary.csv
+Expected project layout:
+
+    service_controltower/
+    ├── data_preparation/
+    │   ├── build_snapshot_dataframe.py
+    │   ├── config.py
+    │   └── output/
+    ├── enriched_data/
+    │   ├── machine.csv
+    │   ├── fault_codes.csv
+    │   └── maintenance.csv
+    └── requirements.txt
 
 Output grain:
-    One row per machine / snapshot_date.
+    One row per model_id / snapshot_date.
+
+Important design choice:
+    machine.csv is the canonical snapshot backbone. All source-specific snapshot
+    tables must follow the same model_id + snapshot_date rows from machine.csv.
+    Source tables do not create their own snapshot calendars.
 
 Core leakage-control rule:
-    Feature windows use only records with event_date < snapshot_date.
-    The optional target uses warranty failure dates after the snapshot date and on/before
-    snapshot_date + horizon_days.
-
-Notes about data cleaning in this script:
-    The cleaning step is intentionally light and auditable. It standardizes obvious null-like
-    strings such as "", "nan", "null", "N/A" to real missing values, strips whitespace from
-    object columns, and drops only fully empty rows or columns. It does not drop duplicate rows
-    by default because duplicate-looking event records may still represent real repeated events.
+    Features only use source records with event_date < snapshot_date.
+    Target labels, when warranty data is added later, should only use dates after
+    snapshot_date and on/before snapshot_date + prediction_horizon.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -47,62 +52,46 @@ import pandas as pd
 # -----------------------------------------------------------------------------
 # Optional run configuration
 # -----------------------------------------------------------------------------
-# The script is designed to run from config.py so you do not have to type a long
-# command every time. Keep config.py in the same folder as this script, edit the
-# parameter values there, and run:
-#
-#     python build_snapshot_dataframe.py
-#
-# If config.py is not present, the script falls back to the built-in defaults
-# defined below. The build_snapshot_dataframe(...) function still accepts direct
-# arguments, which is useful when calling it from notebooks or tests.
 try:
     import config as run_config
-except ImportError:  # pragma: no cover - allows module reuse without config.py
+except ImportError:  # pragma: no cover
     run_config = None
 
 
 def cfg(name: str, default):
-    """Read a value from config.py, or return a safe built-in default."""
+    """Read a value from config.py, or return a built-in default."""
     return getattr(run_config, name, default) if run_config is not None else default
 
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_PROJECT_ROOT = SCRIPT_DIR.parent
+PROJECT_ROOT = Path(cfg("PROJECT_ROOT", DEFAULT_PROJECT_ROOT)).resolve()
+INPUT_DIR = Path(cfg("INPUT_DIR", PROJECT_ROOT / "enriched_data")).resolve()
+OUTPUT_DIR = Path(cfg("OUTPUT_DIR", PROJECT_ROOT / "data_preparation" / "output")).resolve()
+SOURCE_SNAPSHOT_DIR = Path(cfg("SOURCE_SNAPSHOT_DIR", OUTPUT_DIR / "source_snapshots")).resolve()
 
 TARGET_MODEL_FAMILIES = tuple(
     str(x).upper().strip() for x in cfg("TARGET_MODEL_FAMILIES", ("D51", "D61", "D71"))
 )
 
+MODEL_ID_CANDIDATE_COLUMNS = tuple(
+    cfg("MODEL_ID_CANDIDATE_COLUMNS", ("model_id", "machine_id", "MACHINE_ID", "Machine_ID"))
+)
 
-# -----------------------------------------------------------------------------
-# Console progress helper
-# -----------------------------------------------------------------------------
-# Keep this inside the script so config.py does not need to change.
-# Increase this number if you want fewer progress messages.
+MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS = tuple(
+    cfg(
+        "MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS",
+        ("snapshot_date", "SNAPSHOT_DATE", "as_of_date", "AS_OF_DATE", "snapshot_dt"),
+    )
+)
+
+ALLOW_MODEL_ID_FALLBACK = bool(cfg("ALLOW_MODEL_ID_FALLBACK", True))
 PROGRESS_EVERY_MACHINES = int(cfg("PROGRESS_EVERY_MACHINES", 100))
-
-
-def progress(message: str) -> None:
-    """Print a short progress message immediately.
-
-    flush=True matters because long-running scripts sometimes buffer output,
-    especially in VS Code terminals, remote compute, notebooks, or Azure jobs.
-    """
-    print(f"[snapshot-build] {message}", flush=True)
-
-
-# Source-standardization audit rows are written to source_standardization_summary.csv.
-# This is separate from missing_profile_*.csv because it records rows dropped by
-# date/id/model filters after raw CSV cleaning.
-SOURCE_STANDARDIZATION_SUMMARIES: list[dict] = []
-
 
 
 # -----------------------------------------------------------------------------
 # Frozen model feature list
 # -----------------------------------------------------------------------------
-# These are the feature columns that came from the provided xgb_feature_freeze.xlsx
-# workbook. The script guarantees that each of these columns exists in the final
-# dataframe, even when a source column is unavailable and the feature has to be
-# filled with a safe default.
 FROZEN_FEATURES = [
     "fault_count_7d",
     "fault_count_30d",
@@ -171,9 +160,6 @@ FROZEN_FEATURES = [
     "smr_since_last_reset",
 ]
 
-# Features that represent counts should become 0 when no record exists in the
-# lookback window. This is different from recency or measurement features, where
-# missing can have a different meaning.
 COUNT_FEATURES = [
     c
     for c in FROZEN_FEATURES
@@ -197,9 +183,6 @@ COUNT_FEATURES = [
     }
 ]
 
-# Recency features use a large sentinel value when no event was observed before
-# the snapshot. This tells the model "very long time / no prior event" without
-# dropping the row.
 RECENCY_FEATURES = [
     "days_since_last_fault",
     "days_since_last_severe_fault",
@@ -208,8 +191,6 @@ RECENCY_FEATURES = [
     "days_since_last_filter_reset",
 ]
 
-# Null-like values that often appear in CSV exports. The cleaning step converts
-# these to real missing values before feature generation.
 NULL_LIKE_STRINGS = {
     "",
     " ",
@@ -226,9 +207,6 @@ NULL_LIKE_STRINGS = {
     "<na>",
 }
 
-# Keyword patterns used to aggregate source records into component-level model
-# features. These are intentionally simple and transparent so the business can
-# review and revise them later.
 COMPONENT_PATTERNS = {
     "engine": ["engine"],
     "hydraulic": ["hydraulic"],
@@ -248,100 +226,61 @@ MAINTENANCE_TYPE_PATTERNS = {
 
 
 # -----------------------------------------------------------------------------
-# Input/output path helpers
+# Console progress helper
 # -----------------------------------------------------------------------------
-def resolve_project_input_path(
-    input_dir: str | Path,
-    path_arg: Optional[str | Path],
-    default_filename: str,
-    required: bool,
-) -> Optional[Path]:
-    """Resolve a file path from either an explicit CLI path or the input folder.
+def progress(message: str) -> None:
+    """Print a short progress message immediately."""
+    print(f"[snapshot-build] {message}", flush=True)
 
-    Examples:
-        --input-dir enriched_data and no --fault-codes argument becomes
-        enriched_data/fault_codes.csv.
 
-        If an optional file such as warranty.csv does not exist, return None.
-    """
-    input_dir = Path(input_dir)
-    candidate = Path(path_arg) if path_arg else input_dir / default_filename
+# -----------------------------------------------------------------------------
+# File/path helpers
+# -----------------------------------------------------------------------------
+def resolve_existing_path(path_value: str | Path, label: str) -> Path:
+    """Resolve and validate a required input path."""
+    path = Path(path_value).expanduser()
+    candidates = [path]
 
-    if required and not candidate.exists():
-        raise FileNotFoundError(f"Required input file not found: {candidate}")
+    if not path.is_absolute():
+        candidates.append((PROJECT_ROOT / path).resolve())
 
-    if not required and not candidate.exists():
+    candidates.append((INPUT_DIR / path.name).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    checked = "\n  - ".join(str(c) for c in candidates)
+    raise FileNotFoundError(f"{label} not found. Checked:\n  - {checked}")
+
+
+def optional_existing_path(path_value: Optional[str | Path]) -> Optional[Path]:
+    """Return an optional path only when it exists."""
+    if path_value in (None, "", "None"):
         return None
-
-    return candidate 
-
-
-def resolve_feature_freeze_path(
-    input_dir: str | Path,
-    path_arg: Optional[str | Path],
-) -> Optional[Path]:
-    """Find the optional Excel feature-freeze file.
-
-    The file is optional because FROZEN_FEATURES is already embedded above. When
-    the Excel file is present, the script uses it as a validation check to make
-    sure the output still contains all expected features.
-    """
-    if path_arg:
-        p = Path(path_arg)
-        return p if p.exists() else None
-
-    candidates = [
-        Path(input_dir) / "xgb_feature_freeze.xlsx",
-        Path("xgb_feature_freeze.xlsx"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
-
-
-def resolve_output_path(output_dir: str | Path, output_arg: str | Path) -> Path:
-    """Resolve the snapshot output path.
-
-    If --output is just a filename, save it inside --output-dir. If --output has
-    a directory component or is absolute, respect it as provided.
-    """
-    output_dir = Path(output_dir)
-    output = Path(output_arg)
-    if output.is_absolute() or output.parent != Path("."):
-        return output
-    return output_dir / output
+    try:
+        return resolve_existing_path(path_value, "optional input")
+    except FileNotFoundError:
+        return None
 
 
 # -----------------------------------------------------------------------------
 # Data cleaning and missing-value reporting
 # -----------------------------------------------------------------------------
 def dedupe_column_names(columns: Iterable[object]) -> list[str]:
-    """Strip whitespace from column names and make duplicate names unique.
-
-    CSV exports sometimes contain columns like "SERIAL " or duplicate headers
-    after trimming. Duplicate column names can break pandas selection, so this
-    function appends a suffix to repeated names.
-    """
+    """Strip whitespace from column names and make duplicate names unique."""
     seen: dict[str, int] = {}
     cleaned_columns: list[str] = []
-
     for col in columns:
-        base = str(col).strip()
-        base = base if base else "unnamed_column"
+        base = str(col).strip() or "unnamed_column"
         count = seen.get(base, 0) + 1
         seen[base] = count
         cleaned_columns.append(base if count == 1 else f"{base}_duplicate_{count}")
-
     return cleaned_columns
 
 
 def blank_or_null_string_count(series: pd.Series) -> int:
-    """Count string values that are visually blank or null-like.
-
-    This catches values such as "", "nan", "NULL", and "N/A" before they are
-    converted to actual missing values.
-    """
+    """Count visually blank or null-like string values."""
     if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
         return 0
     text = series.astype("string").str.strip().str.lower()
@@ -349,28 +288,17 @@ def blank_or_null_string_count(series: pd.Series) -> int:
 
 
 def sample_non_missing_values(series: pd.Series, max_values: int = 3) -> str:
-    """Return a compact example-value string for the missing-value report."""
     examples = series.dropna().astype(str).head(max_values).tolist()
     return " | ".join(examples)
 
 
 def build_missing_profile(df: pd.DataFrame, dataset_name: str, stage: str) -> pd.DataFrame:
-    """Build a column-level missingness report for one dataframe.
-
-    The report is generated both before and after light cleaning. This helps you
-    audit whether missing values are coming from true pandas NaN values or from
-    CSV strings like "nan" and "N/A".
-    """
+    """Build a column-level missingness report."""
     row_count = len(df)
-    profile_rows: list[dict] = []
-
+    rows: list[dict] = []
     for col in df.columns:
         missing_count = int(df[col].isna().sum())
-        blank_like_count = blank_or_null_string_count(df[col])
-        non_missing = int(row_count - missing_count)
-        unique_non_missing = int(df[col].dropna().nunique()) if row_count else 0
-
-        profile_rows.append(
+        rows.append(
             {
                 "dataset": dataset_name,
                 "stage": stage,
@@ -379,41 +307,24 @@ def build_missing_profile(df: pd.DataFrame, dataset_name: str, stage: str) -> pd
                 "row_count": row_count,
                 "missing_count": missing_count,
                 "missing_pct": round((missing_count / row_count) * 100, 4) if row_count else 0.0,
-                "blank_or_null_string_count": blank_like_count,
-                "non_missing_count": non_missing,
-                "unique_non_missing_count": unique_non_missing,
+                "blank_or_null_string_count": blank_or_null_string_count(df[col]),
+                "non_missing_count": int(row_count - missing_count),
+                "unique_non_missing_count": int(df[col].dropna().nunique()) if row_count else 0,
                 "example_non_missing_values": sample_non_missing_values(df[col]),
             }
         )
+    return pd.DataFrame(rows)
 
-    return pd.DataFrame(profile_rows)
 
-
-def clean_raw_dataframe(
-    df: pd.DataFrame,
-    dataset_name: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-    """Lightly clean one raw CSV dataframe and return audit artifacts.
-
-    Cleaning choices are deliberately conservative:
-        1. Strip column-name whitespace and make duplicate names unique.
-        2. Strip whitespace in text columns.
-        3. Convert null-like strings to missing values.
-        4. Drop only rows or columns that are completely empty.
-
-    The function returns:
-        cleaned_df, raw_missing_profile, cleaned_missing_profile, cleaning_summary
-    """
+def clean_raw_dataframe(df: pd.DataFrame, dataset_name: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Lightly clean one raw CSV dataframe and return audit artifacts."""
     rows_before = len(df)
     cols_before = len(df.columns)
-
     raw_profile = build_missing_profile(df, dataset_name=dataset_name, stage="raw")
 
     cleaned = df.copy()
     cleaned.columns = dedupe_column_names(cleaned.columns)
 
-    # Normalize object/string columns. Numeric columns are left untouched here;
-    # individual feature-standardization functions convert numeric fields later.
     object_cols = cleaned.select_dtypes(include=["object", "string"]).columns
     for col in object_cols:
         cleaned[col] = cleaned[col].astype("string").str.strip()
@@ -429,67 +340,44 @@ def clean_raw_dataframe(
     summary = {
         "dataset": dataset_name,
         "rows_before": rows_before,
-        "rows_after": len(cleaned),
+        "rows_after_light_cleaning": len(cleaned),
         "rows_dropped_fully_empty": rows_before - len(cleaned),
         "columns_before": cols_before,
-        "columns_after": len(cleaned.columns),
+        "columns_after_light_cleaning": len(cleaned.columns),
         "columns_dropped_fully_empty": len(fully_empty_cols),
         "fully_empty_columns_dropped": ", ".join(fully_empty_cols),
         "missing_cells_raw": int(df.isna().sum().sum()),
         "missing_cells_cleaned": int(cleaned.isna().sum().sum()),
-        "blank_or_null_strings_raw": int(raw_profile["blank_or_null_string_count"].sum())
-        if not raw_profile.empty
-        else 0,
+        "blank_or_null_strings_raw": int(raw_profile["blank_or_null_string_count"].sum()) if not raw_profile.empty else 0,
     }
-
     return cleaned, raw_profile, cleaned_profile, summary
 
 
 def read_csv_safely(path: str | Path) -> pd.DataFrame:
-    """Read a CSV without dtype guessing warnings on mixed-type columns."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(path)
     return pd.read_csv(path, low_memory=False)
 
 
-def load_and_clean_csv(
-    path: str | Path,
-    dataset_name: str,
-    output_dir: str | Path,
-    write_cleaning_reports: bool = True,
-) -> tuple[pd.DataFrame, list[pd.DataFrame], dict]:
-    """Read a CSV, run missing-value detection, clean it, and optionally save reports."""
+def load_and_clean_csv(path: str | Path, dataset_name: str, output_dir: str | Path) -> tuple[pd.DataFrame, list[pd.DataFrame], dict]:
+    """Read a CSV, run missing-value detection, lightly clean it, and save a profile."""
     raw = read_csv_safely(path)
     cleaned, raw_profile, cleaned_profile, summary = clean_raw_dataframe(raw, dataset_name)
     profiles = [raw_profile, cleaned_profile]
 
-    if write_cleaning_reports:
+    if bool(cfg("WRITE_CLEANING_REPORTS", True)):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        pd.concat(profiles, ignore_index=True).to_csv(
-            output_dir / f"missing_profile_{dataset_name}.csv",
-            index=False,
-        )
-
+        pd.concat(profiles, ignore_index=True).to_csv(output_dir / f"missing_profile_{dataset_name}.csv", index=False)
     return cleaned, profiles, summary
 
 
-def write_combined_cleaning_reports(
-    output_dir: str | Path,
-    profiles: list[pd.DataFrame],
-    summaries: list[dict],
-) -> None:
-    """Save all per-file missing profiles and cleaning summaries in one place."""
+def write_combined_cleaning_reports(output_dir: str | Path, profiles: list[pd.DataFrame], summaries: list[dict]) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     if profiles:
-        pd.concat(profiles, ignore_index=True).to_csv(
-            output_dir / "missing_profile_all_files.csv",
-            index=False,
-        )
-
+        pd.concat(profiles, ignore_index=True).to_csv(output_dir / "missing_profile_all_files.csv", index=False)
     if summaries:
         pd.DataFrame(summaries).to_csv(output_dir / "cleaning_summary.csv", index=False)
 
@@ -498,11 +386,7 @@ def write_combined_cleaning_reports(
 # Generic dataframe helpers
 # -----------------------------------------------------------------------------
 def safe_col(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
-    """Return df[col] if it exists; otherwise return a default Series.
-
-    This allows the script to keep running when a source file is missing an
-    optional column. The feature is then filled with a safe default later.
-    """
+    """Return df[col] if present, otherwise a default Series."""
     if col in df.columns:
         return df[col]
     if isinstance(default, pd.Series):
@@ -510,50 +394,68 @@ def safe_col(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
     return pd.Series(default, index=df.index)
 
 
-def first_existing_col(
-    df: pd.DataFrame,
-    candidates: Iterable[str],
-    default=np.nan,
-) -> pd.Series:
-    """Return the first available source column from a list of possible names."""
+def first_existing_col(df: pd.DataFrame, candidates: Iterable[str], default=np.nan) -> pd.Series:
+    """Return the first available source column from a list."""
     for col in candidates:
         if col in df.columns:
             return df[col]
     return pd.Series(default, index=df.index)
 
 
+def first_existing_col_name(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    """Return the first available column name from a list."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
 def normalize_key(s: pd.Series) -> pd.Series:
-    """Normalize machine identifiers such as SERIAL or serial_number."""
+    """Normalize identifiers such as model_id or serial_number."""
     out = s.astype("string").str.strip()
     return out.mask(out.str.lower().isin(NULL_LIKE_STRINGS), pd.NA)
 
 
 def parse_dt(s: pd.Series) -> pd.Series:
-    """Parse a date column safely and normalize timezone handling.
-
-    errors="coerce" turns invalid dates into NaT instead of crashing.
-    utc=True makes mixed timezone formats comparable.
-    tz_convert(None) removes timezone metadata after converting everything to UTC.
-    """
+    """Parse dates safely and normalize timezone handling."""
     return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert(None)
 
 
-def model_family(full_model: object) -> Optional[str]:
-    """Extract a configured target model family such as D51, D61, or D71."""
-    if pd.isna(full_model):
-        return None
-
-    text = str(full_model).upper()
+def has_target_family(text_value: object) -> bool:
+    """Return True when text contains one of the configured target model families."""
+    if not TARGET_MODEL_FAMILIES:
+        return True
+    if pd.isna(text_value):
+        return False
+    text = str(text_value).upper()
     for family in TARGET_MODEL_FAMILIES:
-        # Match model-family prefixes at word boundaries. This catches values
-        # such as D51, D51PX, D61EX, and D71PX while avoiding unrelated strings.
         if re.search(rf"\b{re.escape(family)}", text):
-            return family
-    return None
+            return True
+    return False
+
+
+def normalize_model_id(df: pd.DataFrame, source_name: str) -> tuple[pd.Series, str]:
+    """Create the canonical model_id used for all joins."""
+    for col in MODEL_ID_CANDIDATE_COLUMNS:
+        if col in df.columns:
+            return normalize_key(df[col]), col
+
+    if not ALLOW_MODEL_ID_FALLBACK:
+        return pd.Series(pd.NA, index=df.index, dtype="string"), "missing"
+
+    full_model = first_existing_col(df, ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"], pd.NA)
+    serial = first_existing_col(df, ["serial_number", "SERIAL", "Serial", "ZZSERNR"], pd.NA)
+    fallback = full_model.astype("string").str.strip() + " " + serial.astype("string").str.strip()
+    fallback = fallback.mask(fallback.str.lower().isin(NULL_LIKE_STRINGS), pd.NA)
+    progress(
+        f"WARNING: {source_name} has no true model_id/machine_id column. "
+        "Using fallback full_model + serial. Add model_id to the source extract when possible."
+    )
+    return normalize_key(fallback), "fallback_full_model_plus_serial"
 
 
 def contains_any(series: pd.Series, patterns: Iterable[str]) -> pd.Series:
-    """Boolean mask for rows where a text field contains any keyword pattern."""
+    """Boolean mask where text contains any keyword pattern."""
     txt = series.fillna("").astype(str).str.lower()
     out = pd.Series(False, index=series.index)
     for pat in patterns:
@@ -575,7 +477,7 @@ def ratio(num: float, den: float) -> float:
 
 
 def days_between(snapshot_date: pd.Timestamp, event_date: Optional[pd.Timestamp]) -> float:
-    """Days from event_date to snapshot_date. Missing event dates stay missing."""
+    """Days from event_date to snapshot_date."""
     if event_date is None or pd.isna(event_date):
         return np.nan
     return float((snapshot_date - event_date).days)
@@ -583,8 +485,6 @@ def days_between(snapshot_date: pd.Timestamp, event_date: Optional[pd.Timestamp]
 
 def boolean_from_mixed_values(series: pd.Series, default: bool = False) -> pd.Series:
     """Convert messy true/false values into booleans."""
-    if series is None:
-        return pd.Series(default)
     text = series.astype("string").str.strip().str.lower()
     true_values = {"true", "1", "yes", "y", "t"}
     false_values = {"false", "0", "no", "n", "f"}
@@ -593,167 +493,146 @@ def boolean_from_mixed_values(series: pd.Series, default: bool = False) -> pd.Se
     return result.fillna(default).astype(bool)
 
 
+# -----------------------------------------------------------------------------
+# Machine backbone standardization
+# -----------------------------------------------------------------------------
+def standardize_machine_backbone(machine: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Standardize machine.csv as the canonical model_id + snapshot_date backbone.
 
-def append_standardization_summary(summary: dict) -> None:
-    """Append one source-standardization audit record."""
-    SOURCE_STANDARDIZATION_SUMMARIES.append(summary)
+    Unlike earlier versions, this function does not create snapshot dates from
+    event-source min/max dates. It trusts machine.csv to define the official
+    snapshot calendar. Every source snapshot table must later match this exact
+    backbone.
+    """
+    m = machine.copy()
+    m["model_id"], model_id_source = normalize_model_id(m, "machine")
+    snapshot_date_col = first_existing_col_name(m, MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS)
+    if snapshot_date_col is None:
+        raise ValueError(
+            "machine.csv must contain a snapshot date column. Checked: "
+            + ", ".join(MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS)
+        )
+
+    m["snapshot_date"] = parse_dt(m[snapshot_date_col]).dt.normalize()
+    m["full_model"] = first_existing_col(m, ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"], pd.NA).astype("string").str.strip()
+
+    total_rows = len(m)
+    missing_model_id_rows = int(m["model_id"].isna().sum())
+    missing_snapshot_date_rows = int(m["snapshot_date"].isna().sum())
+
+    target_mask = m["full_model"].map(has_target_family) | m["model_id"].map(has_target_family)
+    out = m[m["model_id"].notna() & m["snapshot_date"].notna() & target_mask].copy()
+
+    duplicate_key_rows = int(out.duplicated(["model_id", "snapshot_date"]).sum())
+    out = out.sort_values(["model_id", "snapshot_date"]).drop_duplicates(["model_id", "snapshot_date"], keep="last")
+
+    # Carry optional machine/master columns into the backbone as machine_* fields.
+    # This preserves future static or per-snapshot machine features without
+    # colliding with source-level feature names.
+    identity_cols = set(MODEL_ID_CANDIDATE_COLUMNS) | set(MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS) | {
+        "model_id",
+        "snapshot_date",
+        "full_model",
+        snapshot_date_col,
+    }
+    base_cols = ["model_id", "snapshot_date", "full_model"]
+    extra_cols = [c for c in out.columns if c not in identity_cols]
+    rename_map = {c: c if c.startswith("machine_") else f"machine_{c}" for c in extra_cols}
+    out = out[base_cols + extra_cols].rename(columns=rename_map)
+    out = out.reset_index(drop=True)
+
+    summary = {
+        "source": "machine",
+        "source_role": "canonical_snapshot_backbone",
+        "input_rows": total_rows,
+        "model_id_source": model_id_source,
+        "snapshot_date_source": snapshot_date_col,
+        "missing_model_id_rows": missing_model_id_rows,
+        "missing_usable_event_date_rows": missing_snapshot_date_rows,
+        "dropped_missing_event_date_rows": missing_snapshot_date_rows,
+        "duplicate_model_id_snapshot_rows_removed": duplicate_key_rows,
+        "rows_after_standardization": len(out),
+        "unique_model_ids_after_standardization": out["model_id"].nunique(),
+        "first_snapshot_date": str(out["snapshot_date"].min()) if len(out) else None,
+        "last_snapshot_date": str(out["snapshot_date"].max()) if len(out) else None,
+    }
+    return out, summary
 
 
-def write_source_standardization_summary(output_dir: str | Path) -> None:
-    """Save row-drop audit information from source standardization."""
-    if not SOURCE_STANDARDIZATION_SUMMARIES:
-        return
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = Path(cfg("SOURCE_STANDARDIZATION_SUMMARY_PATH", output_dir / "source_standardization_summary.csv"))
-    if not summary_path.is_absolute():
-        summary_path = output_dir / summary_path
-    pd.DataFrame(SOURCE_STANDARDIZATION_SUMMARIES).to_csv(summary_path, index=False)
-    progress(f"Source standardization summary saved to: {summary_path}")
+def apply_backbone_filters(backbone: pd.DataFrame) -> pd.DataFrame:
+    """Apply date and mini-run filters to the machine-defined backbone."""
+    out = backbone.copy()
 
+    min_snapshot_date = cfg("MIN_SNAPSHOT_DATE", None)
+    max_snapshot_date = cfg("MAX_SNAPSHOT_DATE", None)
+    if min_snapshot_date:
+        out = out[out["snapshot_date"] >= pd.to_datetime(min_snapshot_date)]
+    if max_snapshot_date:
+        out = out[out["snapshot_date"] <= pd.to_datetime(max_snapshot_date)]
 
-def normalize_serial_list(values: Optional[Iterable[object]]) -> list[str]:
-    """Normalize configured MINI_RUN_SERIALS values."""
-    if not values:
-        return []
-    out: list[str] = []
-    for value in values:
-        if value is None or pd.isna(value):
-            continue
-        text = str(value).strip()
-        if text:
-            out.append(text)
+    mini_enabled = bool(cfg("MINI_RUN_ENABLED", False))
+    if mini_enabled:
+        model_ids = [str(x).strip() for x in cfg("MINI_RUN_MODEL_IDS", []) if str(x).strip()]
+        if model_ids:
+            out = out[out["model_id"].astype(str).isin(model_ids)].copy()
+            progress(f"Mini-run enabled using explicit MINI_RUN_MODEL_IDS. Selected {out['model_id'].nunique():,} model_ids.")
+        else:
+            n = int(cfg("MINI_RUN_MACHINE_COUNT", 3))
+            selected = out["model_id"].drop_duplicates().head(n)
+            out = out[out["model_id"].isin(selected)].copy()
+            progress(f"Mini-run enabled. Selected first {out['model_id'].nunique():,} model_ids from machine backbone.")
+    else:
+        max_machines = cfg("MAX_MACHINES", None)
+        if max_machines is not None:
+            selected = out["model_id"].drop_duplicates().head(int(max_machines))
+            out = out[out["model_id"].isin(selected)].copy()
+            progress(f"MAX_MACHINES limiter active. Selected {out['model_id'].nunique():,} model_ids.")
+
+    out = out.sort_values(["model_id", "snapshot_date"]).reset_index(drop=True)
+    validate_backbone(out)
     return out
 
 
-def save_mini_validation_outputs(df: pd.DataFrame, output_dir: str | Path) -> None:
-    """Write small QA files for mini validation mode."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def validate_backbone(backbone: pd.DataFrame) -> None:
+    """Validate that the canonical backbone has one row per model_id/snapshot_date."""
+    required = {"model_id", "snapshot_date"}
+    missing = required - set(backbone.columns)
+    if missing:
+        raise ValueError(f"Backbone is missing required columns: {sorted(missing)}")
+    if backbone[["model_id", "snapshot_date"]].isna().any().any():
+        raise ValueError("Backbone contains missing model_id or snapshot_date values after cleaning.")
+    duplicate_count = int(backbone.duplicated(["model_id", "snapshot_date"]).sum())
+    if duplicate_count:
+        raise ValueError(f"Backbone has duplicate model_id + snapshot_date rows: {duplicate_count:,}")
 
-    sample_path = Path(cfg("MINI_VALIDATION_SAMPLE_ROWS_PATH", output_dir / "mini_snapshot_validation_sample_rows.csv"))
-    by_machine_path = Path(cfg("MINI_VALIDATION_BY_MACHINE_PATH", output_dir / "mini_snapshot_validation_by_machine.csv"))
-
-    df.head(200).to_csv(sample_path, index=False)
-
-    if not df.empty:
-        agg = (
-            df.groupby(["SERIAL", "full_model", "model_family"], dropna=False)
-            .agg(
-                snapshot_rows=("snapshot_date", "size"),
-                first_snapshot_date=("snapshot_date", "min"),
-                last_snapshot_date=("snapshot_date", "max"),
-            )
-            .reset_index()
-        )
-        if "claim_next_45d" in df.columns:
-            target_summary = df.groupby("SERIAL", dropna=False)["claim_next_45d"].sum(min_count=1).reset_index()
-            target_summary = target_summary.rename(columns={"claim_next_45d": "positive_claim_labels"})
-            agg = agg.merge(target_summary, on="SERIAL", how="left")
-    else:
-        agg = pd.DataFrame(columns=["SERIAL", "full_model", "model_family", "snapshot_rows", "first_snapshot_date", "last_snapshot_date"])
-
-    agg.to_csv(by_machine_path, index=False)
-    progress(f"Mini validation sample saved to: {sample_path}")
-    progress(f"Mini validation by-machine summary saved to: {by_machine_path}")
 
 # -----------------------------------------------------------------------------
 # Source standardization
 # -----------------------------------------------------------------------------
-def standardize_faults(fault: pd.DataFrame) -> pd.DataFrame:
-    """Convert the raw fault/event file into a standardized event table.
-
-    This function explicitly detects fault-code rows with no usable event date.
-    Those rows are dropped before feature generation and the counts are written
-    to source_standardization_summary.csv.
-    """
+def standardize_faults(fault: pd.DataFrame, allowed_model_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Convert the raw fault/event table into a standardized event table."""
     f = fault.copy()
-    rows_before = len(f)
+    f["model_id"], model_id_source = normalize_model_id(f, "fault_codes")
+    f["full_model"] = first_existing_col(f, ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"], pd.NA).astype("string").str.strip()
 
-    f["SERIAL"] = normalize_key(first_existing_col(f, ["serial_number", "SERIAL", "Serial", "ZZSERNR"]))
-    f["full_model"] = first_existing_col(
-        f,
-        ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"],
-        "",
-    ).astype("string").str.strip()
-    f["model_family"] = f["full_model"].map(model_family)
-
-    # Prefer event_time if available because it has timestamp precision. If it is
-    # missing, fall back to event_date. Both are cleaned to timezone-naive UTC.
     event_time = parse_dt(first_existing_col(f, ["event_time", "UPDATE_DATETIME", "update_datetime"], pd.NaT))
     event_date = parse_dt(first_existing_col(f, ["event_date", "LOCAL_DATE", "local_date"], pd.NaT))
     f["fault_event_date"] = event_time.fillna(event_date)
 
-    missing_date_rows = int(f["fault_event_date"].isna().sum())
-    missing_serial_rows = int(f["SERIAL"].isna().sum())
-    non_target_model_rows = int(~f["model_family"].isin(TARGET_MODEL_FAMILIES).sum()) if False else 0
-    non_target_model_rows = int((~f["model_family"].isin(TARGET_MODEL_FAMILIES)).sum())
-
-    progress(
-        "Fault date quality: "
-        f"raw rows={rows_before:,}; rows with no usable date={missing_date_rows:,}; "
-        f"rows with missing SERIAL={missing_serial_rows:,}"
-    )
-
-    # Standardize field variants used by the feature functions below.
-    f["fault_code_clean"] = first_existing_col(
-        f,
-        ["fault_code", "EVENT_CODE", "event_code", "ERROR_CODE", "error_code"],
-        "",
-    ).astype("string").str.strip()
-    f["event_action_level_clean"] = first_existing_col(
-        f,
-        ["event_action_level", "Action_level", "ACTION_LEVEL", "action_level"],
-        "",
-    ).astype("string").str.upper().str.strip()
-    f["action_level_num_clean"] = pd.to_numeric(
-        first_existing_col(f, ["action_level_num", "ACTION_LEVEL_NUM"], np.nan),
-        errors="coerce",
-    )
-    f["action_level_num_clean"] = f["action_level_num_clean"].fillna(
-        action_level_to_num(f["event_action_level_clean"])
-    )
-    f["occurrence_count_clean"] = pd.to_numeric(
-        first_existing_col(f, ["occurrence_count", "OCCURRENCE_COUNT"], 1),
-        errors="coerce",
-    ).fillna(1)
-    f["log_occurrence_clean"] = pd.to_numeric(
-        first_existing_col(f, ["log_occurrence_count"], np.nan),
-        errors="coerce",
-    )
+    f["fault_code_clean"] = first_existing_col(f, ["fault_code", "EVENT_CODE", "event_code", "ERROR_CODE", "error_code"], "").astype("string").str.strip()
+    f["event_action_level_clean"] = first_existing_col(f, ["event_action_level", "Action_level", "ACTION_LEVEL", "action_level"], "").astype("string").str.upper().str.strip()
+    f["action_level_num_clean"] = pd.to_numeric(first_existing_col(f, ["action_level_num", "ACTION_LEVEL_NUM"], np.nan), errors="coerce")
+    f["action_level_num_clean"] = f["action_level_num_clean"].fillna(action_level_to_num(f["event_action_level_clean"]))
+    f["occurrence_count_clean"] = pd.to_numeric(first_existing_col(f, ["occurrence_count", "OCCURRENCE_COUNT"], 1), errors="coerce").fillna(1)
+    f["log_occurrence_clean"] = pd.to_numeric(first_existing_col(f, ["log_occurrence_count"], np.nan), errors="coerce")
     f["log_occurrence_clean"] = f["log_occurrence_clean"].fillna(np.log1p(f["occurrence_count_clean"]))
-    f["occurrence_class_clean"] = pd.to_numeric(
-        first_existing_col(f, ["occurrence_class"], 0),
-        errors="coerce",
-    ).fillna(0)
-    f["smr_hours_clean"] = pd.to_numeric(
-        first_existing_col(f, ["smr_hours", "SMR", "TELEMETRY_SMR", "telemetry_smr"], np.nan),
-        errors="coerce",
-    )
-    f["failure_code_evidence_score_clean"] = pd.to_numeric(
-        first_existing_col(f, ["failure_code_evidence_score"], np.nan),
-        errors="coerce",
-    )
-    f["evidence_strength_clean"] = first_existing_col(
-        f,
-        ["failure_code_evidence_strength_class"],
-        "",
-    ).astype("string").str.upper().str.strip()
-    f["evidence_group_clean"] = first_existing_col(
-        f,
-        ["failure_code_evidence_group"],
-        "",
-    ).astype("string").str.upper().str.strip()
-    f["history_category_clean"] = first_existing_col(
-        f,
-        ["history_category"],
-        "",
-    ).astype("string").str.lower()
-    f["applicable_component_clean"] = first_existing_col(
-        f,
-        ["applicable_component", "applicableComponent"],
-        "",
-    ).astype("string")
+    f["occurrence_class_clean"] = pd.to_numeric(first_existing_col(f, ["occurrence_class"], 0), errors="coerce").fillna(0)
+    f["smr_hours_clean"] = pd.to_numeric(first_existing_col(f, ["smr_hours", "SMR", "TELEMETRY_SMR", "telemetry_smr"], np.nan), errors="coerce")
+    f["failure_code_evidence_score_clean"] = pd.to_numeric(first_existing_col(f, ["failure_code_evidence_score"], np.nan), errors="coerce")
+    f["evidence_strength_clean"] = first_existing_col(f, ["failure_code_evidence_strength_class"], "").astype("string").str.upper().str.strip()
+    f["evidence_group_clean"] = first_existing_col(f, ["failure_code_evidence_group"], "").astype("string").str.upper().str.strip()
+    f["history_category_clean"] = first_existing_col(f, ["history_category"], "").astype("string").str.lower()
+    f["applicable_component_clean"] = first_existing_col(f, ["applicable_component", "applicableComponent"], "").astype("string")
     f["related_component_clean"] = (
         first_existing_col(f, ["related_component"], "").astype("string")
         + " "
@@ -761,88 +640,59 @@ def standardize_faults(fault: pd.DataFrame) -> pd.DataFrame:
         + " "
         + first_existing_col(f, ["applicable_component", "applicableComponent"], "").astype("string")
     )
-    f["is_mechanical_failure_code_clean"] = pd.to_numeric(
-        first_existing_col(f, ["is_mechanical_failure_code"], 0),
-        errors="coerce",
-    ).fillna(0)
-    f["is_electrical_failure_code_clean"] = pd.to_numeric(
-        first_existing_col(f, ["is_electrical_failure_code"], 0),
-        errors="coerce",
-    ).fillna(0)
+    f["is_mechanical_failure_code_clean"] = pd.to_numeric(first_existing_col(f, ["is_mechanical_failure_code"], 0), errors="coerce").fillna(0)
+    f["is_electrical_failure_code_clean"] = pd.to_numeric(first_existing_col(f, ["is_electrical_failure_code"], 0), errors="coerce").fillna(0)
 
-    # Keep only usable D51/D61/D71 fault records with a machine id and date.
-    keep_mask = (
-        f["fault_event_date"].notna()
-        & f["SERIAL"].notna()
-        & f["model_family"].isin(TARGET_MODEL_FAMILIES)
-    )
-    dropped_total = int((~keep_mask).sum())
-    f = f[keep_mask]
+    for comp, patterns in COMPONENT_PATTERNS.items():
+        f[f"is_component_{comp}"] = contains_any(f["related_component_clean"], patterns)
+    f["is_event_evidence"] = f["evidence_group_clean"].eq("EVENT") | f["history_category_clean"].str.contains("event", na=False)
+    f["is_context_evidence"] = f["evidence_group_clean"].eq("CONTEXT") | f["history_category_clean"].str.contains("context", na=False)
 
-    append_standardization_summary(
-        {
-            "dataset": "fault_codes",
-            "rows_before_standardization": rows_before,
-            "rows_after_standardization": len(f),
-            "rows_dropped_total": dropped_total,
-            "rows_missing_usable_date_dropped": missing_date_rows,
-            "rows_missing_serial": missing_serial_rows,
-            "rows_non_target_model_family": non_target_model_rows,
-            "target_model_families": ",".join(TARGET_MODEL_FAMILIES),
-        }
-    )
-    progress(
-        "Fault standardization complete: "
-        f"kept {len(f):,} rows; dropped {dropped_total:,} rows "
-        f"including {missing_date_rows:,} rows with no usable date"
-    )
-    return f.sort_values(["SERIAL", "fault_event_date"]).reset_index(drop=True)
+    total_rows = len(f)
+    missing_model_id_rows = int(f["model_id"].isna().sum())
+    missing_date_rows = int(f["fault_event_date"].isna().sum())
+    not_in_backbone_rows = int((~f["model_id"].astype("string").isin(allowed_model_ids) & f["model_id"].notna()).sum())
 
-def standardize_maintenance(pm: pd.DataFrame) -> pd.DataFrame:
-    """Convert the raw maintenance-monitor file into a standardized event table."""
+    out = f[
+        f["model_id"].notna()
+        & f["fault_event_date"].notna()
+        & f["model_id"].astype("string").isin(allowed_model_ids)
+    ].copy()
+    out = out.sort_values(["model_id", "fault_event_date"]).reset_index(drop=True)
+
+    summary = {
+        "source": "fault_codes",
+        "source_role": "event_features",
+        "input_rows": total_rows,
+        "model_id_source": model_id_source,
+        "snapshot_date_source": "event_time/event_date",
+        "missing_model_id_rows": missing_model_id_rows,
+        "missing_usable_event_date_rows": missing_date_rows,
+        "dropped_missing_event_date_rows": missing_date_rows,
+        "rows_not_in_machine_backbone": not_in_backbone_rows,
+        "rows_after_standardization": len(out),
+        "unique_model_ids_after_standardization": out["model_id"].nunique(),
+    }
+    return out, summary
+
+
+def standardize_maintenance(pm: pd.DataFrame, allowed_model_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Convert the raw maintenance-monitor table into a standardized event table."""
     m = pm.copy()
-
-    m["SERIAL"] = normalize_key(first_existing_col(m, ["SERIAL", "serial_number", "Serial"]))
-    m["full_model"] = first_existing_col(
-        m,
-        ["full_model", "FULL_MODEL", "MODEL", "model"],
-        "",
-    ).astype("string").str.strip()
-    m["model_family"] = m["full_model"].map(model_family)
+    m["model_id"], model_id_source = normalize_model_id(m, "maintenance")
+    m["full_model"] = first_existing_col(m, ["full_model", "FULL_MODEL", "MODEL", "model"], pd.NA).astype("string").str.strip()
 
     event_time = parse_dt(first_existing_col(m, ["event_time", "UPDATE_DATETIME", "update_datetime"], pd.NaT))
     event_date = parse_dt(first_existing_col(m, ["event_date", "date", "LOCAL_DATE", "local_date"], pd.NaT))
     m["maintenance_event_date"] = event_time.fillna(event_date)
 
-    m["smr_hours_clean"] = pd.to_numeric(
-        first_existing_col(m, ["smr_hours", "SMR", "TELEMETRY_SMR", "telemetry_smr"], np.nan),
-        errors="coerce",
-    )
-    m["remaining_hours_clean"] = pd.to_numeric(
-        first_existing_col(m, ["remaining_hours", "REMAINING_HOURS"], np.nan),
-        errors="coerce",
-    )
-    m["is_monitor_reset_clean"] = boolean_from_mixed_values(
-        first_existing_col(m, ["is_monitor_reset"], False),
-        default=False,
-    )
-    m["is_overdue_clean"] = boolean_from_mixed_values(
-        first_existing_col(m, ["is_overdue"], False),
-        default=False,
-    )
-    m["is_due_now_clean"] = boolean_from_mixed_values(
-        first_existing_col(m, ["is_due_now"], False),
-        default=False,
-    )
-    m["available_clean"] = boolean_from_mixed_values(
-        first_existing_col(m, ["AVAILABLE", "available"], True),
-        default=True,
-    )
-    m["maintenance_type_clean"] = first_existing_col(
-        m,
-        ["maintenance_type", "service_types", "SERVICE_TYPES"],
-        "",
-    ).astype("string")
+    m["smr_hours_clean"] = pd.to_numeric(first_existing_col(m, ["smr_hours", "SMR", "TELEMETRY_SMR", "telemetry_smr"], np.nan), errors="coerce")
+    m["remaining_hours_clean"] = pd.to_numeric(first_existing_col(m, ["remaining_hours", "REMAINING_HOURS"], np.nan), errors="coerce")
+    m["is_monitor_reset_clean"] = boolean_from_mixed_values(first_existing_col(m, ["is_monitor_reset"], False), default=False)
+    m["is_overdue_clean"] = boolean_from_mixed_values(first_existing_col(m, ["is_overdue"], False), default=False)
+    m["is_due_now_clean"] = boolean_from_mixed_values(first_existing_col(m, ["is_due_now"], False), default=False)
+    m["available_clean"] = boolean_from_mixed_values(first_existing_col(m, ["AVAILABLE", "available"], True), default=True)
+    m["maintenance_type_clean"] = first_existing_col(m, ["maintenance_type", "service_types", "SERVICE_TYPES"], "").astype("string")
     m["related_component_clean"] = (
         first_existing_col(m, ["related_component"], "").astype("string")
         + " "
@@ -851,151 +701,48 @@ def standardize_maintenance(pm: pd.DataFrame) -> pd.DataFrame:
         + first_existing_col(m, ["related_component_2"], "").astype("string")
     )
 
-    m = m[
-        m["maintenance_event_date"].notna()
-        & m["SERIAL"].notna()
-        & m["model_family"].isin(TARGET_MODEL_FAMILIES)
-    ]
-    return m.sort_values(["SERIAL", "maintenance_event_date"]).reset_index(drop=True)
+    for comp, patterns in COMPONENT_PATTERNS.items():
+        m[f"is_component_{comp}"] = contains_any(m["related_component_clean"], patterns)
+    for mtype, patterns in MAINTENANCE_TYPE_PATTERNS.items():
+        m[f"is_maintenance_type_{mtype}"] = contains_any(m["maintenance_type_clean"], patterns)
 
+    total_rows = len(m)
+    missing_model_id_rows = int(m["model_id"].isna().sum())
+    missing_date_rows = int(m["maintenance_event_date"].isna().sum())
+    not_in_backbone_rows = int((~m["model_id"].astype("string").isin(allowed_model_ids) & m["model_id"].notna()).sum())
 
-def standardize_warranty(warranty: pd.DataFrame) -> pd.DataFrame:
-    """Standardize the optional warranty table used to create claim_next_45d."""
-    w = warranty.copy()
-    w["SERIAL"] = normalize_key(first_existing_col(w, ["ZZSERNR", "SERIAL", "serial_number", "Serial"]))
-    w["warranty_failure_date"] = parse_dt(
-        first_existing_col(w, ["ZZFAILDAT", "warranty_failure_date", "failure_date"], pd.NaT)
-    )
-    w = w[w["SERIAL"].notna() & w["warranty_failure_date"].notna()]
-    return w.sort_values(["SERIAL", "warranty_failure_date"]).reset_index(drop=True)
+    out = m[
+        m["model_id"].notna()
+        & m["maintenance_event_date"].notna()
+        & m["model_id"].astype("string").isin(allowed_model_ids)
+    ].copy()
+    out = out.sort_values(["model_id", "maintenance_event_date"]).reset_index(drop=True)
 
-
-# -----------------------------------------------------------------------------
-# Snapshot backbone
-# -----------------------------------------------------------------------------
-def build_machine_universe(
-    fault: pd.DataFrame,
-    machine: pd.DataFrame,
-    pm: pd.DataFrame,
-    max_machines: Optional[int] = None,
-    mini_run_enabled: bool = False,
-    mini_run_machine_count: int = 3,
-    mini_run_serials: Optional[Iterable[object]] = None,
-) -> pd.DataFrame:
-    """Create the D51/D61/D71 machine universe.
-
-    The machine file is preferred for static model information. However, because
-    the current machine.csv may be a proxy or duplicate of the fault-code file,
-    this function also looks at the standardized fault and maintenance tables so
-    that machines are not accidentally lost.
-    """
-    chunks: list[pd.DataFrame] = []
-
-    for df in [machine, fault, pm]:
-        d = df.copy()
-        d["SERIAL"] = normalize_key(first_existing_col(d, ["SERIAL", "serial_number", "Serial", "ZZSERNR"]))
-        d["full_model"] = first_existing_col(
-            d,
-            ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"],
-            "",
-        ).astype("string").str.strip()
-        d["model_family"] = d["full_model"].map(model_family)
-        chunks.append(d[["SERIAL", "full_model", "model_family"]].dropna(subset=["SERIAL"]))
-
-    universe = pd.concat(chunks, ignore_index=True)
-    universe = universe[universe["model_family"].isin(TARGET_MODEL_FAMILIES)]
-    universe = (
-        universe.sort_values(["SERIAL", "full_model"])
-        .drop_duplicates("SERIAL", keep="last")
-        .reset_index(drop=True)
-    )
-
-    if mini_run_enabled:
-        selected_serials = normalize_serial_list(mini_run_serials)
-        if selected_serials:
-            before_filter = len(universe)
-            universe = universe[universe["SERIAL"].isin(selected_serials)].copy()
-            progress(
-                f"Mini run enabled with configured serials: kept {len(universe):,} "
-                f"of {before_filter:,} machines"
-            )
-        else:
-            universe = universe.head(int(mini_run_machine_count)).copy()
-            progress(f"Mini run enabled: using first {len(universe):,} machines")
-    elif max_machines is not None:
-        universe = universe.head(max_machines).copy()
-
-    return universe
-
-
-def build_snapshot_backbone(
-    universe: pd.DataFrame,
-    fault: pd.DataFrame,
-    pm: pd.DataFrame,
-    warranty: Optional[pd.DataFrame] = None,
-    snapshot_freq_days: int = 14,
-    min_snapshot_date: Optional[str] = None,
-    max_snapshot_date: Optional[str] = None,
-) -> pd.DataFrame:
-    """Generate one row per machine per snapshot date.
-
-    For each machine, the snapshot range runs from the first observed event date
-    to the last observed event date. Optional min/max date arguments are useful
-    for development runs or time-based train/validation/test construction.
-    """
-    event_frames = [
-        fault[["SERIAL", "fault_event_date"]].rename(columns={"fault_event_date": "event_date"}),
-        pm[["SERIAL", "maintenance_event_date"]].rename(columns={"maintenance_event_date": "event_date"}),
-    ]
-    if warranty is not None and not warranty.empty:
-        event_frames.append(
-            warranty[["SERIAL", "warranty_failure_date"]].rename(columns={"warranty_failure_date": "event_date"})
-        )
-
-    events = pd.concat(event_frames, ignore_index=True).dropna(subset=["event_date"])
-    bounds = events.groupby("SERIAL")["event_date"].agg(
-        first_observed_date="min",
-        last_observed_date="max",
-    ).reset_index()
-    backbone_base = universe.merge(bounds, on="SERIAL", how="inner")
-
-    min_dt = pd.to_datetime(min_snapshot_date) if min_snapshot_date else None
-    max_dt = pd.to_datetime(max_snapshot_date) if max_snapshot_date else None
-
-    rows: list[tuple] = []
-    total_machines = len(backbone_base)
-    progress(f"Creating snapshot dates for {total_machines:,} machines...")
-
-    for machine_idx, r in enumerate(backbone_base.itertuples(index=False), start=1):
-        start = pd.Timestamp(r.first_observed_date).normalize()
-        end = pd.Timestamp(r.last_observed_date).normalize()
-
-        if min_dt is not None:
-            start = max(start, min_dt)
-        if max_dt is not None:
-            end = min(end, max_dt)
-        if start > end:
-            continue
-
-        for snap in pd.date_range(start=start, end=end, freq=f"{snapshot_freq_days}D"):
-            rows.append((r.SERIAL, r.full_model, r.model_family, snap))
-
-        if machine_idx == 1 or machine_idx % PROGRESS_EVERY_MACHINES == 0 or machine_idx == total_machines:
-            progress(f"Backbone progress: {machine_idx:,}/{total_machines:,} machines; {len(rows):,} snapshot rows")
-
-    return pd.DataFrame(rows, columns=["SERIAL", "full_model", "model_family", "snapshot_date"])
+    summary = {
+        "source": "maintenance",
+        "source_role": "event_features",
+        "input_rows": total_rows,
+        "model_id_source": model_id_source,
+        "snapshot_date_source": "event_time/event_date/date",
+        "missing_model_id_rows": missing_model_id_rows,
+        "missing_usable_event_date_rows": missing_date_rows,
+        "dropped_missing_event_date_rows": missing_date_rows,
+        "rows_not_in_machine_backbone": not_in_backbone_rows,
+        "rows_after_standardization": len(out),
+        "unique_model_ids_after_standardization": out["model_id"].nunique(),
+    }
+    return out, summary
 
 
 # -----------------------------------------------------------------------------
-# Fault feature engineering
+# Fault source feature engineering
 # -----------------------------------------------------------------------------
-def fault_features_for_machine(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[dict]:
-    """Create fault-derived features for one machine across all snapshot dates."""
+def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[dict]:
+    """Create fault-derived features for one model_id across all snapshot dates."""
     out: list[dict] = []
     dates = f_m["fault_event_date"] if "fault_event_date" in f_m.columns else pd.Series(dtype="datetime64[ns]")
 
     for snap in snap_m["snapshot_date"]:
-        # All feature calculations below use dates before the snapshot only.
         before = f_m[dates < snap]
         w90 = before[before["fault_event_date"] >= snap - pd.Timedelta(days=90)]
         w30 = before[before["fault_event_date"] >= snap - pd.Timedelta(days=30)]
@@ -1006,9 +753,7 @@ def fault_features_for_machine(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[
         ]
         severe_before = before[before["event_action_level_clean"].isin(["L03", "L04", "L05"])]
 
-        row: dict = {"snapshot_date": snap}
-
-        # Recent fault volume and trend features.
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
         row["fault_count_7d"] = len(w7)
         row["fault_count_30d"] = len(w30)
         row["fault_count_90d"] = len(w90)
@@ -1017,7 +762,6 @@ def fault_features_for_machine(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[
         row["days_since_last_fault"] = days_between(snap, before["fault_event_date"].max())
         row["days_since_last_severe_fault"] = days_between(snap, severe_before["fault_event_date"].max())
 
-        # Normalize fault volume by recent SMR growth when SMR is available.
         smr_latest = before["smr_hours_clean"].dropna().max()
         smr_90_ago_candidates = before[
             before["fault_event_date"] <= snap - pd.Timedelta(days=90)
@@ -1030,18 +774,15 @@ def fault_features_for_machine(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[
         )
         row["faults_per_100_hours"] = ratio(row["fault_count_90d"], max((smr_delta_90d or 0) / 100.0, 1.0))
 
-        # Fault diversity and repetition features.
         row["unique_fault_code_count_90d"] = w90["fault_code_clean"].replace("", np.nan).nunique()
         row["repeat_fault_ratio_90d"] = ratio(row["fault_count_90d"], max(row["unique_fault_code_count_90d"], 1))
         row["unique_component_count_90d"] = w90["applicable_component_clean"].replace("", np.nan).nunique()
 
-        # Mechanical/electrical flags from the enriched fault-code file.
         row["mechanical_fault_count_90d"] = int((w90["is_mechanical_failure_code_clean"] == 1).sum())
         row["mechanical_fault_count_30d"] = int((w30["is_mechanical_failure_code_clean"] == 1).sum())
         row["electrical_fault_count_90d"] = int((w90["is_electrical_failure_code_clean"] == 1).sum())
         row["electrical_fault_count_30d"] = int((w30["is_electrical_failure_code_clean"] == 1).sum())
 
-        # Severity/action-level features.
         for lvl in ["L01", "L02", "L03", "L04"]:
             row[f"action_{lvl}_count_90d"] = int((w90["event_action_level_clean"] == lvl).sum())
         row["max_action_level_90d"] = w90["action_level_num_clean"].max()
@@ -1049,42 +790,29 @@ def fault_features_for_machine(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[
         row["max_log_occurrence_90d"] = w90["log_occurrence_clean"].max()
         row["occurrence_severity_score_90d"] = w90["occurrence_class_clean"].sum()
 
-        # Evidence-strength features from enriched failure-code logic.
         row["strong_fault_count_90d"] = int((w90["evidence_strength_clean"] == "STRONG").sum())
         row["moderate_fault_count_90d"] = int(w90["evidence_strength_clean"].isin(["MEDIUM", "MODERATE"]).sum())
-        event_w90 = w90[
-            w90["evidence_group_clean"].eq("EVENT")
-            | w90["history_category_clean"].str.contains("event", na=False)
-        ]
-        context_w90 = w90[
-            w90["evidence_group_clean"].eq("CONTEXT")
-            | w90["history_category_clean"].str.contains("context", na=False)
-        ]
+        event_w90 = w90[w90["is_event_evidence"]]
+        context_w90 = w90[w90["is_context_evidence"]]
         row["max_event_evidence_score_90d"] = event_w90["failure_code_evidence_score_clean"].max()
         row["avg_event_evidence_score_90d"] = event_w90["failure_code_evidence_score_clean"].mean()
         row["max_context_evidence_score_90d"] = context_w90["failure_code_evidence_score_clean"].max()
 
-        # Component bucket features based on related/applicable component text.
-        component_counts = {}
-        for comp, pats in COMPONENT_PATTERNS.items():
-            feature = {
-                "engine": "engine_fault_count_90d",
-                "hydraulic": "hydraulic_fault_count_90d",
-                "powertrain": "powertrain_fault_count_90d",
-                "scr": "scr_fault_count_90d",
-                "workequipment": "workequipment_fault_count_90d",
-                "cooling": "cooling_fault_count_90d",
-            }.get(comp)
-            if feature:
-                cnt = int(contains_any(w90["related_component_clean"], pats).sum())
-                row[feature] = cnt
-                component_counts[feature] = cnt
-        row["top_component_fault_ratio_90d"] = ratio(
-            max(component_counts.values()) if component_counts else 0,
-            row["fault_count_90d"],
-        )
+        component_counts: dict[str, int] = {}
+        component_feature_map = {
+            "engine": "engine_fault_count_90d",
+            "hydraulic": "hydraulic_fault_count_90d",
+            "powertrain": "powertrain_fault_count_90d",
+            "scr": "scr_fault_count_90d",
+            "workequipment": "workequipment_fault_count_90d",
+            "cooling": "cooling_fault_count_90d",
+        }
+        for comp, feature in component_feature_map.items():
+            cnt = int(w90[f"is_component_{comp}"].sum()) if f"is_component_{comp}" in w90.columns else 0
+            row[feature] = cnt
+            component_counts[feature] = cnt
+        row["top_component_fault_ratio_90d"] = ratio(max(component_counts.values()) if component_counts else 0, row["fault_count_90d"])
 
-        # Extra non-frozen helper columns are useful for QA and model debugging.
         row["has_fault_90d"] = int(row["fault_count_90d"] > 0)
         row["smr_latest_before_snapshot"] = smr_latest
         row["smr_delta_90d"] = smr_delta_90d
@@ -1093,11 +821,38 @@ def fault_features_for_machine(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[
     return out
 
 
+def build_fault_snapshot(backbone: pd.DataFrame, fault: pd.DataFrame) -> pd.DataFrame:
+    """Build the source-specific fault snapshot dataframe on the machine backbone."""
+    start = time.perf_counter()
+    rows: list[pd.DataFrame] = []
+    fault_groups = {k: v for k, v in fault.groupby("model_id", sort=False)}
+
+    total_models = backbone["model_id"].nunique() if not backbone.empty else 0
+    total_snapshot_rows = len(backbone)
+    processed_snapshot_rows = 0
+    progress(f"Building fault snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
+
+    for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
+        f_m = fault_groups.get(model_id, fault.iloc[0:0])
+        rows.append(pd.DataFrame(fault_features_for_model(snap_m, f_m)))
+        processed_snapshot_rows += len(snap_m)
+
+        if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
+            progress(
+                f"Fault snapshot progress: {idx:,}/{total_models:,} model_ids; "
+                f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
+            )
+
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date"])
+    progress(f"Fault snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
+    return result
+
+
 # -----------------------------------------------------------------------------
-# Maintenance feature engineering
+# Maintenance source feature engineering
 # -----------------------------------------------------------------------------
-def maintenance_features_for_machine(snap_m: pd.DataFrame, m_m: pd.DataFrame) -> list[dict]:
-    """Create maintenance-monitor features for one machine across snapshots."""
+def maintenance_features_for_model(snap_m: pd.DataFrame, m_m: pd.DataFrame) -> list[dict]:
+    """Create maintenance-derived features for one model_id across snapshots."""
     out: list[dict] = []
     dates = m_m["maintenance_event_date"] if "maintenance_event_date" in m_m.columns else pd.Series(dtype="datetime64[ns]")
 
@@ -1108,9 +863,6 @@ def maintenance_features_for_machine(snap_m: pd.DataFrame, m_m: pd.DataFrame) ->
         reset180 = w180[w180["is_monitor_reset_clean"]]
         reset90 = w90[w90["is_monitor_reset_clean"]]
 
-        # Current maintenance state is the latest available record for each item
-        # before the snapshot. EVENT_NAME_EN is the best item name in the current
-        # enriched file. If it is missing, current-state features safely become 0.
         latest_cols = ["EVENT_NAME_EN"] if "EVENT_NAME_EN" in before.columns else []
         if latest_cols and len(before):
             current = before.sort_values("maintenance_event_date").groupby(latest_cols, dropna=False).tail(1)
@@ -1118,19 +870,16 @@ def maintenance_features_for_machine(snap_m: pd.DataFrame, m_m: pd.DataFrame) ->
         else:
             current = before.tail(0)
 
-        row: dict = {"snapshot_date": snap}
-
-        # Maintenance frequency and reset behavior.
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
         row["maintenance_events_180d"] = len(w180)
         row["monitor_reset_count_180d"] = len(reset180)
         row["maintenance_reset_ratio_180d"] = ratio(row["monitor_reset_count_180d"], row["maintenance_events_180d"])
         row["maintenance_events_90d"] = len(w90)
         row["monitor_reset_count_90d"] = len(reset90)
-
-        # Current maintenance due/overdue status.
         row["active_maintenance_items"] = len(current)
         row["overdue_item_count"] = int(current["is_overdue_clean"].sum()) if len(current) else 0
         row["due_now_item_count"] = int(current["is_due_now_clean"].sum()) if len(current) else 0
+
         if len(current) and "remaining_hours_clean" in current.columns:
             row["overdue_item_count"] = max(row["overdue_item_count"], int((current["remaining_hours_clean"] < 0).sum()))
             row["due_now_item_count"] = max(row["due_now_item_count"], int((current["remaining_hours_clean"] == 0).sum()))
@@ -1141,46 +890,40 @@ def maintenance_features_for_machine(snap_m: pd.DataFrame, m_m: pd.DataFrame) ->
         row["avg_remaining_hours"] = current["remaining_hours_clean"].mean() if len(current) else np.nan
         row["min_remaining_hours"] = current["remaining_hours_clean"].min() if len(current) else np.nan
 
-        # Component-level reset and overdue features.
-        for comp, pats in COMPONENT_PATTERNS.items():
-            reset_feature = {
-                "engine": "engine_reset_count_180d",
-                "powertrain": "transmission_reset_count_180d",
-                "final_drive": "final_drive_reset_count_180d",
-                "cooling": "cooling_system_reset_count_180d",
-                "scr": "urea_scr_system_reset_count_180d",
-            }.get(comp)
-            overdue_feature = {
-                "engine": "engine_overdue_item_count",
-                "powertrain": "transmission_overdue_item_count",
-                "final_drive": "final_drive_overdue_item_count",
-                "cooling": "cooling_system_overdue_item_count",
-                "scr": "urea_scr_system_overdue_item_count",
-            }.get(comp)
+        component_reset_feature_map = {
+            "engine": "engine_reset_count_180d",
+            "powertrain": "transmission_reset_count_180d",
+            "final_drive": "final_drive_reset_count_180d",
+            "cooling": "cooling_system_reset_count_180d",
+            "scr": "urea_scr_system_reset_count_180d",
+        }
+        component_overdue_feature_map = {
+            "engine": "engine_overdue_item_count",
+            "powertrain": "transmission_overdue_item_count",
+            "final_drive": "final_drive_overdue_item_count",
+            "cooling": "cooling_system_overdue_item_count",
+            "scr": "urea_scr_system_overdue_item_count",
+        }
+        for comp, feature in component_reset_feature_map.items():
+            row[feature] = int(reset180[f"is_component_{comp}"].sum()) if f"is_component_{comp}" in reset180.columns else 0
+        for comp, feature in component_overdue_feature_map.items():
+            if len(current) and f"is_component_{comp}" in current.columns:
+                row[feature] = int(current[current["is_overdue_clean"]][f"is_component_{comp}"].sum())
+            else:
+                row[feature] = 0
 
-            if reset_feature:
-                row[reset_feature] = int(contains_any(reset180["related_component_clean"], pats).sum())
-            if overdue_feature:
-                row[overdue_feature] = (
-                    int(contains_any(current[current["is_overdue_clean"]]["related_component_clean"], pats).sum())
-                    if len(current)
-                    else 0
-                )
-
-        # Maintenance type features.
-        for mtype, pats in MAINTENANCE_TYPE_PATTERNS.items():
-            row[f"{mtype}_reset_count_180d"] = int(contains_any(reset180["maintenance_type_clean"], pats).sum())
+        for mtype in MAINTENANCE_TYPE_PATTERNS:
+            col = f"is_maintenance_type_{mtype}"
+            row[f"{mtype}_reset_count_180d"] = int(reset180[col].sum()) if col in reset180.columns else 0
 
         row["unique_maintenance_type_count_180d"] = reset180["maintenance_type_clean"].replace("", np.nan).nunique()
         row["days_since_last_reset"] = days_between(snap, reset180["maintenance_event_date"].max())
 
-        oil_reset = reset180[contains_any(reset180["maintenance_type_clean"], MAINTENANCE_TYPE_PATTERNS["oil"])]
-        filter_reset = reset180[contains_any(reset180["maintenance_type_clean"], MAINTENANCE_TYPE_PATTERNS["filter"])]
+        oil_reset = reset180[reset180.get("is_maintenance_type_oil", pd.Series(False, index=reset180.index))]
+        filter_reset = reset180[reset180.get("is_maintenance_type_filter", pd.Series(False, index=reset180.index))]
         row["days_since_last_oil_reset"] = days_between(snap, oil_reset["maintenance_event_date"].max())
         row["days_since_last_filter_reset"] = days_between(snap, filter_reset["maintenance_event_date"].max())
 
-        # SMR since latest reset. If SMR is unavailable, this is filled to 0 in
-        # finalize_snapshot_df.
         latest_smr = before["smr_hours_clean"].dropna().max()
         last_reset = reset180.sort_values("maintenance_event_date").tail(1)
         last_reset_smr = last_reset["smr_hours_clean"].iloc[0] if len(last_reset) else np.nan
@@ -1195,129 +938,92 @@ def maintenance_features_for_machine(snap_m: pd.DataFrame, m_m: pd.DataFrame) ->
     return out
 
 
-def build_features(snapshots: pd.DataFrame, fault: pd.DataFrame, pm: pd.DataFrame) -> pd.DataFrame:
-    """Build all source-derived features and merge them onto the backbone."""
-    all_rows: list[pd.DataFrame] = []
-    fault_groups = {k: v for k, v in fault.groupby("SERIAL", sort=False)}
-    pm_groups = {k: v for k, v in pm.groupby("SERIAL", sort=False)}
+def build_maintenance_snapshot(backbone: pd.DataFrame, pm: pd.DataFrame) -> pd.DataFrame:
+    """Build the source-specific maintenance snapshot dataframe on the machine backbone."""
+    start = time.perf_counter()
+    rows: list[pd.DataFrame] = []
+    pm_groups = {k: v for k, v in pm.groupby("model_id", sort=False)}
 
-    total_machines = snapshots["SERIAL"].nunique() if not snapshots.empty else 0
-    total_snapshot_rows = len(snapshots)
+    total_models = backbone["model_id"].nunique() if not backbone.empty else 0
+    total_snapshot_rows = len(backbone)
     processed_snapshot_rows = 0
+    progress(f"Building maintenance snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
 
-    progress(
-        f"Building features for {total_machines:,} machines "
-        f"and {total_snapshot_rows:,} snapshot rows..."
-    )
-
-    for machine_idx, (serial, snap_m) in enumerate(snapshots.groupby("SERIAL", sort=False), start=1):
-        base = snap_m[["SERIAL", "full_model", "model_family", "snapshot_date"]].copy()
-        f_m = fault_groups.get(serial, fault.iloc[0:0])
-        m_m = pm_groups.get(serial, pm.iloc[0:0])
-
-        f_feat = pd.DataFrame(fault_features_for_machine(snap_m, f_m))
-        m_feat = pd.DataFrame(maintenance_features_for_machine(snap_m, m_m))
-        merged = base.merge(f_feat, on="snapshot_date", how="left").merge(m_feat, on="snapshot_date", how="left")
-        all_rows.append(merged)
-
+    for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
+        m_m = pm_groups.get(model_id, pm.iloc[0:0])
+        rows.append(pd.DataFrame(maintenance_features_for_model(snap_m, m_m)))
         processed_snapshot_rows += len(snap_m)
 
-        if (
-            machine_idx == 1
-            or machine_idx % PROGRESS_EVERY_MACHINES == 0
-            or machine_idx == total_machines
-        ):
+        if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
             progress(
-                f"Feature progress: {machine_idx:,}/{total_machines:,} machines; "
-                f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows processed"
+                f"Maintenance snapshot progress: {idx:,}/{total_models:,} model_ids; "
+                f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
             )
 
-    features = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-
-    # Guarantee every frozen feature exists. This makes downstream training code
-    # stable even if a source column is missing in one extract.
-    for col in FROZEN_FEATURES:
-        if col not in features.columns:
-            features[col] = np.nan
-
-    progress(f"Feature build complete. Feature dataframe rows: {len(features):,}")
-
-    return features
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date"])
+    progress(f"Maintenance snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
+    return result
 
 
 # -----------------------------------------------------------------------------
-# Optional warranty target
+# Joining, validation, and saving
 # -----------------------------------------------------------------------------
-def add_warranty_target(
-    snapshots: pd.DataFrame,
-    warranty: Optional[pd.DataFrame],
-    horizon_days: int = 45,
-) -> pd.DataFrame:
-    """Add claim_next_45d from warranty failure dates.
-
-    A positive label means the same machine has at least one warranty failure
-    date strictly after the snapshot and on/before snapshot + horizon_days.
-    """
-    df = snapshots.copy()
-    if warranty is None or warranty.empty:
-        df["claim_next_45d"] = np.nan
-        return df
-
-    target: list[int] = []
-    war_groups = {
-        k: v["warranty_failure_date"].sort_values().to_numpy(dtype="datetime64[ns]")
-        for k, v in warranty.groupby("SERIAL")
-    }
-
-    total_rows = len(df)
-    progress(f"Creating warranty target for {total_rows:,} snapshot rows...")
-
-    for row_idx, r in enumerate(df[["SERIAL", "snapshot_date"]].itertuples(index=False), start=1):
-        dates = war_groups.get(r.SERIAL)
-        if dates is None or len(dates) == 0:
-            target.append(0)
-        else:
-            snap = np.datetime64(r.snapshot_date)
-            end = np.datetime64(r.snapshot_date + pd.Timedelta(days=horizon_days))
-            has_claim = bool(((dates > snap) & (dates <= end)).any())
-            target.append(int(has_claim))
-
-        if total_rows and (row_idx == 1 or row_idx % 100000 == 0 or row_idx == total_rows):
-            progress(f"Target progress: {row_idx:,}/{total_rows:,} snapshot rows")
-
-    df["claim_next_45d"] = target
-    return df
+def key_count(df: pd.DataFrame) -> int:
+    return int(df[["model_id", "snapshot_date"]].drop_duplicates().shape[0]) if not df.empty else 0
 
 
-# -----------------------------------------------------------------------------
-# Final missing-value handling and feature validation
-# -----------------------------------------------------------------------------
-def finalize_snapshot_df(
-    df: pd.DataFrame,
-    feature_freeze_path: Optional[str | Path] = None,
-) -> pd.DataFrame:
+def validate_source_snapshot_alignment(source_name: str, backbone: pd.DataFrame, source_snapshot: pd.DataFrame) -> None:
+    """Make sure a source snapshot exactly follows the machine.csv backbone."""
+    required = {"model_id", "snapshot_date"}
+    missing_cols = required - set(source_snapshot.columns)
+    if missing_cols:
+        raise ValueError(f"{source_name} snapshot is missing key columns: {sorted(missing_cols)}")
+
+    duplicate_count = int(source_snapshot.duplicated(["model_id", "snapshot_date"]).sum())
+    if duplicate_count:
+        raise ValueError(f"{source_name} snapshot has duplicate model_id + snapshot_date keys: {duplicate_count:,}")
+
+    if len(source_snapshot) != len(backbone):
+        raise ValueError(
+            f"{source_name} snapshot row count mismatch. Expected {len(backbone):,} from machine backbone, "
+            f"got {len(source_snapshot):,}."
+        )
+
+    b_keys = backbone[["model_id", "snapshot_date"]].drop_duplicates()
+    s_keys = source_snapshot[["model_id", "snapshot_date"]].drop_duplicates()
+    merged = b_keys.merge(s_keys, on=["model_id", "snapshot_date"], how="outer", indicator=True)
+    missing_from_source = int((merged["_merge"] == "left_only").sum())
+    extra_in_source = int((merged["_merge"] == "right_only").sum())
+    if missing_from_source or extra_in_source:
+        raise ValueError(
+            f"{source_name} snapshot key mismatch against machine backbone. "
+            f"missing_from_source={missing_from_source:,}, extra_in_source={extra_in_source:,}."
+        )
+
+    progress(f"{source_name} alignment validated: {len(source_snapshot):,} rows match machine backbone.")
+
+
+def finalize_snapshot_df(df: pd.DataFrame, feature_freeze_path: Optional[str | Path] = None) -> pd.DataFrame:
     """Fill feature missing values and order columns for model training."""
     out = df.copy()
 
-    # Count features: no source event in the lookback window means zero events.
+    for col in FROZEN_FEATURES:
+        if col not in out.columns:
+            out[col] = np.nan
+
     for col in COUNT_FEATURES:
         if col in out.columns:
             out[col] = out[col].fillna(0).astype(float)
 
-    # Recency features: no prior event gets a large sentinel.
     for col in RECENCY_FEATURES:
         if col in out.columns:
             out[col] = out[col].fillna(9999).astype(float)
 
-    # Ratios and trend rates: default to zero when denominator/history is missing.
     ratio_cols = [c for c in FROZEN_FEATURES if c.endswith("ratio_90d") or c.endswith("ratio_180d") or c.endswith("rate")]
     for col in ratio_cols:
         if col in out.columns:
             out[col] = out[col].fillna(0).astype(float)
 
-    # Continuous score/amount/SMR-like fields: fill to zero for the first version.
-    # If later model experiments show missingness itself is predictive, add explicit
-    # missingness indicator columns before this fill.
     amount_or_score_cols = [
         "faults_per_100_hours",
         "max_action_level_90d",
@@ -1337,7 +1043,6 @@ def finalize_snapshot_df(
         if col in out.columns:
             out[col] = out[col].fillna(0).astype(float)
 
-    # Optional validation against the Excel feature-freeze workbook.
     if feature_freeze_path is not None and Path(feature_freeze_path).exists():
         freeze = pd.read_excel(feature_freeze_path, sheet_name="all")
         if "Feature" in freeze.columns:
@@ -1351,41 +1056,100 @@ def finalize_snapshot_df(
             if missing:
                 raise ValueError(f"Missing frozen features from output: {missing}")
 
-    ordered_cols = ["SERIAL", "full_model", "model_family", "snapshot_date"]
+    ordered_cols = ["model_id", "snapshot_date", "full_model"]
     if "claim_next_45d" in out.columns:
         ordered_cols.append("claim_next_45d")
     ordered_cols += FROZEN_FEATURES
     extra_cols = [c for c in out.columns if c not in ordered_cols]
 
-    # If no snapshots were produced, return a correctly shaped empty dataframe.
     for col in ordered_cols:
         if col not in out.columns:
             out[col] = pd.Series(dtype="float64")
 
-    return out[ordered_cols + extra_cols].sort_values(["SERIAL", "snapshot_date"]).reset_index(drop=True)
+    return out[ordered_cols + extra_cols].sort_values(["model_id", "snapshot_date"]).reset_index(drop=True)
 
 
-def save_snapshot_dataframe(df: pd.DataFrame, output_path: str | Path) -> Path:
-    """Save the snapshot dataframe as CSV or Parquet.
+def save_dataframe(df: pd.DataFrame, output_path: str | Path) -> Path:
+    """Save dataframe as CSV.
 
-    Parquet is preferred for large data. If pyarrow/fastparquet is not installed,
-    the script falls back to CSV instead of failing silently.
+    For the current QA/review phase, every dataframe output is forced to CSV so
+    it can be opened directly in Excel, VS Code, or similar tools. If config.py
+    still points to a .parquet path, this function automatically changes the
+    suffix to .csv instead of writing parquet.
     """
     output_path = Path(output_path)
+    if output_path.suffix.lower() != ".csv":
+        csv_path = output_path.with_suffix(".csv")
+        progress(f"CSV output mode is enabled. Rewriting output path from {output_path} to {csv_path}")
+        output_path = csv_path
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, index=False)
+    return output_path
 
-    if output_path.suffix.lower() == ".csv":
-        df.to_csv(output_path, index=False)
-        return output_path
 
-    try:
-        df.to_parquet(output_path, index=False)
-        return output_path
-    except ImportError:
-        fallback = output_path.with_suffix(".csv")
-        df.to_csv(fallback, index=False)
-        print(f"Parquet engine not installed. Saved CSV fallback instead: {fallback}")
-        return fallback
+def save_source_snapshot(df: pd.DataFrame, filename: str) -> Path:
+    """Save an intermediate source-level snapshot dataframe."""
+    if not bool(cfg("SAVE_SOURCE_SNAPSHOTS", True)):
+        return Path("")
+    SOURCE_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    return save_dataframe(df, SOURCE_SNAPSHOT_DIR / filename)
+
+
+def write_source_standardization_summary(output_dir: str | Path, summaries: list[dict]) -> None:
+    """Write standardization/date-drop summary for all sources."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(summaries).to_csv(output_dir / "source_standardization_summary.csv", index=False)
+
+
+def write_source_alignment_summary(output_dir: str | Path, backbone: pd.DataFrame, source_snapshots: dict[str, pd.DataFrame]) -> None:
+    """Write a compact source alignment report."""
+    rows = [
+        {
+            "source_snapshot": "machine_backbone",
+            "rows": len(backbone),
+            "unique_model_ids": backbone["model_id"].nunique() if not backbone.empty else 0,
+            "unique_keys": key_count(backbone),
+            "matches_backbone_rows": True,
+        }
+    ]
+    for name, df in source_snapshots.items():
+        rows.append(
+            {
+                "source_snapshot": name,
+                "rows": len(df),
+                "unique_model_ids": df["model_id"].nunique() if not df.empty else 0,
+                "unique_keys": key_count(df),
+                "matches_backbone_rows": len(df) == len(backbone) and key_count(df) == key_count(backbone),
+            }
+        )
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output_dir / "source_snapshot_alignment_summary.csv", index=False)
+
+
+def write_mini_validation_outputs(df: pd.DataFrame, output_dir: str | Path) -> None:
+    """Write small QA outputs for mini validation runs."""
+    if not bool(cfg("MINI_RUN_ENABLED", False)):
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df.head(200).to_csv(output_dir / "mini_snapshot_validation_sample_rows.csv", index=False)
+
+    summary = (
+        df.groupby("model_id")
+        .agg(
+            snapshot_rows=("snapshot_date", "count"),
+            first_snapshot_date=("snapshot_date", "min"),
+            last_snapshot_date=("snapshot_date", "max"),
+            total_faults_90d=("fault_count_90d", "sum"),
+            total_maintenance_events_180d=("maintenance_events_180d", "sum"),
+        )
+        .reset_index()
+    )
+    summary.to_csv(output_dir / "mini_snapshot_validation_by_model_id.csv", index=False)
 
 
 # -----------------------------------------------------------------------------
@@ -1395,288 +1159,186 @@ def build_snapshot_dataframe(
     fault_codes_path: str | Path,
     machine_path: str | Path,
     maintenance_path: str | Path,
-    output_dir: str | Path = "data_preparation/output",
-    warranty_path: Optional[str | Path] = None,
+    output_dir: str | Path = OUTPUT_DIR,
     feature_freeze_path: Optional[str | Path] = None,
-    snapshot_freq_days: int = 14,
-    horizon_days: int = 45,
-    min_snapshot_date: Optional[str] = None,
-    max_snapshot_date: Optional[str] = None,
-    write_cleaning_reports: bool = True,
-    max_machines: Optional[int] = None,
-    mini_run_enabled: bool = False,
-    mini_run_machine_count: int = 3,
-    mini_run_serials: Optional[Iterable[object]] = None,
 ) -> pd.DataFrame:
-    """Build the final model-ready snapshot dataframe.
+    """Build separate source snapshots following machine.csv, then join them."""
+    overall_start = time.perf_counter()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    SOURCE_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-    This is the main function to call from notebooks or pipelines. It handles:
-        1. CSV loading.
-        2. Per-file missing-value detection and light cleaning.
-        3. Source standardization.
-        4. Snapshot backbone creation.
-        5. Feature engineering.
-        6. Optional warranty target creation.
-        7. Final missing-value filling and feature validation.
-    """
-    progress("Starting snapshot dataframe build...")
+    progress("Starting machine-backbone-driven snapshot dataframe build...")
+    progress(f"Project root: {PROJECT_ROOT}")
+    progress(f"Input folder: {INPUT_DIR}")
+    progress(f"Output folder: {output_dir}")
+    progress("Canonical backbone: machine.csv model_id + snapshot_date")
+    progress("Join key: model_id + snapshot_date")
 
     all_profiles: list[pd.DataFrame] = []
     cleaning_summaries: list[dict] = []
+    standardization_summaries: list[dict] = []
 
-    progress("Step 1/7: Loading and cleaning fault_codes file...")
-    raw_fault, profiles, summary = load_and_clean_csv(
-        fault_codes_path,
-        dataset_name="fault_codes",
-        output_dir=output_dir,
-        write_cleaning_reports=write_cleaning_reports,
-    )
-    all_profiles.extend(profiles)
-    cleaning_summaries.append(summary)
-    progress(f"fault_codes loaded: {len(raw_fault):,} rows, {len(raw_fault.columns):,} columns")
-
-    progress("Step 2/7: Loading and cleaning machine file...")
-    raw_machine, profiles, summary = load_and_clean_csv(
-        machine_path,
-        dataset_name="machine",
-        output_dir=output_dir,
-        write_cleaning_reports=write_cleaning_reports,
-    )
+    progress("Step 1/8: Loading and lightly cleaning source CSV files...")
+    raw_machine, profiles, summary = load_and_clean_csv(machine_path, "machine", output_dir)
     all_profiles.extend(profiles)
     cleaning_summaries.append(summary)
     progress(f"machine loaded: {len(raw_machine):,} rows, {len(raw_machine.columns):,} columns")
 
-    progress("Step 3/7: Loading and cleaning maintenance file...")
-    raw_pm, profiles, summary = load_and_clean_csv(
-        maintenance_path,
-        dataset_name="maintenance",
-        output_dir=output_dir,
-        write_cleaning_reports=write_cleaning_reports,
-    )
+    raw_fault, profiles, summary = load_and_clean_csv(fault_codes_path, "fault_codes", output_dir)
+    all_profiles.extend(profiles)
+    cleaning_summaries.append(summary)
+    progress(f"fault_codes loaded: {len(raw_fault):,} rows, {len(raw_fault.columns):,} columns")
+
+    raw_pm, profiles, summary = load_and_clean_csv(maintenance_path, "maintenance", output_dir)
     all_profiles.extend(profiles)
     cleaning_summaries.append(summary)
     progress(f"maintenance loaded: {len(raw_pm):,} rows, {len(raw_pm.columns):,} columns")
 
-    raw_warranty = None
-    if warranty_path:
-        progress("Optional warranty file found. Loading and cleaning warranty file...")
-        raw_warranty, profiles, summary = load_and_clean_csv(
-            warranty_path,
-            dataset_name="warranty",
-            output_dir=output_dir,
-            write_cleaning_reports=write_cleaning_reports,
-        )
-        all_profiles.extend(profiles)
-        cleaning_summaries.append(summary)
-        progress(f"warranty loaded: {len(raw_warranty):,} rows, {len(raw_warranty.columns):,} columns")
-    else:
-        progress("No warranty file found. claim_next_45d will be left blank.")
-
-    if write_cleaning_reports:
-        progress("Writing missing-value and cleaning summary reports...")
+    if bool(cfg("WRITE_CLEANING_REPORTS", True)):
         write_combined_cleaning_reports(output_dir, all_profiles, cleaning_summaries)
-        progress(f"Cleaning reports saved to: {output_dir}")
+        progress("Missing-value and light-cleaning reports written.")
 
-    progress("Step 4/7: Standardizing source tables...")
-    SOURCE_STANDARDIZATION_SUMMARIES.clear()
-    fault = standardize_faults(raw_fault)
-    pm = standardize_maintenance(raw_pm)
-    write_source_standardization_summary(output_dir)
-
-    progress(f"Standardized fault rows after filtering: {len(fault):,}")
-    progress(f"Standardized maintenance rows after filtering: {len(pm):,}")
-
-    progress("Step 5/7: Building machine universe...")
-    universe = build_machine_universe(
-        fault,
-        raw_machine,
-        pm,
-        max_machines=max_machines,
-        mini_run_enabled=mini_run_enabled,
-        mini_run_machine_count=mini_run_machine_count,
-        mini_run_serials=mini_run_serials,
-    )
-    progress(f"Machine universe size: {len(universe):,}")
-
-    warranty = None
-    if raw_warranty is not None:
-        warranty = standardize_warranty(raw_warranty)
-        warranty = warranty[warranty["SERIAL"].isin(universe["SERIAL"])]
-        progress(f"Standardized warranty rows after filtering to machine universe: {len(warranty):,}")
-
-    progress("Step 6/7: Building snapshot backbone...")
-    snapshots = build_snapshot_backbone(
-        universe=universe,
-        fault=fault,
-        pm=pm,
-        warranty=warranty,
-        snapshot_freq_days=snapshot_freq_days,
-        min_snapshot_date=min_snapshot_date,
-        max_snapshot_date=max_snapshot_date,
-    )
+    progress("Step 2/8: Standardizing machine.csv as canonical snapshot backbone...")
+    backbone, summary = standardize_machine_backbone(raw_machine)
+    standardization_summaries.append(summary)
     progress(
-        f"Snapshot backbone created: {len(snapshots):,} rows "
-        f"across {snapshots['SERIAL'].nunique() if not snapshots.empty else 0:,} machines"
+        "Machine backbone date quality: "
+        f"missing snapshot rows={summary['missing_usable_event_date_rows']:,}; "
+        f"duplicate keys removed={summary['duplicate_model_id_snapshot_rows_removed']:,}; "
+        f"rows after standardization={summary['rows_after_standardization']:,}"
     )
 
-    progress("Step 7/7: Engineering features. This is usually the slowest step...")
-    features = build_features(snapshots, fault, pm)
+    backbone = apply_backbone_filters(backbone)
+    allowed_model_ids = set(backbone["model_id"].astype("string"))
+    progress(
+        f"Canonical backbone after filters: {len(backbone):,} rows across "
+        f"{backbone['model_id'].nunique() if not backbone.empty else 0:,} model_ids"
+    )
+    save_source_snapshot(backbone, "machine_backbone.csv")
 
-    progress("Adding warranty target if available...")
-    features = add_warranty_target(features, warranty, horizon_days=horizon_days)
-
-    progress("Finalizing missing values and validating frozen features...")
-    features = finalize_snapshot_df(features, feature_freeze_path=feature_freeze_path)
-
-    progress(f"Snapshot dataframe build complete. Final shape: {features.shape[0]:,} rows x {features.shape[1]:,} columns")
-
-    return features
-
-
-def _search_existing_file(filename: str) -> Optional[Path]:
-    """Search likely project roots for a required input file.
-
-    This protects against Azure ML / VS Code resolving the project through a
-    different mount path than the one shown in the Explorer.
-    """
-    search_roots: list[Path] = []
-
-    if run_config is not None:
-        for attr in ["PROJECT_ROOT", "INPUT_DIR", "DATA_PREPARATION_DIR"]:
-            value = getattr(run_config, attr, None)
-            if value is not None:
-                p = Path(value)
-                search_roots.extend([p, p.parent])
-
-    script_dir = Path(__file__).absolute().parent
-    cwd = Path.cwd().absolute()
-    for base in [script_dir, cwd, script_dir.parent, cwd.parent]:
-        search_roots.append(base)
-        search_roots.extend(list(base.parents)[:5])
-
-    seen: set[str] = set()
-    for root in search_roots:
-        for candidate in [root / filename, root / "enriched_data" / filename, root / "data_preparation" / filename]:
-            key = str(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            if candidate.exists():
-                return candidate
-    return None
-
-
-def require_existing_path(path_value: str | Path, label: str) -> Path:
-    """Validate required input paths from config.py before running the build."""
-    path = Path(path_value)
-    if path.exists():
-        return path
-
-    fallback = _search_existing_file(path.name)
-    if fallback is not None:
-        progress(f"{label} not found at configured path: {path}")
-        progress(f"Using discovered {label}: {fallback}")
-        return fallback
-
-    raise FileNotFoundError(
-        f"{label} not found: {path}\n"
-        f"Current working directory: {Path.cwd().absolute()}\n"
-        f"Script directory: {Path(__file__).absolute().parent}\n"
-        "Expected current structure: service_controltower/enriched_data/<file>.csv "
-        "and service_controltower/data_preparation/*.py"
+    progress("Step 3/8: Standardizing event sources and forcing them to machine backbone model_ids...")
+    fault, summary = standardize_faults(raw_fault, allowed_model_ids=allowed_model_ids)
+    standardization_summaries.append(summary)
+    progress(
+        "Fault date/model-id quality: "
+        f"missing usable date rows={summary['missing_usable_event_date_rows']:,}; "
+        f"rows not in machine backbone={summary['rows_not_in_machine_backbone']:,}; "
+        f"rows after standardization={summary['rows_after_standardization']:,}"
     )
 
+    pm, summary = standardize_maintenance(raw_pm, allowed_model_ids=allowed_model_ids)
+    standardization_summaries.append(summary)
+    progress(
+        "Maintenance date/model-id quality: "
+        f"missing usable date rows={summary['missing_usable_event_date_rows']:,}; "
+        f"rows not in machine backbone={summary['rows_not_in_machine_backbone']:,}; "
+        f"rows after standardization={summary['rows_after_standardization']:,}"
+    )
 
-def optional_existing_path(path_value: Optional[str | Path]) -> Optional[Path]:
-    """Return an optional configured path only when it exists."""
-    if path_value in (None, "", "None"):
-        return None
-    path = Path(path_value)
-    if path.exists():
-        return path
-    return _search_existing_file(path.name)
+    write_source_standardization_summary(output_dir, standardization_summaries)
+    progress("Source standardization summary written.")
+
+    progress("Step 4/8: Building fault source snapshot dataframe on machine backbone...")
+    fault_snapshot = build_fault_snapshot(backbone, fault)
+    validate_source_snapshot_alignment("fault_snapshot", backbone, fault_snapshot)
+    save_source_snapshot(fault_snapshot, "fault_snapshot.csv")
+
+    progress("Step 5/8: Building maintenance source snapshot dataframe on machine backbone...")
+    maintenance_snapshot = build_maintenance_snapshot(backbone, pm)
+    validate_source_snapshot_alignment("maintenance_snapshot", backbone, maintenance_snapshot)
+    save_source_snapshot(maintenance_snapshot, "maintenance_snapshot.csv")
+
+    progress("Step 6/8: Writing source snapshot alignment summary...")
+    write_source_alignment_summary(
+        output_dir,
+        backbone,
+        {
+            "fault_snapshot": fault_snapshot,
+            "maintenance_snapshot": maintenance_snapshot,
+        },
+    )
+
+    progress("Step 7/8: Joining source snapshots into unified snapshot dataframe...")
+    unified = backbone.copy()
+    unified = unified.merge(fault_snapshot, on=["model_id", "snapshot_date"], how="left")
+    unified = unified.merge(maintenance_snapshot, on=["model_id", "snapshot_date"], how="left")
+    progress(f"Unified snapshot shape before finalization: {unified.shape[0]:,} rows x {unified.shape[1]:,} columns")
+
+    progress("Step 8/8: Finalizing missing values and validating frozen features...")
+    unified = finalize_snapshot_df(unified, feature_freeze_path=feature_freeze_path)
+    write_mini_validation_outputs(unified, output_dir)
+
+    elapsed_min = (time.perf_counter() - overall_start) / 60
+    progress(f"Snapshot build complete in {elapsed_min:.2f} minutes. Final shape: {unified.shape[0]:,} rows x {unified.shape[1]:,} columns")
+    return unified
+
+
+# -----------------------------------------------------------------------------
+# Future source-extension placeholders
+# -----------------------------------------------------------------------------
+# When oil, warranty, or service data becomes available, add each source in the
+# same pattern used above:
+#
+#   1. standardize_oil(raw_oil, allowed_model_ids) -> oil_event_table, summary
+#   2. build_oil_snapshot(backbone, oil_event_table) -> model_id/snapshot_date features
+#   3. validate_source_snapshot_alignment("oil_snapshot", backbone, oil_snapshot)
+#   4. save_source_snapshot(oil_snapshot, "oil_snapshot.csv")
+#   5. unified = unified.merge(oil_snapshot, on=["model_id", "snapshot_date"], how="left")
+#
+# The key rule stays the same: oil/service/warranty source snapshots must use the
+# machine.csv backbone dates. They should never generate independent calendars.
+# Warranty target should look after snapshot_date, not before it.
 
 
 def main() -> None:
-    """Config-driven entry point.
+    """Config-driven entry point. No command-line arguments are required."""
+    fault_codes_path = resolve_existing_path(cfg("FAULT_CODES_PATH", INPUT_DIR / "fault_codes.csv"), "FAULT_CODES_PATH")
+    machine_path = resolve_existing_path(cfg("MACHINE_PATH", INPUT_DIR / "machine.csv"), "MACHINE_PATH")
+    maintenance_path = resolve_existing_path(cfg("MAINTENANCE_PATH", INPUT_DIR / "maintenance.csv"), "MAINTENANCE_PATH")
+    feature_freeze_path = optional_existing_path(cfg("FEATURE_FREEZE_PATH", INPUT_DIR / "xgb_feature_freeze.xlsx"))
 
-    Edit config.py, then run:
-
-        python build_snapshot_dataframe.py
-
-    No command-line arguments are required. This avoids long commands and keeps
-    your project parameters version-controlled in one place.
-    """
-    input_dir = Path(cfg("INPUT_DIR", "enriched_data"))
-    output_dir = Path(cfg("OUTPUT_DIR", "data_preparation/output"))
-
-    # Required source files. These default to files inside enriched_data/.
-    fault_codes_path = require_existing_path(
-        cfg("FAULT_CODES_PATH", input_dir / "fault_codes.csv"),
-        "FAULT_CODES_PATH",
-    )
-    machine_path = require_existing_path(
-        cfg("MACHINE_PATH", input_dir / "machine.csv"),
-        "MACHINE_PATH",
-    )
-    maintenance_path = require_existing_path(
-        cfg("MAINTENANCE_PATH", input_dir / "maintenance.csv"),
-        "MAINTENANCE_PATH",
-    )
-
-    # Optional source files. Missing warranty.csv is allowed; in that case the
-    # script still creates the feature dataframe but leaves claim_next_45d blank.
-    warranty_path = optional_existing_path(cfg("WARRANTY_PATH", input_dir / "warranty.csv"))
-    feature_freeze_path = optional_existing_path(
-        cfg("FEATURE_FREEZE_PATH", input_dir / "xgb_feature_freeze.xlsx")
-    )
-
-    mini_run_enabled = bool(cfg("MINI_RUN_ENABLED", False))
-    output_path = Path(
-        cfg("MINI_OUTPUT_PATH", output_dir / "snapshot_dataframe_mini.parquet")
-        if mini_run_enabled
-        else cfg("OUTPUT_PATH", output_dir / "snapshot_dataframe.parquet")
-    )
+    output_path = Path(cfg("OUTPUT_PATH", OUTPUT_DIR / "snapshot_dataframe.csv"))
+    if bool(cfg("MINI_RUN_ENABLED", False)):
+        output_path = Path(cfg("MINI_OUTPUT_PATH", OUTPUT_DIR / "snapshot_dataframe_mini.csv"))
 
     print("Using config.py" if run_config is not None else "config.py not found; using built-in defaults")
-    print(f"Input folder: {input_dir}")
+    print(f"Project root: {PROJECT_ROOT}")
+    print(f"Input folder: {INPUT_DIR}")
     print(f"Output path: {output_path}")
-    print(f"Mini run enabled: {mini_run_enabled}")
-    if mini_run_enabled:
-        print(f"Mini run serials: {cfg('MINI_RUN_SERIALS', [])}")
-        print(f"Mini run machine count: {cfg('MINI_RUN_MACHINE_COUNT', 3)}")
-    print(f"Target model families: {', '.join(TARGET_MODEL_FAMILIES)}")
+    print(f"Target model families used for filtering: {', '.join(TARGET_MODEL_FAMILIES)}")
+    print(f"Mini run enabled: {bool(cfg('MINI_RUN_ENABLED', False))}")
 
     df = build_snapshot_dataframe(
         fault_codes_path=fault_codes_path,
         machine_path=machine_path,
         maintenance_path=maintenance_path,
-        output_dir=output_dir,
-        warranty_path=warranty_path,
+        output_dir=OUTPUT_DIR,
         feature_freeze_path=feature_freeze_path,
-        snapshot_freq_days=int(cfg("SNAPSHOT_FREQ_DAYS", 14)),
-        horizon_days=int(cfg("HORIZON_DAYS", 45)),
-        min_snapshot_date=cfg("MIN_SNAPSHOT_DATE", None),
-        max_snapshot_date=cfg("MAX_SNAPSHOT_DATE", None),
-        write_cleaning_reports=bool(cfg("WRITE_CLEANING_REPORTS", True)),
-        max_machines=cfg("MAX_MACHINES", None),
-        mini_run_enabled=mini_run_enabled,
-        mini_run_machine_count=int(cfg("MINI_RUN_MACHINE_COUNT", 3)),
-        mini_run_serials=cfg("MINI_RUN_SERIALS", []),
     )
 
-    progress("Saving snapshot dataframe...")
-    saved_path = save_snapshot_dataframe(df, output_path)
-    if mini_run_enabled:
-        save_mini_validation_outputs(df, output_dir)
+    progress("Saving unified snapshot dataframe...")
+    saved_path = save_dataframe(df, output_path)
 
-    print(f"Saved snapshot dataframe: {saved_path}")
+    run_summary = {
+        "saved_path": str(saved_path),
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "unique_model_ids": int(df["model_id"].nunique()) if "model_id" in df.columns else 0,
+        "min_snapshot_date": str(df["snapshot_date"].min()) if "snapshot_date" in df.columns and len(df) else None,
+        "max_snapshot_date": str(df["snapshot_date"].max()) if "snapshot_date" in df.columns and len(df) else None,
+        "source_snapshot_dir": str(SOURCE_SNAPSHOT_DIR),
+        "canonical_backbone": "machine.csv model_id + snapshot_date",
+    }
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([run_summary]).to_csv(OUTPUT_DIR / "snapshot_build_run_summary.csv", index=False)
+
+    print(f"Saved unified snapshot dataframe: {saved_path}")
     print(f"Rows: {len(df):,}")
     print(f"Columns: {len(df.columns):,}")
-    print(f"Cleaning reports folder: {output_dir}")
-    if "claim_next_45d" in df.columns:
-        print("Target distribution:")
-        print(df["claim_next_45d"].value_counts(dropna=False).to_string())
+    print(f"Unique model_id count: {df['model_id'].nunique() if 'model_id' in df.columns else 0:,}")
+    print(f"Source snapshot folder: {SOURCE_SNAPSHOT_DIR}")
+    print(f"Reports folder: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

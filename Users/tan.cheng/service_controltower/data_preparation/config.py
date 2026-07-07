@@ -1,182 +1,165 @@
 """
-Configuration for the predictive-maintenance snapshot build.
+Configuration for data_preparation/build_snapshot_dataframe.py.
 
-Current project layout supported by this config:
+Current folder structure expected:
 
     service_controltower/
-        data_preparation/
-            config.py
-            build_snapshot_dataframe.py
-            log_compute_device.py
-            submit_snapshot_build_aml_job.py
-            output/
-        enriched_data/
-            fault_codes.csv
-            machine.csv
-            maintenance.csv
-            warranty.csv                 # optional
-            xgb_feature_freeze.xlsx       # optional
-        requirements.txt
+    ├── data_preparation/
+    │   ├── build_snapshot_dataframe.py
+    │   ├── config.py
+    │   ├── log_compute_device.py
+    │   ├── submit_snapshot_build_aml_job.py
+    │   └── output/
+    ├── enriched_data/
+    │   ├── machine.csv          # canonical model_id + snapshot_date backbone
+    │   ├── fault_codes.csv
+    │   └── maintenance.csv
+    └── requirements.txt
 
-Run locally from the repository root or from data_preparation/:
+Run from service_controltower/:
 
     python data_preparation/build_snapshot_dataframe.py
 
-or, if your terminal is already inside data_preparation/:
+or from service_controltower/data_preparation/:
 
     python build_snapshot_dataframe.py
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 
 
 # -----------------------------------------------------------------------------
-# Project-folder detection
+# Project folders
 # -----------------------------------------------------------------------------
-def _candidate_project_roots() -> list[Path]:
-    """Return likely service_controltower root folders.
+# config.py is inside service_controltower/data_preparation/.
+# Therefore the project root is two levels up from this file's path:
+#   config.py -> data_preparation -> service_controltower
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    Azure ML sometimes exposes the same folder through both a /home/azureuser path
-    and a /mnt/batch/... path.  Using absolute() instead of resolve() avoids
-    forcing symlink resolution too early, and the scripts also validate the final
-    files before running.
-    """
-    config_dir = Path(__file__).absolute().parent
-    cwd = Path.cwd().absolute()
-
-    candidates: list[Path] = []
-
-    # Expected layout: service_controltower/data_preparation/config.py
-    candidates.append(config_dir.parent)
-
-    # Useful when running from service_controltower/ or data_preparation/.
-    candidates.append(cwd)
-    candidates.append(cwd.parent)
-
-    # Walk upward from both locations and keep any folder that looks like project root.
-    for base in (config_dir, cwd):
-        for parent in [base, *base.parents]:
-            candidates.append(parent)
-
-    # Preserve order and remove duplicates.
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for p in candidates:
-        key = str(p)
-        if key not in seen:
-            unique.append(p)
-            seen.add(key)
-    return unique
-
-
-def _detect_project_root() -> Path:
-    """Find the root folder that contains both data_preparation and enriched_data."""
-    for root in _candidate_project_roots():
-        if (root / "data_preparation").exists() and (root / "enriched_data").exists():
-            return root
-
-    # Fallback to the expected parent of data_preparation.  The build script will
-    # raise a clear FileNotFoundError if the input files are still not found.
-    return Path(__file__).absolute().parent.parent
-
-
-PROJECT_ROOT = _detect_project_root()
-DATA_PREPARATION_DIR = PROJECT_ROOT / "data_preparation"
 INPUT_DIR = PROJECT_ROOT / "enriched_data"
-OUTPUT_DIR = DATA_PREPARATION_DIR / "output"
+OUTPUT_DIR = PROJECT_ROOT / "data_preparation" / "output"
+SOURCE_SNAPSHOT_DIR = OUTPUT_DIR / "source_snapshots"
 
 
 # -----------------------------------------------------------------------------
-# Input files
+# Input files currently available
 # -----------------------------------------------------------------------------
-FAULT_CODES_PATH = INPUT_DIR / "fault_codes.csv"
+# machine.csv is now the official snapshot backbone. It must contain:
+#   - model_id or machine_id
+#   - snapshot_date
+#   - full_model, recommended for D51/D61/D71 filtering
 MACHINE_PATH = INPUT_DIR / "machine.csv"
+FAULT_CODES_PATH = INPUT_DIR / "fault_codes.csv"
 MAINTENANCE_PATH = INPUT_DIR / "maintenance.csv"
 
-# Optional files. If warranty.csv does not exist, claim_next_45d is left blank.
+# Optional future inputs. The current build script includes placeholders but does
+# not yet build features from these files.
 WARRANTY_PATH = INPUT_DIR / "warranty.csv"
+OIL_SAMPLE_PATH = INPUT_DIR / "oil_samples.csv"
+SERVICE_PATH = INPUT_DIR / "service.csv"
+
+# Optional feature-name validation file.
 FEATURE_FREEZE_PATH = INPUT_DIR / "xgb_feature_freeze.xlsx"
 
 
 # -----------------------------------------------------------------------------
 # Output files
 # -----------------------------------------------------------------------------
-OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe.parquet"
-SOURCE_STANDARDIZATION_SUMMARY_PATH = OUTPUT_DIR / "source_standardization_summary.csv"
+OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe.csv"
+MINI_OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe_mini.csv"
+
+# Save intermediate source-level snapshot tables, useful for QA and monitoring.
+# Saved under data_preparation/output/source_snapshots/:
+#   - machine_backbone.csv
+#   - fault_snapshot.csv
+#   - maintenance_snapshot.csv
+SAVE_SOURCE_SNAPSHOTS = True
 
 
 # -----------------------------------------------------------------------------
-# Snapshot and target settings
+# Machine-backbone settings
 # -----------------------------------------------------------------------------
-SNAPSHOT_FREQ_DAYS = 14
-HORIZON_DAYS = 45
+# All source snapshots are forced to use exactly the model_id + snapshot_date rows
+# from machine.csv. They do not generate independent snapshot calendars.
+MODEL_ID_CANDIDATE_COLUMNS = (
+    "model_id",
+    "machine_id",
+    "MACHINE_ID",
+    "Machine_ID",
+)
+
+MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS = (
+    "snapshot_date",
+    "SNAPSHOT_DATE",
+    "as_of_date",
+    "AS_OF_DATE",
+    "snapshot_dt",
+)
+
+# Temporary fallback for older event extracts that do not yet contain model_id or
+# machine_id. Production extracts should include a real model_id/machine_id.
+ALLOW_MODEL_ID_FALLBACK = True
+
+# The model-family column is not written to the output, but these prefixes are
+# still used internally to restrict the machine backbone to target dozer families.
+TARGET_MODEL_FAMILIES = ("D51", "D61", "D71")
+
+# Optional date limits for development or time-sliced builds.
+# These filters are applied to the machine.csv backbone after it is loaded.
 MIN_SNAPSHOT_DATE = None
 MAX_SNAPSHOT_DATE = None
-
-# Optional development limiter for all runs. Leave None for all machines.
-MAX_MACHINES = None
 
 
 # -----------------------------------------------------------------------------
 # Mini validation mode
 # -----------------------------------------------------------------------------
-# Turn this on to build output for only a few machines before spending time on
-# the full snapshot dataframe.
+# Turn this on when you want to build snapshots for only 2 or 3 machines/model_ids
+# to inspect the logic before running the full build.
 MINI_RUN_ENABLED = True
-
-# Used only when MINI_RUN_ENABLED=True and MINI_RUN_SERIALS is empty.
 MINI_RUN_MACHINE_COUNT = 2
+MINI_RUN_MODEL_IDS = []
 
-# Optional exact serials to validate. Example: ["70356", "B11204", "30948"]
-MINI_RUN_SERIALS = []
-
-# Separate mini output files so a mini run does not overwrite the full output.
-MINI_OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe_mini.parquet"
-MINI_VALIDATION_SAMPLE_ROWS_PATH = OUTPUT_DIR / "mini_snapshot_validation_sample_rows.csv"
-MINI_VALIDATION_BY_MACHINE_PATH = OUTPUT_DIR / "mini_snapshot_validation_by_machine.csv"
+# Backward-compatible limiter. Prefer MINI_RUN_ENABLED for validation.
+MAX_MACHINES = None
 
 
 # -----------------------------------------------------------------------------
-# Data cleaning/report settings
+# Snapshot and target settings for future extensions
 # -----------------------------------------------------------------------------
-WRITE_CLEANING_REPORTS = True
+# The current snapshot dates come from machine.csv, not from this frequency.
+# Keep this setting for future rebuilding of the machine backbone if needed.
+SNAPSHOT_FREQ_DAYS = 14
+
+# Future warranty target horizon.
+HORIZON_DAYS = 45
 
 
 # -----------------------------------------------------------------------------
-# Machine population and progress
+# Progress/reporting settings
 # -----------------------------------------------------------------------------
-TARGET_MODEL_FAMILIES = ("D51", "D61", "D71")
 PROGRESS_EVERY_MACHINES = 100
+WRITE_CLEANING_REPORTS = True
 
 
 # -----------------------------------------------------------------------------
 # Azure ML job submission settings
 # -----------------------------------------------------------------------------
-# Fill these in before running:
-#     python data_preparation/submit_snapshot_build_aml_job.py
-AML_SUBSCRIPTION_ID = "7f07baf7-8bba-4b88-b300-74ba5b15f52d"
-AML_RESOURCE_GROUP = "ai-servicecontroltower"
-AML_WORKSPACE_NAME = "ai-controltower-aml"
-AML_COMPUTE_NAME = "tan-dev-gpu-cluster"
-
-# Curated GPU environment. This avoids manually pinning CUDA wheels.
-# If you run on CPU compute, you may switch to an AzureML sklearn/pandas curated env.
+# These are used by data_preparation/submit_snapshot_build_aml_job.py.
+# Fill them in before submitting to Azure ML.
+AML_SUBSCRIPTION_ID = ""
+AML_RESOURCE_GROUP = ""
+AML_WORKSPACE_NAME = ""
+AML_COMPUTE_NAME = ""
 AML_ENVIRONMENT = "AzureML-acpt-pytorch-2.8-cuda12.6@latest"
-AML_EXPERIMENT_NAME = "snapshot-data-preparation"
-AML_DISPLAY_NAME = "build-snapshot-dataframe"
+AML_EXPERIMENT_NAME = "snapshot-build"
+AML_DISPLAY_NAME = "snapshot-build-machine-backbone"
 
-# Upload the whole project folder as the AML code snapshot so data_preparation/
-# scripts and enriched_data/ are both reachable inside the job.
 AML_CODE_DIR = PROJECT_ROOT
-BUILD_SNAPSHOT_SCRIPT_PATH = DATA_PREPARATION_DIR / "build_snapshot_dataframe.py"
-LOG_DEVICE_SCRIPT_PATH = DATA_PREPARATION_DIR / "log_compute_device.py"
+BUILD_SNAPSHOT_SCRIPT_PATH = PROJECT_ROOT / "data_preparation" / "build_snapshot_dataframe.py"
+LOG_DEVICE_SCRIPT_PATH = PROJECT_ROOT / "data_preparation" / "log_compute_device.py"
 REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
 
 AML_INSTALL_REQUIREMENTS = True
 AML_STREAM_LOGS = True
 AML_REQUIRE_GPU = False
-
-# Local device requirement if you run log_compute_device.py outside Azure ML.
 REQUIRE_GPU = False

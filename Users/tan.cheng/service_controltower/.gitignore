@@ -49,6 +49,9 @@ logs/
 ###############################################################################
 data_preparation/output/**
 enriched_data/output/**
+# Generated outputs
+/data_preparation/output/**
+data_preparation/output/
 
 ###############################################################################
 # JSON outputs
@@ -79,9 +82,6 @@ device_report.json
 **/enriched_data/*.xlsx
 **/enriched_data/*.ipynb
 
-# Generated outputs
-**/data_preparation/output/
-*.parquet
-*.csv
-*.json
+
+
 

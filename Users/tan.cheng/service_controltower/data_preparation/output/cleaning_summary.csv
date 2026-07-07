@@ -1,4 +1,4 @@
-dataset,rows_before,rows_after,rows_dropped_fully_empty,columns_before,columns_after,columns_dropped_fully_empty,fully_empty_columns_dropped,missing_cells_raw,missing_cells_cleaned,blank_or_null_strings_raw
+dataset,rows_before,rows_after_light_cleaning,rows_dropped_fully_empty,columns_before,columns_after_light_cleaning,columns_dropped_fully_empty,fully_empty_columns_dropped,missing_cells_raw,missing_cells_cleaned,blank_or_null_strings_raw
+machine,358878,358878,0,3,3,0,,0,0,0
 fault_codes,682641,682641,0,38,38,0,,376907,376907,0
-machine,682641,682641,0,38,38,0,,376907,376907,0
 maintenance,245640,245640,0,27,26,1,related_component_2,555628,309988,0
