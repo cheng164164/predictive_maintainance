@@ -13,7 +13,10 @@ Current folder structure expected:
     ├── enriched_data/
     │   ├── machine.csv          # canonical model_id + snapshot_date backbone
     │   ├── fault_codes.csv
-    │   └── maintenance.csv
+    │   ├── maintenance.csv
+    │   ├── operation.csv
+    │   ├── warranty.csv
+    │   └── xgb_feature_freeze(all).csv
     └── requirements.txt
 
 Run from service_controltower/:
@@ -52,14 +55,18 @@ MACHINE_PATH = INPUT_DIR / "machine.csv"
 FAULT_CODES_PATH = INPUT_DIR / "fault_codes.csv"
 MAINTENANCE_PATH = INPUT_DIR / "maintenance.csv"
 
-# Optional future inputs. The current build script includes placeholders but does
-# not yet build features from these files.
+# Newly supported files.
+# operation.csv creates operation/utilization features.
+# warranty.csv creates the target label claim_next_45d.
+OPERATION_PATH = INPUT_DIR / "operation.csv"
 WARRANTY_PATH = INPUT_DIR / "warranty.csv"
+
+# Optional future inputs.
 OIL_SAMPLE_PATH = INPUT_DIR / "oil_samples.csv"
 SERVICE_PATH = INPUT_DIR / "service.csv"
 
-# Optional feature-name validation file.
-FEATURE_FREEZE_PATH = INPUT_DIR / "xgb_feature_freeze.xlsx"
+# Optional feature-name validation file. CSV and Excel are both supported.
+FEATURE_FREEZE_PATH = INPUT_DIR / "xgb_feature_freeze(all).csv"
 
 
 # -----------------------------------------------------------------------------
@@ -73,6 +80,8 @@ MINI_OUTPUT_PATH = OUTPUT_DIR / "snapshot_dataframe_mini.csv"
 #   - machine_backbone.csv
 #   - fault_snapshot.csv
 #   - maintenance_snapshot.csv
+#   - operation_snapshot.csv, if operation data exists
+#   - warranty_target_snapshot.csv, if warranty data exists
 SAVE_SOURCE_SNAPSHOTS = True
 
 

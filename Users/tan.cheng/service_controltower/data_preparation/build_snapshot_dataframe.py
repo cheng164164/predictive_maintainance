@@ -5,10 +5,11 @@ Current supported source files:
     1. machine.csv          canonical model_id + snapshot_date backbone
     2. fault_codes.csv      fault/event history
     3. maintenance.csv      maintenance-monitor / PM history
+    4. operation.csv        daily operation / utilization history
+    5. warranty.csv         warranty/claim history for target labels
 
 Designed for future extension:
     - oil / fluid sample data
-    - warranty data / target labels
     - service/work-order data
 
 Expected project layout:
@@ -21,7 +22,10 @@ Expected project layout:
     ├── enriched_data/
     │   ├── machine.csv
     │   ├── fault_codes.csv
-    │   └── maintenance.csv
+    │   ├── maintenance.csv
+    │   ├── operation.csv
+    │   ├── warranty.csv
+    │   └── xgb_feature_freeze(all).csv
     └── requirements.txt
 
 Output grain:
@@ -34,7 +38,7 @@ Important design choice:
 
 Core leakage-control rule:
     Features only use source records with event_date < snapshot_date.
-    Target labels, when warranty data is added later, should only use dates after
+    Target labels from warranty data only use claim/failure dates after
     snapshot_date and on/before snapshot_date + prediction_horizon.
 """
 
@@ -93,71 +97,137 @@ PROGRESS_EVERY_MACHINES = int(cfg("PROGRESS_EVERY_MACHINES", 100))
 # Frozen model feature list
 # -----------------------------------------------------------------------------
 FROZEN_FEATURES = [
-    "fault_count_7d",
-    "fault_count_30d",
-    "fault_count_90d",
-    "fault_count_previous_30d",
-    "fault_growth_rate",
-    "days_since_last_fault",
-    "days_since_last_severe_fault",
-    "faults_per_100_hours",
-    "unique_fault_code_count_90d",
-    "repeat_fault_ratio_90d",
-    "unique_component_count_90d",
-    "mechanical_fault_count_90d",
-    "mechanical_fault_count_30d",
-    "electrical_fault_count_90d",
-    "electrical_fault_count_30d",
-    "action_L01_count_90d",
-    "action_L02_count_90d",
-    "action_L03_count_90d",
-    "action_L04_count_90d",
-    "max_action_level_90d",
-    "sum_log_occurrence_90d",
-    "max_log_occurrence_90d",
-    "occurrence_severity_score_90d",
-    "strong_fault_count_90d",
-    "moderate_fault_count_90d",
-    "max_event_evidence_score_90d",
-    "avg_event_evidence_score_90d",
-    "max_context_evidence_score_90d",
-    "engine_fault_count_90d",
-    "hydraulic_fault_count_90d",
-    "powertrain_fault_count_90d",
-    "scr_fault_count_90d",
-    "workequipment_fault_count_90d",
-    "cooling_fault_count_90d",
-    "top_component_fault_ratio_90d",
-    "maintenance_events_180d",
-    "monitor_reset_count_180d",
-    "maintenance_reset_ratio_180d",
-    "maintenance_events_90d",
-    "monitor_reset_count_90d",
-    "active_maintenance_items",
-    "overdue_item_count",
-    "due_now_item_count",
-    "maintenance_due_or_overdue_ratio",
-    "avg_remaining_hours",
-    "min_remaining_hours",
-    "engine_reset_count_180d",
-    "transmission_reset_count_180d",
-    "final_drive_reset_count_180d",
-    "cooling_system_reset_count_180d",
-    "urea_scr_system_reset_count_180d",
-    "engine_overdue_item_count",
-    "transmission_overdue_item_count",
-    "final_drive_overdue_item_count",
-    "cooling_system_overdue_item_count",
-    "urea_scr_system_overdue_item_count",
-    "oil_reset_count_180d",
-    "filter_reset_count_180d",
-    "breather_reset_count_180d",
-    "coolant_reset_count_180d",
-    "unique_maintenance_type_count_180d",
-    "days_since_last_reset",
-    "days_since_last_oil_reset",
-    "days_since_last_filter_reset",
-    "smr_since_last_reset",
+    'fault_count_7d',
+    'fault_count_30d',
+    'fault_count_90d',
+    'fault_count_previous_30d',
+    'fault_growth_rate',
+    'days_since_last_fault',
+    'days_since_last_severe_fault',
+    'faults_per_100_hours',
+    'unique_fault_code_count_90d',
+    'repeat_fault_ratio_90d',
+    'unique_component_count_90d',
+    'mechanical_fault_count_90d',
+    'mechanical_fault_count_30d',
+    'electrical_fault_count_90d',
+    'electrical_fault_count_30d',
+    'action_L01_count_90d',
+    'action_L02_count_90d',
+    'action_L03_count_90d',
+    'action_L04_count_90d',
+    'max_action_level_90d',
+    'sum_log_occurrence_90d',
+    'max_log_occurrence_90d',
+    'occurrence_severity_score_90d',
+    'strong_fault_count_90d',
+    'moderate_fault_count_90d',
+    'max_event_evidence_score_90d',
+    'avg_event_evidence_score_90d',
+    'max_context_evidence_score_90d',
+    'engine_fault_count_90d',
+    'hydraulic_fault_count_90d',
+    'powertrain_fault_count_90d',
+    'scr_fault_count_90d',
+    'workequipment_fault_count_90d',
+    'cooling_fault_count_90d',
+    'top_component_fault_ratio_90d',
+    'maintenance_events_180d',
+    'monitor_reset_count_180d',
+    'maintenance_reset_ratio_180d',
+    'maintenance_events_90d',
+    'monitor_reset_count_90d',
+    'active_maintenance_items',
+    'overdue_item_count',
+    'due_now_item_count',
+    'maintenance_due_or_overdue_ratio',
+    'avg_remaining_hours',
+    'min_remaining_hours',
+    'engine_reset_count_180d',
+    'transmission_reset_count_180d',
+    'final_drive_reset_count_180d',
+    'cooling_system_reset_count_180d',
+    'urea_scr_system_reset_count_180d',
+    'engine_overdue_item_count',
+    'transmission_overdue_item_count',
+    'final_drive_overdue_item_count',
+    'cooling_system_overdue_item_count',
+    'urea_scr_system_overdue_item_count',
+    'oil_reset_count_180d',
+    'filter_reset_count_180d',
+    'breather_reset_count_180d',
+    'coolant_reset_count_180d',
+    'unique_maintenance_type_count_180d',
+    'days_since_last_reset',
+    'days_since_last_oil_reset',
+    'days_since_last_filter_reset',
+    'smr_since_last_reset',
+    'smr_latest_hours',
+    'smr_delta_90d',
+    'days_since_last_smr',
+    'smr_delta_7d',
+    'smr_delta_30d',
+    'working_hours_sum_30d',
+    'working_hours_sum_90d',
+    'actual_work_day_count_30d',
+    'actual_work_day_count_90d',
+    'actual_work_day_ratio_90d',
+    'days_since_last_actual_work_day',
+    'current_actual_work_streak_days',
+    'actual_work_valid_flag',
+    'working_hours_stddev_actual_work_day_90d',
+    'actual_work_seconds_invalid_count_90d',
+    'fuel_actual_work_conflict_count_90d',
+    'working_hours_rate_change_30d_vs_90d',
+    'actual_work_day_ratio_change_30d_vs_90d',
+    'working_hours_sum_7d',
+    'actual_work_day_count_7d',
+    'actual_work_day_ratio_30d',
+    'avg_working_hours_per_actual_work_day_30d',
+    'avg_working_hours_per_actual_work_day_90d',
+    'max_working_hours_day_90d',
+    'avg_engine_running_hours_per_engine_day_90d',
+    'avg_throttle_dial_position_active_30d',
+    'avg_throttle_dial_position_active_90d',
+    'days_since_last_engine_running_day',
+    'engine_idling_share_90d',
+    'engine_running_day_ratio_30d',
+    'engine_running_day_ratio_90d',
+    'engine_running_hours_sum_30d',
+    'engine_running_hours_sum_7d',
+    'engine_running_hours_sum_90d',
+    'engine_running_rate_change_30d_vs_90d',
+    'throttle_full_hours_sum_90d',
+    'throttle_full_share_change_30d_vs_90d',
+    'engine_observed_day_count_90d',
+    'throttle_observed_day_count_90d',
+    'work_idle_sum_exceeds_engine_count_90d',
+    'engine_running_day_count_30d',
+    'engine_running_day_count_90d',
+    'engine_running_hours_max_day_90d',
+    'engine_running_hours_stddev_engine_day_90d',
+    'high_throttle_day_count_90d',
+    'long_engine_day_count_90d',
+    'throttle_full_engine_share_30d',
+    'throttle_full_engine_share_90d',
+    'travel_hours_sum_30d',
+    'travel_hours_sum_90d',
+    'travel_day_count_30d',
+    'travel_day_count_90d',
+    'avg_travel_hours_per_travel_day_90d',
+    'days_since_last_travel_day',
+    'moving_back_forth_hours_sum_90d',
+    'steering_hours_sum_90d',
+    'moving_back_forth_to_travel_ratio_90d',
+    'travel_day_ratio_observed_90d',
+    'travel_day_ratio_observed_30d',
+    'travel_rate_change_30d_vs_90d',
+    'has_travel_data_90d',
+    'avg_travel_hours_per_travel_day_30d',
+    'travel_share_of_working_hours_90d',
+    'steering_to_travel_ratio_90d',
+    'auto_quick_shift_hours_sum_90d',
+    'manual_variable_shift_hours_sum_90d',
 ]
 
 COUNT_FEATURES = [
@@ -184,11 +254,15 @@ COUNT_FEATURES = [
 ]
 
 RECENCY_FEATURES = [
-    "days_since_last_fault",
-    "days_since_last_severe_fault",
-    "days_since_last_reset",
-    "days_since_last_oil_reset",
-    "days_since_last_filter_reset",
+    'days_since_last_fault',
+    'days_since_last_severe_fault',
+    'days_since_last_reset',
+    'days_since_last_oil_reset',
+    'days_since_last_filter_reset',
+    'days_since_last_smr',
+    'days_since_last_actual_work_day',
+    'days_since_last_engine_running_day',
+    'days_since_last_travel_day',
 ]
 
 NULL_LIKE_STRINGS = {
@@ -454,6 +528,72 @@ def normalize_model_id(df: pd.DataFrame, source_name: str) -> tuple[pd.Series, s
     return normalize_key(fallback), "fallback_full_model_plus_serial"
 
 
+def fallback_model_id_from_full_model_serial(df: pd.DataFrame) -> pd.Series:
+    """Build a temporary model_id as full_model + serial when needed.
+
+    This is mainly used for warranty extracts where machine_id may appear as
+    D71EX-24-70155 while the machine backbone uses D71EX-24 70155.
+    Production extracts should still provide the same model_id as machine.csv.
+    """
+    full_model = first_existing_col(df, ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"], pd.NA)
+    serial = first_existing_col(df, ["serial_number", "SERIAL", "Serial", "serial", "ZZSERNR"], pd.NA)
+    fallback = full_model.astype("string").str.strip() + " " + serial.astype("string").str.strip()
+    fallback = fallback.mask(fallback.str.lower().isin(NULL_LIKE_STRINGS), pd.NA)
+    return normalize_key(fallback)
+
+
+def reconcile_model_id_to_backbone(
+    df: pd.DataFrame,
+    model_id: pd.Series,
+    allowed_model_ids: set[str],
+    source_name: str,
+) -> tuple[pd.Series, int]:
+    """Use full_model + serial only for rows whose provided model_id misses the backbone.
+
+    This preserves true model_id values when they already match the machine.csv
+    backbone, while fixing common source-format differences such as
+    D71EX-24-70155 versus D71EX-24 70155.
+    """
+    allowed = {str(x) for x in allowed_model_ids}
+    current = normalize_key(model_id)
+    fallback = fallback_model_id_from_full_model_serial(df)
+
+    current_matches = current.astype("string").isin(allowed)
+    fallback_matches = fallback.astype("string").isin(allowed)
+    use_fallback = (~current_matches) & fallback_matches
+    reconciled_count = int(use_fallback.sum())
+
+    if reconciled_count:
+        progress(
+            f"{source_name}: reconciled {reconciled_count:,} model_id values to the "
+            "machine backbone using full_model + serial."
+        )
+
+    out = current.mask(use_fallback, fallback)
+    return out, reconciled_count
+
+
+def numeric_col(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """Return a numeric source column or a default numeric Series."""
+    return pd.to_numeric(safe_col(df, col, default), errors="coerce")
+
+
+def flag_col(df: pd.DataFrame, col: str, default: int = 0) -> pd.Series:
+    """Return a 0/1 numeric flag column from mixed source values."""
+    if col not in df.columns:
+        return pd.Series(default, index=df.index, dtype="float64")
+    raw = df[col]
+    if pd.api.types.is_bool_dtype(raw):
+        return raw.astype(float)
+    text = raw.astype("string").str.strip().str.lower()
+    true_values = {"true", "1", "yes", "y", "t"}
+    false_values = {"false", "0", "no", "n", "f"}
+    out = pd.to_numeric(raw, errors="coerce")
+    out = out.mask(text.isin(true_values), 1)
+    out = out.mask(text.isin(false_values), 0)
+    return out.fillna(default).astype(float)
+
+
 def contains_any(series: pd.Series, patterns: Iterable[str]) -> pd.Series:
     """Boolean mask where text contains any keyword pattern."""
     txt = series.fillna("").astype(str).str.lower()
@@ -613,6 +753,9 @@ def standardize_faults(fault: pd.DataFrame, allowed_model_ids: set[str]) -> tupl
     """Convert the raw fault/event table into a standardized event table."""
     f = fault.copy()
     f["model_id"], model_id_source = normalize_model_id(f, "fault_codes")
+    f["model_id"], reconciled_model_id_rows = reconcile_model_id_to_backbone(
+        f, f["model_id"], allowed_model_ids, "fault_codes"
+    )
     f["full_model"] = first_existing_col(f, ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"], pd.NA).astype("string").str.strip()
 
     event_time = parse_dt(first_existing_col(f, ["event_time", "UPDATE_DATETIME", "update_datetime"], pd.NaT))
@@ -665,6 +808,7 @@ def standardize_faults(fault: pd.DataFrame, allowed_model_ids: set[str]) -> tupl
         "source_role": "event_features",
         "input_rows": total_rows,
         "model_id_source": model_id_source,
+        "model_id_reconciled_to_backbone_rows": reconciled_model_id_rows,
         "snapshot_date_source": "event_time/event_date",
         "missing_model_id_rows": missing_model_id_rows,
         "missing_usable_event_date_rows": missing_date_rows,
@@ -680,6 +824,9 @@ def standardize_maintenance(pm: pd.DataFrame, allowed_model_ids: set[str]) -> tu
     """Convert the raw maintenance-monitor table into a standardized event table."""
     m = pm.copy()
     m["model_id"], model_id_source = normalize_model_id(m, "maintenance")
+    m["model_id"], reconciled_model_id_rows = reconcile_model_id_to_backbone(
+        m, m["model_id"], allowed_model_ids, "maintenance"
+    )
     m["full_model"] = first_existing_col(m, ["full_model", "FULL_MODEL", "MODEL", "model"], pd.NA).astype("string").str.strip()
 
     event_time = parse_dt(first_existing_col(m, ["event_time", "UPDATE_DATETIME", "update_datetime"], pd.NaT))
@@ -723,7 +870,146 @@ def standardize_maintenance(pm: pd.DataFrame, allowed_model_ids: set[str]) -> tu
         "source_role": "event_features",
         "input_rows": total_rows,
         "model_id_source": model_id_source,
+        "model_id_reconciled_to_backbone_rows": reconciled_model_id_rows,
         "snapshot_date_source": "event_time/event_date/date",
+        "missing_model_id_rows": missing_model_id_rows,
+        "missing_usable_event_date_rows": missing_date_rows,
+        "dropped_missing_event_date_rows": missing_date_rows,
+        "rows_not_in_machine_backbone": not_in_backbone_rows,
+        "rows_after_standardization": len(out),
+        "unique_model_ids_after_standardization": out["model_id"].nunique(),
+    }
+    return out, summary
+
+
+def standardize_operation(operation: pd.DataFrame, allowed_model_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Convert daily operation/utilization records into a standardized event table."""
+    o = operation.copy()
+    o["model_id"], model_id_source = normalize_model_id(o, "operation")
+    o["model_id"], reconciled_model_id_rows = reconcile_model_id_to_backbone(
+        o, o["model_id"], allowed_model_ids, "operation"
+    )
+    o["full_model"] = first_existing_col(o, ["full_model", "FULL_MODEL", "MODEL", "model"], pd.NA).astype("string").str.strip()
+
+    # Operation records are daily. Prefer LOCAL_DATE so the feature date stays on
+    # the machine's local operating day; fall back to timestamp fields when needed.
+    local_date = parse_dt(first_existing_col(o, ["LOCAL_DATE", "local_date", "event_date", "date"], pd.NaT))
+    update_ts = parse_dt(first_existing_col(o, ["update_datetime_ts", "UPDATE_DATETIME", "event_time"], pd.NaT))
+    o["operation_event_date"] = local_date.fillna(update_ts).dt.normalize()
+
+    numeric_defaults = {
+        "smr_hours": np.nan,
+        "smr_delta_clean_since_prev_obs_hours": 0,
+        "actual_working_hours_clean": 0,
+        "actual_work_streak_through_current_day": 0,
+        "engine_running_hours_clean": 0,
+        "engine_idling_hours_clean": 0,
+        "throttle_full_hours_clean": 0,
+        "throttle_average_dial_position_clean": np.nan,
+        "traveling_hours_clean": 0,
+        "moving_back_forth_hours_clean": 0,
+        "steering_hours_clean": 0,
+        "working_hours_clean": 0,
+        "auto_quick_shift_hours_clean": 0,
+        "manual_variable_shift_hours_clean": 0,
+        "movement_observed_count": 0,
+    }
+    for col, default in numeric_defaults.items():
+        o[f"{col}_clean"] = numeric_col(o, col, default)
+
+    flag_defaults = [
+        "smr_valid_for_utilization_flag",
+        "smr_present_flag",
+        "actual_work_day_flag",
+        "actual_work_valid_flag",
+        "actual_work_seconds_invalid_flag",
+        "fuel_actual_work_conflict_flag",
+        "engine_running_day_flag",
+        "engine_seconds_valid_flag",
+        "engine_seconds_observed_flag",
+        "throttle_observed_flag",
+        "work_idle_sum_exceeds_engine_flag",
+        "high_throttle_day_flag",
+        "long_engine_day_flag",
+        "travel_day_flag",
+        "travel_usable_flag",
+        "movement_day_flag",
+        "travel_invalid_flag",
+    ]
+    for col in flag_defaults:
+        o[f"{col}_clean"] = flag_col(o, col, 0)
+
+    o["last_actual_work_date_clean"] = parse_dt(
+        first_existing_col(o, ["last_actual_work_date_through_current_day"], pd.NaT)
+    ).dt.normalize()
+
+    total_rows = len(o)
+    missing_model_id_rows = int(o["model_id"].isna().sum())
+    missing_date_rows = int(o["operation_event_date"].isna().sum())
+    not_in_backbone_rows = int((~o["model_id"].astype("string").isin(allowed_model_ids) & o["model_id"].notna()).sum())
+
+    out = o[
+        o["model_id"].notna()
+        & o["operation_event_date"].notna()
+        & o["model_id"].astype("string").isin(allowed_model_ids)
+    ].copy()
+    out = out.sort_values(["model_id", "operation_event_date"]).reset_index(drop=True)
+
+    summary = {
+        "source": "operation",
+        "source_role": "event_features",
+        "input_rows": total_rows,
+        "model_id_source": model_id_source,
+        "model_id_reconciled_to_backbone_rows": reconciled_model_id_rows,
+        "snapshot_date_source": "LOCAL_DATE/update_datetime_ts",
+        "missing_model_id_rows": missing_model_id_rows,
+        "missing_usable_event_date_rows": missing_date_rows,
+        "dropped_missing_event_date_rows": missing_date_rows,
+        "rows_not_in_machine_backbone": not_in_backbone_rows,
+        "rows_after_standardization": len(out),
+        "unique_model_ids_after_standardization": out["model_id"].nunique(),
+    }
+    return out, summary
+
+
+def standardize_warranty(warranty: pd.DataFrame, allowed_model_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Standardize warranty/claim records used to create claim_next_45d."""
+    w = warranty.copy()
+    w["model_id"], model_id_source = normalize_model_id(w, "warranty")
+    w["model_id"], reconciled_model_id_rows = reconcile_model_id_to_backbone(
+        w, w["model_id"], allowed_model_ids, "warranty"
+    )
+    w["full_model"] = first_existing_col(w, ["full_model", "FULL_MODEL", "MODEL", "model", "ZZMATNR"], pd.NA).astype("string").str.strip()
+
+    claim_date = parse_dt(
+        first_existing_col(
+            w,
+            ["local_date", "LOCAL_DATE", "ZZFAILDAT", "warranty_failure_date", "failure_date", "claim_date"],
+            pd.NaT,
+        )
+    )
+    w["warranty_event_date"] = claim_date.dt.normalize()
+    w["claim_number_clean"] = first_existing_col(w, ["claim_number", "CLMNO", "claim_id"], "").astype("string").str.strip()
+
+    total_rows = len(w)
+    missing_model_id_rows = int(w["model_id"].isna().sum())
+    missing_date_rows = int(w["warranty_event_date"].isna().sum())
+    not_in_backbone_rows = int((~w["model_id"].astype("string").isin(allowed_model_ids) & w["model_id"].notna()).sum())
+
+    out = w[
+        w["model_id"].notna()
+        & w["warranty_event_date"].notna()
+        & w["model_id"].astype("string").isin(allowed_model_ids)
+    ].copy()
+    out = out.sort_values(["model_id", "warranty_event_date"]).reset_index(drop=True)
+
+    summary = {
+        "source": "warranty",
+        "source_role": "target_label",
+        "input_rows": total_rows,
+        "model_id_source": model_id_source,
+        "model_id_reconciled_to_backbone_rows": reconciled_model_id_rows,
+        "snapshot_date_source": "local_date/ZZFAILDAT",
         "missing_model_id_rows": missing_model_id_rows,
         "missing_usable_event_date_rows": missing_date_rows,
         "dropped_missing_event_date_rows": missing_date_rows,
@@ -815,7 +1101,7 @@ def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[di
 
         row["has_fault_90d"] = int(row["fault_count_90d"] > 0)
         row["smr_latest_before_snapshot"] = smr_latest
-        row["smr_delta_90d"] = smr_delta_90d
+        row["fault_smr_delta_90d"] = smr_delta_90d
         out.append(row)
 
     return out
@@ -966,6 +1252,251 @@ def build_maintenance_snapshot(backbone: pd.DataFrame, pm: pd.DataFrame) -> pd.D
 
 
 # -----------------------------------------------------------------------------
+# Operation source feature engineering
+# -----------------------------------------------------------------------------
+def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> list[dict]:
+    """Create operation/utilization features for one model_id across snapshots."""
+    out: list[dict] = []
+    dates = o_m["operation_event_date"] if "operation_event_date" in o_m.columns else pd.Series(dtype="datetime64[ns]")
+
+    def sum_col(df: pd.DataFrame, col: str) -> float:
+        return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum()) if col in df.columns else 0.0
+
+    def max_col(df: pd.DataFrame, col: str) -> float:
+        if col not in df.columns or df.empty:
+            return np.nan
+        return pd.to_numeric(df[col], errors="coerce").max()
+
+    def mean_col(df: pd.DataFrame, col: str) -> float:
+        if col not in df.columns or df.empty:
+            return np.nan
+        return pd.to_numeric(df[col], errors="coerce").mean()
+
+    def std_col(df: pd.DataFrame, col: str) -> float:
+        if col not in df.columns or df.empty:
+            return np.nan
+        return pd.to_numeric(df[col], errors="coerce").std(ddof=1)
+
+    for snap in snap_m["snapshot_date"]:
+        before = o_m[dates < snap]
+        w90 = before[before["operation_event_date"] >= snap - pd.Timedelta(days=90)]
+        w30 = before[before["operation_event_date"] >= snap - pd.Timedelta(days=30)]
+        w7 = before[before["operation_event_date"] >= snap - pd.Timedelta(days=7)]
+
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
+
+        # SMR / utilization features.
+        valid_smr_before = before[(before["smr_valid_for_utilization_flag_clean"] == 1) & before["smr_hours_clean"].notna()]
+        latest_valid_smr = valid_smr_before.sort_values("operation_event_date").tail(1)
+        if len(latest_valid_smr):
+            row["smr_latest_hours"] = latest_valid_smr["smr_hours_clean"].iloc[0]
+            row["days_since_last_smr"] = days_between(snap, latest_valid_smr["operation_event_date"].iloc[0])
+        else:
+            row["smr_latest_hours"] = np.nan
+            row["days_since_last_smr"] = np.nan
+        row["smr_delta_7d"] = sum_col(w7, "smr_delta_clean_since_prev_obs_hours_clean")
+        row["smr_delta_30d"] = sum_col(w30, "smr_delta_clean_since_prev_obs_hours_clean")
+        row["smr_delta_90d"] = sum_col(w90, "smr_delta_clean_since_prev_obs_hours_clean")
+
+        # Actual work / activity features.
+        work_sum_7 = sum_col(w7, "actual_working_hours_clean_clean")
+        work_sum_30 = sum_col(w30, "actual_working_hours_clean_clean")
+        work_sum_90 = sum_col(w90, "actual_working_hours_clean_clean")
+        work_day_7 = sum_col(w7, "actual_work_day_flag_clean")
+        work_day_30 = sum_col(w30, "actual_work_day_flag_clean")
+        work_day_90 = sum_col(w90, "actual_work_day_flag_clean")
+        work_valid_30 = sum_col(w30, "actual_work_valid_flag_clean")
+        work_valid_90 = sum_col(w90, "actual_work_valid_flag_clean")
+
+        row["working_hours_sum_7d"] = work_sum_7
+        row["working_hours_sum_30d"] = work_sum_30
+        row["working_hours_sum_90d"] = work_sum_90
+        row["actual_work_day_count_7d"] = work_day_7
+        row["actual_work_day_count_30d"] = work_day_30
+        row["actual_work_day_count_90d"] = work_day_90
+        row["actual_work_day_ratio_30d"] = ratio(work_day_30, work_valid_30)
+        row["actual_work_day_ratio_90d"] = ratio(work_day_90, work_valid_90)
+        row["actual_work_day_ratio_change_30d_vs_90d"] = row["actual_work_day_ratio_30d"] - row["actual_work_day_ratio_90d"]
+        row["actual_work_valid_flag"] = work_valid_90
+        row["working_hours_rate_change_30d_vs_90d"] = (work_sum_30 / 30.0) - (work_sum_90 / 90.0)
+        row["avg_working_hours_per_actual_work_day_30d"] = ratio(work_sum_30, work_day_30)
+        row["avg_working_hours_per_actual_work_day_90d"] = ratio(work_sum_90, work_day_90)
+        row["max_working_hours_day_90d"] = max_col(w90, "actual_working_hours_clean_clean")
+        active_work_w90 = w90[w90["actual_work_day_flag_clean"] == 1]
+        row["working_hours_stddev_actual_work_day_90d"] = std_col(active_work_w90, "actual_working_hours_clean_clean")
+        row["actual_work_seconds_invalid_count_90d"] = sum_col(w90, "actual_work_seconds_invalid_flag_clean")
+        row["fuel_actual_work_conflict_count_90d"] = sum_col(w90, "fuel_actual_work_conflict_flag_clean")
+
+        latest_before = before.sort_values("operation_event_date").tail(1)
+        if len(latest_before):
+            latest_op_date = latest_before["operation_event_date"].iloc[0]
+            latest_last_work_date = latest_before["last_actual_work_date_clean"].iloc[0]
+            row["days_since_last_actual_work_day"] = days_between(snap, latest_last_work_date)
+            row["current_actual_work_streak_days"] = (
+                latest_before["actual_work_streak_through_current_day_clean"].iloc[0]
+                if days_between(snap, latest_op_date) == 1
+                else 0
+            )
+        else:
+            row["days_since_last_actual_work_day"] = np.nan
+            row["current_actual_work_streak_days"] = 0
+
+        # Engine and throttle features.
+        engine_sum_7 = sum_col(w7, "engine_running_hours_clean_clean")
+        engine_sum_30 = sum_col(w30, "engine_running_hours_clean_clean")
+        engine_sum_90 = sum_col(w90, "engine_running_hours_clean_clean")
+        engine_day_30 = sum_col(w30, "engine_running_day_flag_clean")
+        engine_day_90 = sum_col(w90, "engine_running_day_flag_clean")
+        engine_valid_30 = sum_col(w30, "engine_seconds_valid_flag_clean")
+        engine_valid_90 = sum_col(w90, "engine_seconds_valid_flag_clean")
+        throttle_full_30 = sum_col(w30, "throttle_full_hours_clean_clean")
+        throttle_full_90 = sum_col(w90, "throttle_full_hours_clean_clean")
+
+        row["engine_running_hours_sum_7d"] = engine_sum_7
+        row["engine_running_hours_sum_30d"] = engine_sum_30
+        row["engine_running_hours_sum_90d"] = engine_sum_90
+        row["engine_running_day_count_30d"] = engine_day_30
+        row["engine_running_day_count_90d"] = engine_day_90
+        row["engine_running_day_ratio_30d"] = ratio(engine_day_30, engine_valid_30)
+        row["engine_running_day_ratio_90d"] = ratio(engine_day_90, engine_valid_90)
+        row["engine_running_rate_change_30d_vs_90d"] = (engine_sum_30 / 30.0) - (engine_sum_90 / 90.0)
+        row["avg_engine_running_hours_per_engine_day_90d"] = ratio(engine_sum_90, engine_day_90)
+        engine_active_w90 = w90[w90["engine_running_day_flag_clean"] == 1]
+        engine_active_w30 = w30[w30["engine_running_day_flag_clean"] == 1]
+        row["avg_throttle_dial_position_active_30d"] = mean_col(engine_active_w30, "throttle_average_dial_position_clean_clean")
+        row["avg_throttle_dial_position_active_90d"] = mean_col(engine_active_w90, "throttle_average_dial_position_clean_clean")
+        row["days_since_last_engine_running_day"] = days_between(
+            snap,
+            before.loc[before["engine_running_day_flag_clean"] == 1, "operation_event_date"].max(),
+        )
+        row["engine_idling_share_90d"] = ratio(sum_col(w90, "engine_idling_hours_clean_clean"), engine_sum_90)
+        row["throttle_full_hours_sum_90d"] = throttle_full_90
+        row["throttle_full_engine_share_30d"] = ratio(throttle_full_30, engine_sum_30)
+        row["throttle_full_engine_share_90d"] = ratio(throttle_full_90, engine_sum_90)
+        row["throttle_full_share_change_30d_vs_90d"] = row["throttle_full_engine_share_30d"] - row["throttle_full_engine_share_90d"]
+        row["engine_observed_day_count_90d"] = sum_col(w90, "engine_seconds_observed_flag_clean")
+        row["throttle_observed_day_count_90d"] = sum_col(w90, "throttle_observed_flag_clean")
+        row["work_idle_sum_exceeds_engine_count_90d"] = sum_col(w90, "work_idle_sum_exceeds_engine_flag_clean")
+        row["engine_running_hours_max_day_90d"] = max_col(w90, "engine_running_hours_clean_clean")
+        row["engine_running_hours_stddev_engine_day_90d"] = std_col(engine_active_w90, "engine_running_hours_clean_clean")
+        row["high_throttle_day_count_90d"] = sum_col(w90, "high_throttle_day_flag_clean")
+        row["long_engine_day_count_90d"] = sum_col(w90, "long_engine_day_flag_clean")
+
+        # Travel / movement features.
+        travel_sum_30 = sum_col(w30, "traveling_hours_clean_clean")
+        travel_sum_90 = sum_col(w90, "traveling_hours_clean_clean")
+        travel_day_30 = sum_col(w30, "travel_day_flag_clean")
+        travel_day_90 = sum_col(w90, "travel_day_flag_clean")
+        travel_observed_30 = sum_col(w30, "travel_usable_flag_clean") or len(w30)
+        travel_observed_90 = sum_col(w90, "travel_usable_flag_clean") or len(w90)
+        moving_sum_90 = sum_col(w90, "moving_back_forth_hours_clean_clean")
+        steering_sum_90 = sum_col(w90, "steering_hours_clean_clean")
+
+        row["travel_hours_sum_30d"] = travel_sum_30
+        row["travel_hours_sum_90d"] = travel_sum_90
+        row["travel_day_count_30d"] = travel_day_30
+        row["travel_day_count_90d"] = travel_day_90
+        row["avg_travel_hours_per_travel_day_30d"] = ratio(travel_sum_30, travel_day_30)
+        row["avg_travel_hours_per_travel_day_90d"] = ratio(travel_sum_90, travel_day_90)
+        row["days_since_last_travel_day"] = days_between(
+            snap,
+            before.loc[before["travel_day_flag_clean"] == 1, "operation_event_date"].max(),
+        )
+        row["moving_back_forth_hours_sum_90d"] = moving_sum_90
+        row["steering_hours_sum_90d"] = steering_sum_90
+        row["moving_back_forth_to_travel_ratio_90d"] = ratio(moving_sum_90, travel_sum_90)
+        row["travel_day_ratio_observed_30d"] = ratio(travel_day_30, travel_observed_30)
+        row["travel_day_ratio_observed_90d"] = ratio(travel_day_90, travel_observed_90)
+        row["travel_rate_change_30d_vs_90d"] = (travel_sum_30 / 30.0) - (travel_sum_90 / 90.0)
+        row["has_travel_data_90d"] = int(travel_observed_90 > 0)
+        row["travel_share_of_working_hours_90d"] = ratio(travel_sum_90, work_sum_90)
+        row["steering_to_travel_ratio_90d"] = ratio(steering_sum_90, travel_sum_90)
+        row["auto_quick_shift_hours_sum_90d"] = sum_col(w90, "auto_quick_shift_hours_clean_clean")
+        row["manual_variable_shift_hours_sum_90d"] = sum_col(w90, "manual_variable_shift_hours_clean_clean")
+
+        row["has_operation_90d"] = int(len(w90) > 0)
+        out.append(row)
+
+    return out
+
+
+def build_operation_snapshot(backbone: pd.DataFrame, operation: pd.DataFrame) -> pd.DataFrame:
+    """Build the source-specific operation snapshot dataframe on the machine backbone."""
+    start = time.perf_counter()
+    rows: list[pd.DataFrame] = []
+    operation_groups = {k: v for k, v in operation.groupby("model_id", sort=False)}
+
+    total_models = backbone["model_id"].nunique() if not backbone.empty else 0
+    total_snapshot_rows = len(backbone)
+    processed_snapshot_rows = 0
+    progress(f"Building operation snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
+
+    for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
+        o_m = operation_groups.get(model_id, operation.iloc[0:0])
+        rows.append(pd.DataFrame(operation_features_for_model(snap_m, o_m)))
+        processed_snapshot_rows += len(snap_m)
+
+        if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
+            progress(
+                f"Operation snapshot progress: {idx:,}/{total_models:,} model_ids; "
+                f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
+            )
+
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date"])
+    progress(f"Operation snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Warranty target engineering
+# -----------------------------------------------------------------------------
+def warranty_target_for_model(snap_m: pd.DataFrame, w_m: pd.DataFrame, horizon_days: int) -> list[dict]:
+    """Create claim_next_45d-like target labels for one model_id."""
+    out: list[dict] = []
+    dates = w_m["warranty_event_date"] if "warranty_event_date" in w_m.columns else pd.Series(dtype="datetime64[ns]")
+
+    for snap in snap_m["snapshot_date"]:
+        future = w_m[(dates > snap) & (dates <= snap + pd.Timedelta(days=horizon_days))]
+        out.append(
+            {
+                "model_id": snap_m["model_id"].iloc[0],
+                "snapshot_date": snap,
+                f"claim_next_{horizon_days}d": int(len(future) > 0),
+            }
+        )
+    return out
+
+
+def build_warranty_target_snapshot(backbone: pd.DataFrame, warranty: pd.DataFrame, horizon_days: int = 45) -> pd.DataFrame:
+    """Build the warranty target dataframe on the machine backbone."""
+    start = time.perf_counter()
+    rows: list[pd.DataFrame] = []
+    warranty_groups = {k: v for k, v in warranty.groupby("model_id", sort=False)}
+
+    total_models = backbone["model_id"].nunique() if not backbone.empty else 0
+    total_snapshot_rows = len(backbone)
+    processed_snapshot_rows = 0
+    progress(f"Building warranty target snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
+
+    for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
+        w_m = warranty_groups.get(model_id, warranty.iloc[0:0])
+        rows.append(pd.DataFrame(warranty_target_for_model(snap_m, w_m, horizon_days)))
+        processed_snapshot_rows += len(snap_m)
+
+        if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
+            progress(
+                f"Warranty target progress: {idx:,}/{total_models:,} model_ids; "
+                f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
+            )
+
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date", f"claim_next_{horizon_days}d"])
+    if horizon_days == 45 and "claim_next_45d" not in result.columns and f"claim_next_{horizon_days}d" in result.columns:
+        result = result.rename(columns={f"claim_next_{horizon_days}d": "claim_next_45d"})
+    progress(f"Warranty target snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
+    return result
+
+
+# -----------------------------------------------------------------------------
 # Joining, validation, and saving
 # -----------------------------------------------------------------------------
 def key_count(df: pd.DataFrame) -> int:
@@ -1037,14 +1568,28 @@ def finalize_snapshot_df(df: pd.DataFrame, feature_freeze_path: Optional[str | P
         "min_remaining_hours",
         "smr_since_last_reset",
         "smr_latest_before_snapshot",
-        "smr_delta_90d",
+        "fault_smr_delta_90d",
     ]
     for col in amount_or_score_cols:
         if col in out.columns:
             out[col] = out[col].fillna(0).astype(float)
 
+    # For all remaining model features, missing usually means the source had no
+    # usable records in the lookback window. Keep recency sentinels above; fill
+    # all other numeric features to 0 so downstream XGBoost input is stable.
+    for col in FROZEN_FEATURES:
+        if col in out.columns and col not in RECENCY_FEATURES:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(float)
+
     if feature_freeze_path is not None and Path(feature_freeze_path).exists():
-        freeze = pd.read_excel(feature_freeze_path, sheet_name="all")
+        feature_freeze_path = Path(feature_freeze_path)
+        if feature_freeze_path.suffix.lower() in {".xlsx", ".xls"}:
+            freeze = pd.read_excel(feature_freeze_path, sheet_name="all")
+        else:
+            try:
+                freeze = pd.read_csv(feature_freeze_path, encoding="utf-8")
+            except UnicodeDecodeError:
+                freeze = pd.read_csv(feature_freeze_path, encoding="cp1252")
         if "Feature" in freeze.columns:
             frozen_from_file = (
                 freeze["Feature"].astype(str)
@@ -1159,10 +1704,19 @@ def build_snapshot_dataframe(
     fault_codes_path: str | Path,
     machine_path: str | Path,
     maintenance_path: str | Path,
+    operation_path: Optional[str | Path] = None,
+    warranty_path: Optional[str | Path] = None,
     output_dir: str | Path = OUTPUT_DIR,
     feature_freeze_path: Optional[str | Path] = None,
 ) -> pd.DataFrame:
-    """Build separate source snapshots following machine.csv, then join them."""
+    """Build separate source snapshots following machine.csv, then join them.
+
+    Current source snapshots:
+        - fault_snapshot
+        - maintenance_snapshot
+        - operation_snapshot, when operation.csv exists
+        - warranty_target_snapshot, when warranty.csv exists
+    """
     overall_start = time.perf_counter()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1179,7 +1733,7 @@ def build_snapshot_dataframe(
     cleaning_summaries: list[dict] = []
     standardization_summaries: list[dict] = []
 
-    progress("Step 1/8: Loading and lightly cleaning source CSV files...")
+    progress("Step 1/10: Loading and lightly cleaning source CSV files...")
     raw_machine, profiles, summary = load_and_clean_csv(machine_path, "machine", output_dir)
     all_profiles.extend(profiles)
     cleaning_summaries.append(summary)
@@ -1195,11 +1749,29 @@ def build_snapshot_dataframe(
     cleaning_summaries.append(summary)
     progress(f"maintenance loaded: {len(raw_pm):,} rows, {len(raw_pm.columns):,} columns")
 
+    raw_operation = None
+    if operation_path is not None:
+        raw_operation, profiles, summary = load_and_clean_csv(operation_path, "operation", output_dir)
+        all_profiles.extend(profiles)
+        cleaning_summaries.append(summary)
+        progress(f"operation loaded: {len(raw_operation):,} rows, {len(raw_operation.columns):,} columns")
+    else:
+        progress("operation.csv not found/configured. Operation features will be created as 0-filled columns.")
+
+    raw_warranty = None
+    if warranty_path is not None:
+        raw_warranty, profiles, summary = load_and_clean_csv(warranty_path, "warranty", output_dir)
+        all_profiles.extend(profiles)
+        cleaning_summaries.append(summary)
+        progress(f"warranty loaded: {len(raw_warranty):,} rows, {len(raw_warranty.columns):,} columns")
+    else:
+        progress("warranty.csv not found/configured. claim_next_45d will be left blank.")
+
     if bool(cfg("WRITE_CLEANING_REPORTS", True)):
         write_combined_cleaning_reports(output_dir, all_profiles, cleaning_summaries)
         progress("Missing-value and light-cleaning reports written.")
 
-    progress("Step 2/8: Standardizing machine.csv as canonical snapshot backbone...")
+    progress("Step 2/10: Standardizing machine.csv as canonical snapshot backbone...")
     backbone, summary = standardize_machine_backbone(raw_machine)
     standardization_summaries.append(summary)
     progress(
@@ -1217,7 +1789,7 @@ def build_snapshot_dataframe(
     )
     save_source_snapshot(backbone, "machine_backbone.csv")
 
-    progress("Step 3/8: Standardizing event sources and forcing them to machine backbone model_ids...")
+    progress("Step 3/10: Standardizing event sources and forcing them to machine backbone model_ids...")
     fault, summary = standardize_faults(raw_fault, allowed_model_ids=allowed_model_ids)
     standardization_summaries.append(summary)
     progress(
@@ -1236,36 +1808,85 @@ def build_snapshot_dataframe(
         f"rows after standardization={summary['rows_after_standardization']:,}"
     )
 
+    operation = None
+    if raw_operation is not None:
+        operation, summary = standardize_operation(raw_operation, allowed_model_ids=allowed_model_ids)
+        standardization_summaries.append(summary)
+        progress(
+            "Operation date/model-id quality: "
+            f"missing usable date rows={summary['missing_usable_event_date_rows']:,}; "
+            f"rows not in machine backbone={summary['rows_not_in_machine_backbone']:,}; "
+            f"rows after standardization={summary['rows_after_standardization']:,}"
+        )
+
+    warranty = None
+    if raw_warranty is not None:
+        warranty, summary = standardize_warranty(raw_warranty, allowed_model_ids=allowed_model_ids)
+        standardization_summaries.append(summary)
+        progress(
+            "Warranty date/model-id quality: "
+            f"missing usable date rows={summary['missing_usable_event_date_rows']:,}; "
+            f"rows not in machine backbone={summary['rows_not_in_machine_backbone']:,}; "
+            f"rows after standardization={summary['rows_after_standardization']:,}"
+        )
+
     write_source_standardization_summary(output_dir, standardization_summaries)
     progress("Source standardization summary written.")
 
-    progress("Step 4/8: Building fault source snapshot dataframe on machine backbone...")
+    source_snapshots: dict[str, pd.DataFrame] = {}
+
+    progress("Step 4/10: Building fault source snapshot dataframe on machine backbone...")
     fault_snapshot = build_fault_snapshot(backbone, fault)
     validate_source_snapshot_alignment("fault_snapshot", backbone, fault_snapshot)
     save_source_snapshot(fault_snapshot, "fault_snapshot.csv")
+    source_snapshots["fault_snapshot"] = fault_snapshot
 
-    progress("Step 5/8: Building maintenance source snapshot dataframe on machine backbone...")
+    progress("Step 5/10: Building maintenance source snapshot dataframe on machine backbone...")
     maintenance_snapshot = build_maintenance_snapshot(backbone, pm)
     validate_source_snapshot_alignment("maintenance_snapshot", backbone, maintenance_snapshot)
     save_source_snapshot(maintenance_snapshot, "maintenance_snapshot.csv")
+    source_snapshots["maintenance_snapshot"] = maintenance_snapshot
 
-    progress("Step 6/8: Writing source snapshot alignment summary...")
-    write_source_alignment_summary(
-        output_dir,
-        backbone,
-        {
-            "fault_snapshot": fault_snapshot,
-            "maintenance_snapshot": maintenance_snapshot,
-        },
-    )
+    operation_snapshot = None
+    if operation is not None:
+        progress("Step 6/10: Building operation source snapshot dataframe on machine backbone...")
+        operation_snapshot = build_operation_snapshot(backbone, operation)
+        validate_source_snapshot_alignment("operation_snapshot", backbone, operation_snapshot)
+        save_source_snapshot(operation_snapshot, "operation_snapshot.csv")
+        source_snapshots["operation_snapshot"] = operation_snapshot
+    else:
+        progress("Step 6/10: Skipping operation snapshot because operation.csv is not available.")
 
-    progress("Step 7/8: Joining source snapshots into unified snapshot dataframe...")
+    warranty_target_snapshot = None
+    if warranty is not None:
+        progress("Step 7/10: Building warranty target snapshot dataframe on machine backbone...")
+        warranty_target_snapshot = build_warranty_target_snapshot(
+            backbone,
+            warranty,
+            horizon_days=int(cfg("HORIZON_DAYS", 45)),
+        )
+        validate_source_snapshot_alignment("warranty_target_snapshot", backbone, warranty_target_snapshot)
+        save_source_snapshot(warranty_target_snapshot, "warranty_target_snapshot.csv")
+        source_snapshots["warranty_target_snapshot"] = warranty_target_snapshot
+    else:
+        progress("Step 7/10: Skipping warranty target snapshot because warranty.csv is not available.")
+
+    progress("Step 8/10: Writing source snapshot alignment summary...")
+    write_source_alignment_summary(output_dir, backbone, source_snapshots)
+
+    progress("Step 9/10: Joining source snapshots into unified snapshot dataframe...")
     unified = backbone.copy()
     unified = unified.merge(fault_snapshot, on=["model_id", "snapshot_date"], how="left")
     unified = unified.merge(maintenance_snapshot, on=["model_id", "snapshot_date"], how="left")
+    if operation_snapshot is not None:
+        unified = unified.merge(operation_snapshot, on=["model_id", "snapshot_date"], how="left")
+    if warranty_target_snapshot is not None:
+        unified = unified.merge(warranty_target_snapshot, on=["model_id", "snapshot_date"], how="left")
+    elif "claim_next_45d" not in unified.columns:
+        unified["claim_next_45d"] = np.nan
     progress(f"Unified snapshot shape before finalization: {unified.shape[0]:,} rows x {unified.shape[1]:,} columns")
 
-    progress("Step 8/8: Finalizing missing values and validating frozen features...")
+    progress("Step 10/10: Finalizing missing values and validating frozen features...")
     unified = finalize_snapshot_df(unified, feature_freeze_path=feature_freeze_path)
     write_mini_validation_outputs(unified, output_dir)
 
@@ -1296,7 +1917,11 @@ def main() -> None:
     fault_codes_path = resolve_existing_path(cfg("FAULT_CODES_PATH", INPUT_DIR / "fault_codes.csv"), "FAULT_CODES_PATH")
     machine_path = resolve_existing_path(cfg("MACHINE_PATH", INPUT_DIR / "machine.csv"), "MACHINE_PATH")
     maintenance_path = resolve_existing_path(cfg("MAINTENANCE_PATH", INPUT_DIR / "maintenance.csv"), "MAINTENANCE_PATH")
-    feature_freeze_path = optional_existing_path(cfg("FEATURE_FREEZE_PATH", INPUT_DIR / "xgb_feature_freeze.xlsx"))
+    operation_path = optional_existing_path(cfg("OPERATION_PATH", INPUT_DIR / "operation.csv"))
+    warranty_path = optional_existing_path(cfg("WARRANTY_PATH", INPUT_DIR / "warranty.csv"))
+    feature_freeze_path = optional_existing_path(
+        cfg("FEATURE_FREEZE_PATH", INPUT_DIR / "xgb_feature_freeze(all).csv")
+    )
 
     output_path = Path(cfg("OUTPUT_PATH", OUTPUT_DIR / "snapshot_dataframe.csv"))
     if bool(cfg("MINI_RUN_ENABLED", False)):
@@ -1308,11 +1933,15 @@ def main() -> None:
     print(f"Output path: {output_path}")
     print(f"Target model families used for filtering: {', '.join(TARGET_MODEL_FAMILIES)}")
     print(f"Mini run enabled: {bool(cfg('MINI_RUN_ENABLED', False))}")
+    print(f"Operation path: {operation_path if operation_path else 'not found'}")
+    print(f"Warranty path: {warranty_path if warranty_path else 'not found'}")
 
     df = build_snapshot_dataframe(
         fault_codes_path=fault_codes_path,
         machine_path=machine_path,
         maintenance_path=maintenance_path,
+        operation_path=operation_path,
+        warranty_path=warranty_path,
         output_dir=OUTPUT_DIR,
         feature_freeze_path=feature_freeze_path,
     )
@@ -1329,6 +1958,8 @@ def main() -> None:
         "max_snapshot_date": str(df["snapshot_date"].max()) if "snapshot_date" in df.columns and len(df) else None,
         "source_snapshot_dir": str(SOURCE_SNAPSHOT_DIR),
         "canonical_backbone": "machine.csv model_id + snapshot_date",
+        "operation_path": str(operation_path) if operation_path else None,
+        "warranty_path": str(warranty_path) if warranty_path else None,
     }
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([run_summary]).to_csv(OUTPUT_DIR / "snapshot_build_run_summary.csv", index=False)
