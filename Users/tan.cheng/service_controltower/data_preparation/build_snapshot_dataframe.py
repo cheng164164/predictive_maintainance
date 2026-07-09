@@ -44,8 +44,12 @@ Core leakage-control rule:
 
 from __future__ import annotations
 
+import csv
+import json
+import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -62,8 +66,53 @@ except ImportError:  # pragma: no cover
     run_config = None
 
 
+def _parse_env_override(raw_value: str, default):
+    """Parse SNAPSHOT_* environment overrides using the default value type.
+
+    Azure ML jobs can override selected config.py settings without rewriting the
+    file. This is mainly used for mini-run/full-run selection and for writing
+    AML artifacts under the standard outputs/ folder.
+    """
+    if isinstance(default, bool):
+        return raw_value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(raw_value)
+    if isinstance(default, float):
+        return float(raw_value)
+    if isinstance(default, (list, tuple)):
+        stripped = raw_value.strip()
+        if not stripped:
+            return [] if isinstance(default, list) else tuple()
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, str):
+                parsed = [parsed]
+            return type(default)(parsed)
+        except Exception:
+            parsed = [x.strip() for x in stripped.split(",") if x.strip()]
+            return type(default)(parsed)
+    if isinstance(default, Path):
+        return Path(raw_value)
+    return raw_value
+
+
 def cfg(name: str, default):
-    """Read a value from config.py, or return a built-in default."""
+    """Read environment overrides, then config.py, then default.
+
+    The script runs without command-line arguments. Local runs read config.py.
+    Azure ML runs receive resolved input/output paths through shell exports in
+    submit_snapshot_build_aml_job.py.
+
+    Supported override order:
+      1. SNAPSHOT_<NAME>  - build-script specific overrides
+      2. AML_<NAME>       - AML path/mini-run overrides such as AML_OUTPUT_DIR
+      3. <NAME>           - direct environment override
+      4. config.py
+      5. default
+    """
+    for env_name in (f"SNAPSHOT_{name}", f"AML_{name}", name):
+        if env_name in os.environ:
+            return _parse_env_override(os.environ[env_name], default)
     return getattr(run_config, name, default) if run_config is not None else default
 
 
@@ -73,6 +122,8 @@ PROJECT_ROOT = Path(cfg("PROJECT_ROOT", DEFAULT_PROJECT_ROOT)).resolve()
 INPUT_DIR = Path(cfg("INPUT_DIR", PROJECT_ROOT / "enriched_data")).resolve()
 OUTPUT_DIR = Path(cfg("OUTPUT_DIR", PROJECT_ROOT / "data_preparation" / "output")).resolve()
 SOURCE_SNAPSHOT_DIR = Path(cfg("SOURCE_SNAPSHOT_DIR", OUTPUT_DIR / "source_snapshots")).resolve()
+PROGRESS_LOG_PATH = Path(cfg("PROGRESS_LOG_PATH", OUTPUT_DIR / "snapshot_build_progress_log.csv")).resolve()
+ARTIFACT_MANIFEST_PATH = Path(cfg("ARTIFACT_MANIFEST_PATH", OUTPUT_DIR / "snapshot_build_artifact_manifest.csv")).resolve()
 
 TARGET_MODEL_FAMILIES = tuple(
     str(x).upper().strip() for x in cfg("TARGET_MODEL_FAMILIES", ("D51", "D61", "D71"))
@@ -300,11 +351,63 @@ MAINTENANCE_TYPE_PATTERNS = {
 
 
 # -----------------------------------------------------------------------------
-# Console progress helper
+# Console progress and durable run logging helpers
 # -----------------------------------------------------------------------------
+def _append_csv_row(path: str | Path, row: dict, fieldnames: list[str]) -> None:
+    """Append one row to a CSV file, writing the header when the file is new."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
 def progress(message: str) -> None:
-    """Print a short progress message immediately."""
+    """Print a progress message and append it to a durable progress log.
+
+    The CSV log is useful for long Azure ML jobs. If the job is interrupted, the
+    latest row in snapshot_build_progress_log.csv shows the last completed step
+    or the source snapshot currently being processed.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
     print(f"[snapshot-build] {message}", flush=True)
+    try:
+        _append_csv_row(
+            PROGRESS_LOG_PATH,
+            {
+                "timestamp_utc": timestamp,
+                "message": message,
+                "run_context": os.environ.get("SNAPSHOT_RUN_CONTEXT", "local"),
+                "azureml_run_id": os.environ.get("AZUREML_RUN_ID", ""),
+            },
+            ["timestamp_utc", "run_context", "azureml_run_id", "message"],
+        )
+    except Exception:
+        # Progress logging must never break the snapshot build.
+        pass
+
+
+def record_artifact(artifact_name: str, path: str | Path, df: pd.DataFrame) -> None:
+    """Record every dataframe artifact saved during the run."""
+    try:
+        _append_csv_row(
+            ARTIFACT_MANIFEST_PATH,
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "artifact_name": artifact_name,
+                "path": str(Path(path)),
+                "rows": int(len(df)),
+                "columns": int(len(df.columns)),
+                "run_context": os.environ.get("SNAPSHOT_RUN_CONTEXT", "local"),
+                "azureml_run_id": os.environ.get("AZUREML_RUN_ID", ""),
+            },
+            ["timestamp_utc", "run_context", "azureml_run_id", "artifact_name", "path", "rows", "columns"],
+        )
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -1630,6 +1733,8 @@ def save_dataframe(df: pd.DataFrame, output_path: str | Path) -> Path:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
+    record_artifact(output_path.stem, output_path, df)
+    progress(f"Saved CSV artifact: {output_path} | rows={len(df):,}, columns={len(df.columns):,}")
     return output_path
 
 
@@ -1962,7 +2067,7 @@ def main() -> None:
         "warranty_path": str(warranty_path) if warranty_path else None,
     }
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([run_summary]).to_csv(OUTPUT_DIR / "snapshot_build_run_summary.csv", index=False)
+    save_dataframe(pd.DataFrame([run_summary]), OUTPUT_DIR / "snapshot_build_run_summary.csv")
 
     print(f"Saved unified snapshot dataframe: {saved_path}")
     print(f"Rows: {len(df):,}")

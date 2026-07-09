@@ -1,0 +1,12 @@
+{
+  "job_name": "snapshot-build-gpu-20260709-011820",
+  "returned_job_name": "snapshot-build-gpu-20260709-011820",
+  "output_uri": "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/snapshot-build-gpu-20260709-011820/",
+  "submitted_at_utc": "2026-07-09T01:25:04.336728+00:00",
+  "studio_url": "https://ml.azure.com/runs/snapshot-build-gpu-20260709-011820?wsid=/subscriptions/7f07baf7-8bba-4b88-b300-74ba5b15f52d/resourcegroups/ai-servicecontroltower/workspaces/ai-controltower-aml&tid=58be8688-6625-4e52-80d8-c17f3a9ae08a",
+  "experiment_name": "snapshot-build",
+  "compute_target": "gpu",
+  "compute": "tan-dev-gpu-cluster",
+  "environment": "AzureML-acpt-pytorch-2.8-cuda12.6@latest",
+  "mini_run_enabled": true
+}

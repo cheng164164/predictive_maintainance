@@ -52,6 +52,8 @@ enriched_data/output/**
 # Generated outputs
 /data_preparation/output/**
 data_preparation/output/
+feature_selection/output/**
+/feature_selection/output/**
 
 ###############################################################################
 # JSON outputs

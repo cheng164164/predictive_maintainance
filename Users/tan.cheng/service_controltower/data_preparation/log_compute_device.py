@@ -26,6 +26,18 @@ def cfg(name: str, default):
     return getattr(run_config, name, default) if run_config is not None else default
 
 
+def bool_from_env(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return None
+
+
 def log(message: str) -> None:
     print(f"[device-check] {message}", flush=True)
 
@@ -54,6 +66,9 @@ def detect_device() -> dict:
         "hostname": platform.node(),
         "azureml_run_id": os.environ.get("AZUREML_RUN_ID", ""),
         "azureml_compute_name": os.environ.get("AZUREML_COMPUTE_NAME", ""),
+        "aml_compute_target": os.environ.get("AML_COMPUTE_TARGET", ""),
+        "aml_selected_compute_name": os.environ.get("AML_SELECTED_COMPUTE_NAME", ""),
+        "aml_selected_environment": os.environ.get("AML_SELECTED_ENVIRONMENT", ""),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "nvidia_smi_path": shutil.which("nvidia-smi") or "",
         "nvidia_smi_available": False,
@@ -109,6 +124,9 @@ def main() -> None:
     log(f"platform={info['platform']}")
     log(f"AZUREML_RUN_ID={info['azureml_run_id'] or '<not set>'}")
     log(f"AZUREML_COMPUTE_NAME={info['azureml_compute_name'] or '<not set>'}")
+    log(f"AML_COMPUTE_TARGET={info['aml_compute_target'] or '<not set>'}")
+    log(f"AML_SELECTED_COMPUTE_NAME={info['aml_selected_compute_name'] or '<not set>'}")
+    log(f"AML_SELECTED_ENVIRONMENT={info['aml_selected_environment'] or '<not set>'}")
     log(f"CUDA_VISIBLE_DEVICES={info['cuda_visible_devices'] or '<not set>'}")
     log(f"nvidia-smi path={info['nvidia_smi_path'] or '<not found>'}")
     if info["nvidia_smi_output"]:
@@ -131,7 +149,20 @@ def main() -> None:
     report_path.write_text(json.dumps(info, indent=2))
     log(f"device report saved to {report_path}")
 
-    require_gpu = bool(cfg("AML_REQUIRE_GPU", False)) if os.environ.get("AZUREML_RUN_ID") else bool(cfg("REQUIRE_GPU", False))
+    # Submit script passes REQUIRE_GPU/AML_REQUIRE_GPU as environment variables.
+    # Those should override config.py so CPU runs do not fail even if config.py
+    # previously had AML_REQUIRE_GPU=True.
+    require_gpu = bool_from_env("REQUIRE_GPU")
+    if require_gpu is None:
+        require_gpu = bool_from_env("AML_REQUIRE_GPU")
+    if require_gpu is None:
+        require_gpu = (
+            bool(cfg("AML_REQUIRE_GPU", False))
+            if os.environ.get("AZUREML_RUN_ID")
+            else bool(cfg("REQUIRE_GPU", False))
+        )
+
+    log(f"require_gpu={require_gpu}")
     if require_gpu and info["effective_device"] != "gpu":
         raise RuntimeError(
             "GPU is required by config, but no GPU is visible. Check Azure ML node allocation, "
