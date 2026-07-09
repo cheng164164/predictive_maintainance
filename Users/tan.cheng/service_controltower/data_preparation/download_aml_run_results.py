@@ -8,11 +8,12 @@ Default behavior:
 Specific historical run:
     Pass a job name at runtime:
 
-        python data_preparation/download_aml_run_results.py --job-name snapshot-build-YYYYMMDD-HHMMSS
+        python data_preparation/download_aml_run_results.py --job-name snapshot-build-cpu-YYYYMMDD-HHMMSS
+        python data_preparation/download_aml_run_results.py --job-name snapshot-build-gpu-YYYYMMDD-HHMMSS
 
-    or set this in config.py:
+    If the job name does not include cpu/gpu, provide the workspace target:
 
-        AML_DOWNLOAD_JOB_NAME = "snapshot-build-YYYYMMDD-HHMMSS"
+        python data_preparation/download_aml_run_results.py --job-name <job_name> --compute-target gpu
 
 Results are downloaded to:
 
@@ -50,6 +51,53 @@ def require_value(name: str) -> str:
     return value
 
 
+def first_non_empty(*values) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def normalize_compute_target(value: str) -> str:
+    target = str(value or "").strip().lower()
+    if target in {"cpu", "standard", "standard_cpu"}:
+        return "cpu"
+    if target in {"gpu", "cuda", "nvidia"}:
+        return "gpu"
+    raise ValueError('compute target must be either "cpu" or "gpu".')
+
+
+def infer_compute_target_from_job_name(job_name: str) -> str | None:
+    text = f"-{str(job_name).lower()}-"
+    if "-gpu-" in text:
+        return "gpu"
+    if "-cpu-" in text:
+        return "cpu"
+    return None
+
+
+def resolve_workspace_settings(compute_target: str) -> tuple[str, str, str]:
+    target = normalize_compute_target(compute_target)
+    target_key = target.upper()
+    subscription_id = first_non_empty(
+        cfg(f"AML_{target_key}_SUBSCRIPTION_ID", ""),
+        cfg("AML_SUBSCRIPTION_ID", ""),
+    )
+    resource_group = first_non_empty(
+        cfg(f"AML_{target_key}_RESOURCE_GROUP", ""),
+        cfg("AML_RESOURCE_GROUP", ""),
+    )
+    workspace_name = first_non_empty(
+        cfg(f"AML_{target_key}_WORKSPACE_NAME", ""),
+        cfg("AML_WORKSPACE_NAME", ""),
+    )
+    if not subscription_id or not resource_group or not workspace_name:
+        raise ValueError(
+            f"Missing workspace settings for compute target {target!r}. Check AML_{target_key}_SUBSCRIPTION_ID, "
+            f"AML_{target_key}_RESOURCE_GROUP, and AML_{target_key}_WORKSPACE_NAME in config.py."
+        )
+    return subscription_id, resource_group, workspace_name
 
 
 def build_credential():
@@ -102,14 +150,23 @@ def normalize_base_uri(uri: str) -> str:
     return uri
 
 
-def output_base_uri() -> str:
+def output_base_uri(compute_target: str) -> str:
+    target = normalize_compute_target(compute_target)
+    target_key = target.upper()
+
+    target_base = str(cfg(f"AML_{target_key}_OUTPUT_BASE_DATA_URI", "")).strip()
+    if target_base:
+        return normalize_base_uri(target_base)
+
     base = str(cfg("AML_OUTPUT_BASE_DATA_URI", "")).strip()
     if base:
         return normalize_base_uri(base)
 
     old = str(cfg("AML_OUTPUT_DATA_URI", "")).strip()
     if not old:
-        raise ValueError("Missing AML_OUTPUT_BASE_DATA_URI or AML_OUTPUT_DATA_URI.")
+        raise ValueError(
+            f"Missing AML_{target_key}_OUTPUT_BASE_DATA_URI, AML_OUTPUT_BASE_DATA_URI, or AML_OUTPUT_DATA_URI."
+        )
     old = normalize_base_uri(old)
     if old.rstrip("/").endswith("/latest"):
         return old.rstrip("/").rsplit("/", 1)[0] + "/"
@@ -152,29 +209,54 @@ def parse_args() -> argparse.Namespace:
             "AML_DOWNLOAD_JOB_NAME from config.py, then the last submitted job info file."
         ),
     )
+    parser.add_argument(
+        "--compute-target",
+        choices=["cpu", "gpu"],
+        default=None,
+        help=(
+            "Workspace target for a specific historical job. Usually inferred from job names "
+            "like snapshot-build-cpu-... or snapshot-build-gpu-...."
+        ),
+    )
     return parser.parse_args()
 
 
-def resolve_job_name_and_output_uri(cli_job_name: str | None = None) -> tuple[str, str]:
-    requested_job_name = (cli_job_name or "").strip()
-    if requested_job_name:
-        return requested_job_name, join_uri(output_base_uri(), requested_job_name)
-
+def resolve_download_context(args: argparse.Namespace) -> tuple[str, str, str, str, str, str]:
+    """Return job_name, output_uri, target, subscription, resource group, workspace."""
+    requested_job_name = (args.job_name or "").strip()
     configured_job_name = str(cfg("AML_DOWNLOAD_JOB_NAME", "")).strip()
-    if configured_job_name:
-        return configured_job_name, join_uri(output_base_uri(), configured_job_name)
 
-    info = load_last_job_info()
-    job_name = str(info.get("job_name") or info.get("returned_job_name") or "").strip()
-    output_uri = str(info.get("output_uri") or "").strip()
-    if not job_name:
-        raise ValueError(
-            "Last job info does not contain a job_name. Pass --job-name or set "
-            "AML_DOWNLOAD_JOB_NAME in config.py."
-        )
-    if not output_uri:
-        output_uri = join_uri(output_base_uri(), job_name)
-    return job_name, output_uri
+    # Default/latest path: use the submit script's recorded workspace/output URI.
+    if not requested_job_name and not configured_job_name:
+        info = load_last_job_info()
+        job_name = str(info.get("job_name") or info.get("returned_job_name") or "").strip()
+        if not job_name:
+            raise ValueError(
+                "Last job info does not contain a job_name. Pass --job-name or set "
+                "AML_DOWNLOAD_JOB_NAME in config.py."
+            )
+        target = str(info.get("compute_target") or infer_compute_target_from_job_name(job_name) or cfg("AML_COMPUTE_TARGET", "cpu")).strip()
+        target = normalize_compute_target(target)
+        output_uri = str(info.get("output_uri") or "").strip() or join_uri(output_base_uri(target), job_name)
+        subscription_id = str(info.get("subscription_id") or "").strip()
+        resource_group = str(info.get("resource_group") or "").strip()
+        workspace_name = str(info.get("workspace_name") or "").strip()
+        if not subscription_id or not resource_group or not workspace_name:
+            subscription_id, resource_group, workspace_name = resolve_workspace_settings(target)
+        return job_name, output_uri, target, subscription_id, resource_group, workspace_name
+
+    # Specific job path: infer/choose workspace target and compose output URI.
+    job_name = requested_job_name or configured_job_name
+    target = first_non_empty(
+        args.compute_target,
+        cfg("AML_DOWNLOAD_COMPUTE_TARGET", ""),
+        infer_compute_target_from_job_name(job_name),
+        cfg("AML_COMPUTE_TARGET", "cpu"),
+    )
+    target = normalize_compute_target(target)
+    output_uri = join_uri(output_base_uri(target), job_name)
+    subscription_id, resource_group, workspace_name = resolve_workspace_settings(target)
+    return job_name, output_uri, target, subscription_id, resource_group, workspace_name
 
 
 def datastore_account_container(ml_client: MLClient, datastore_name: str) -> tuple[str, str]:
@@ -190,17 +272,14 @@ def datastore_account_container(ml_client: MLClient, datastore_name: str) -> tup
     if not account_name or not container_name:
         raise ValueError(
             f"Could not resolve account/container for datastore '{datastore_name}'. "
-            "Use an Azure Blob datastore for AML_OUTPUT_BASE_DATA_URI."
+            "Use an Azure Blob datastore for the selected output base URI."
         )
     return str(account_name), str(container_name)
 
 
 def main() -> None:
     args = parse_args()
-    subscription_id = require_value("AML_SUBSCRIPTION_ID")
-    resource_group = require_value("AML_RESOURCE_GROUP")
-    workspace_name = require_value("AML_WORKSPACE_NAME")
-    job_name, output_uri = resolve_job_name_and_output_uri(args.job_name)
+    job_name, output_uri, compute_target, subscription_id, resource_group, workspace_name = resolve_download_context(args)
 
     base_local_dir = Path(
         cfg("AML_RUN_RESULTS_LOCAL_DIR", project_root() / "data_preparation" / "aml_run_results")
@@ -231,6 +310,10 @@ def main() -> None:
     container = service.get_container_client(container_name)
 
     print("Downloading AML run results from datastore:", flush=True)
+    print(f"  compute target: {compute_target}", flush=True)
+    print(f"  workspace: {workspace_name}", flush=True)
+    print(f"  resource group: {resource_group}", flush=True)
+    print(f"  subscription id: {subscription_id}", flush=True)
     print(f"  job name: {job_name}", flush=True)
     print(f"  output uri: {output_uri}", flush=True)
     print(f"  storage account: {account_name}", flush=True)

@@ -152,7 +152,7 @@ def relative_to_code_dir(path: Path, code_dir: Path, label: str) -> str:
         raise ValueError(f"{label} must be inside code_dir. {label}={path}; code_dir={code_dir}") from exc
 
 
-def build_aml_command(code_dir: Path, job_name: str, compute_target: str, compute_name: str, environment_name: str, require_gpu: bool) -> str:
+def build_aml_command(code_dir: Path, job_name: str, compute_target: str, compute_name: str, environment_name: str) -> str:
     build_script = require_existing_path(code_dir / "data_preparation" / "build_snapshot_dataframe.py", "build script")
     log_device_script = require_existing_path(code_dir / "data_preparation" / "log_compute_device.py", "device logger")
     requirements_path = require_existing_path(code_dir / "requirements.txt", "requirements.txt")
@@ -196,8 +196,6 @@ def build_aml_command(code_dir: Path, job_name: str, compute_target: str, comput
         f"export MINI_RUN_ENABLED={shlex.quote(mini_enabled)}",
         f"export MINI_RUN_MACHINE_COUNT={shlex.quote(mini_count)}",
         f"export MINI_RUN_MODEL_IDS={shlex.quote(mini_ids)}",
-        f"export REQUIRE_GPU={'1' if require_gpu else '0'}",
-        f"export AML_REQUIRE_GPU={'1' if require_gpu else '0'}",
         'mkdir -p "$AML_OUTPUT_DIR" "$AML_SOURCE_SNAPSHOT_DIR"',
     ]
 
@@ -214,6 +212,46 @@ def build_aml_command(code_dir: Path, job_name: str, compute_target: str, comput
     commands.append(f"python {shlex.quote(log_rel)}")
     commands.append(f"python {shlex.quote(build_rel)}")
     return " && ".join(commands)
+
+
+# -----------------------------------------------------------------------------
+# CPU/GPU workspace selection
+# -----------------------------------------------------------------------------
+def resolve_workspace_settings(compute_target: str) -> tuple[str, str, str]:
+    """Resolve subscription/resource-group/workspace for the selected target.
+
+    This allows CPU and GPU jobs to run in different AML workspaces/resource
+    groups/subscriptions. Global AML_SUBSCRIPTION_ID / AML_RESOURCE_GROUP /
+    AML_WORKSPACE_NAME remain supported as optional fallbacks.
+    """
+    target_key = compute_target.upper()
+    subscription_id = first_non_empty(
+        cfg(f"AML_{target_key}_SUBSCRIPTION_ID", ""),
+        cfg("AML_SUBSCRIPTION_ID", ""),
+    )
+    resource_group = first_non_empty(
+        cfg(f"AML_{target_key}_RESOURCE_GROUP", ""),
+        cfg("AML_RESOURCE_GROUP", ""),
+    )
+    workspace_name = first_non_empty(
+        cfg(f"AML_{target_key}_WORKSPACE_NAME", ""),
+        cfg("AML_WORKSPACE_NAME", ""),
+    )
+
+    missing = []
+    if not subscription_id:
+        missing.append(f"AML_{target_key}_SUBSCRIPTION_ID")
+    if not resource_group:
+        missing.append(f"AML_{target_key}_RESOURCE_GROUP")
+    if not workspace_name:
+        missing.append(f"AML_{target_key}_WORKSPACE_NAME")
+    if missing:
+        raise ValueError(
+            f"Missing AML workspace settings for AML_COMPUTE_TARGET={compute_target!r}: "
+            + ", ".join(missing)
+        )
+
+    return subscription_id, resource_group, workspace_name
 
 
 # -----------------------------------------------------------------------------
@@ -236,42 +274,37 @@ def first_non_empty(*values) -> str:
     return ""
 
 
-def resolve_compute_settings() -> tuple[str, str, str, bool]:
-    """Resolve compute target, compute name, environment, and GPU requirement.
+def resolve_compute_settings() -> tuple[str, str, str]:
+    """Resolve compute target, compute name, and environment.
 
     AML_COMPUTE_TARGET controls whether the job uses the CPU or GPU cluster.
     AML_COMPUTE_NAME and AML_ENVIRONMENT are optional direct overrides kept for
     backward compatibility. If they are blank, target-specific settings are used.
     """
-    target = normalize_compute_target(str(cfg("AML_COMPUTE_TARGET", "gpu")))
+    target = normalize_compute_target(str(cfg("AML_COMPUTE_TARGET", "cpu")))
+    target_key = target.upper()
 
-    if target == "cpu":
-        compute_name = first_non_empty(cfg("AML_COMPUTE_NAME", ""), cfg("AML_CPU_COMPUTE_NAME", ""))
-        environment_name = first_non_empty(cfg("AML_ENVIRONMENT", ""), cfg("AML_CPU_ENVIRONMENT", ""))
-        require_gpu = False
-    else:
-        compute_name = first_non_empty(cfg("AML_COMPUTE_NAME", ""), cfg("AML_GPU_COMPUTE_NAME", ""))
-        environment_name = first_non_empty(cfg("AML_ENVIRONMENT", ""), cfg("AML_GPU_ENVIRONMENT", ""))
-        require_gpu = bool(cfg("AML_REQUIRE_GPU", False))
+    compute_name = first_non_empty(
+        cfg("AML_COMPUTE_NAME", ""),
+        cfg(f"AML_{target_key}_COMPUTE_NAME", ""),
+    )
+    environment_name = first_non_empty(
+        cfg("AML_ENVIRONMENT", ""),
+        cfg(f"AML_{target_key}_ENVIRONMENT", ""),
+    )
 
     if not compute_name:
         raise ValueError(
             f"No compute name resolved for AML_COMPUTE_TARGET={target!r}. "
-            "Set AML_CPU_COMPUTE_NAME or AML_GPU_COMPUTE_NAME in config.py."
+            f"Set AML_{target_key}_COMPUTE_NAME in config.py."
         )
     if not environment_name:
         raise ValueError(
             f"No environment resolved for AML_COMPUTE_TARGET={target!r}. "
-            "Set AML_CPU_ENVIRONMENT or AML_GPU_ENVIRONMENT in config.py."
+            f"Set AML_{target_key}_ENVIRONMENT in config.py."
         )
 
-    if target == "cpu" and bool(cfg("AML_REQUIRE_GPU", False)):
-        print(
-            "  note: AML_COMPUTE_TARGET='cpu', so AML_REQUIRE_GPU is ignored for this run.",
-            flush=True,
-        )
-
-    return target, compute_name, environment_name, require_gpu
+    return target, compute_name, environment_name
 
 
 # -----------------------------------------------------------------------------
@@ -331,8 +364,15 @@ def normalize_base_uri(uri: str) -> str:
     return uri
 
 
-def output_base_uri() -> str:
-    """Get the datastore folder under which job-name subfolders are written."""
+def output_base_uri(compute_target: str | None = None) -> str:
+    """Get the selected workspace datastore folder for job-name outputs."""
+    target = normalize_compute_target(compute_target or str(cfg("AML_COMPUTE_TARGET", "cpu")))
+    target_key = target.upper()
+
+    target_base = str(cfg(f"AML_{target_key}_OUTPUT_BASE_DATA_URI", "")).strip()
+    if target_base:
+        return normalize_base_uri(target_base)
+
     base = str(cfg("AML_OUTPUT_BASE_DATA_URI", "")).strip()
     if base:
         return normalize_base_uri(base)
@@ -341,11 +381,14 @@ def output_base_uri() -> str:
     # AML_OUTPUT_DATA_URI. If it points to .../latest/, use its parent as base.
     old = str(cfg("AML_OUTPUT_DATA_URI", "")).strip()
     if not old:
-        raise ValueError("Missing AML_OUTPUT_BASE_DATA_URI or AML_OUTPUT_DATA_URI.")
+        raise ValueError(
+            f"Missing AML_{target_key}_OUTPUT_BASE_DATA_URI, AML_OUTPUT_BASE_DATA_URI, or AML_OUTPUT_DATA_URI."
+        )
     old = normalize_base_uri(old)
     if old.rstrip("/").endswith("/latest"):
         return old.rstrip("/").rsplit("/", 1)[0] + "/"
     return old
+
 
 
 def join_uri(base_uri: str, *parts: str) -> str:
@@ -394,7 +437,18 @@ def csv_list(values) -> str:
     return ",".join(str(v).strip() for v in values if str(v).strip())
 
 
-def write_last_job_info(job_name: str, output_uri: str, returned_job, compute_target: str, compute_name: str, environment_name: str) -> None:
+def write_last_job_info(
+    job_name: str,
+    output_uri: str,
+    returned_job,
+    compute_target: str,
+    compute_name: str,
+    environment_name: str,
+    subscription_id: str,
+    resource_group: str,
+    workspace_name: str,
+    output_base_uri_value: str,
+) -> None:
     """Write a small local pointer so the downloader can fetch this run later."""
     root = project_root()
     default_path = root / "data_preparation" / "aml_last_submitted_job.json"
@@ -411,6 +465,10 @@ def write_last_job_info(job_name: str, output_uri: str, returned_job, compute_ta
         "compute_target": compute_target,
         "compute": compute_name,
         "environment": environment_name,
+        "subscription_id": subscription_id,
+        "resource_group": resource_group,
+        "workspace_name": workspace_name,
+        "output_base_uri": output_base_uri_value,
         "mini_run_enabled": bool(cfg("AML_MINI_RUN_ENABLED", False)),
     }
     path.write_text(json.dumps(info, indent=2), encoding="utf-8")
@@ -418,10 +476,8 @@ def write_last_job_info(job_name: str, output_uri: str, returned_job, compute_ta
 
 
 def main() -> None:
-    subscription_id = require_value("AML_SUBSCRIPTION_ID")
-    resource_group = require_value("AML_RESOURCE_GROUP")
-    workspace_name = require_value("AML_WORKSPACE_NAME")
-    compute_target, compute_name, environment_name, require_gpu = resolve_compute_settings()
+    compute_target, compute_name, environment_name = resolve_compute_settings()
+    subscription_id, resource_group, workspace_name = resolve_workspace_settings(compute_target)
     experiment_name = require_value("AML_EXPERIMENT_NAME")
     display_name_base = require_value("AML_DISPLAY_NAME")
 
@@ -433,14 +489,14 @@ def main() -> None:
 
     job_name = generate_job_name(compute_target)
     display_name = build_run_display_name(display_name_base, job_name, compute_target)
-    job_output_uri = join_uri(output_base_uri(), job_name)
+    selected_output_base_uri = output_base_uri(compute_target)
+    job_output_uri = join_uri(selected_output_base_uri, job_name)
     command_line = build_aml_command(
         code_dir=code_dir,
         job_name=job_name,
         compute_target=compute_target,
         compute_name=compute_name,
         environment_name=environment_name,
-        require_gpu=require_gpu,
     )
 
     print("Submitting Azure ML snapshot build job with:", flush=True)
@@ -453,7 +509,7 @@ def main() -> None:
     print("  code upload note: .amlignore excludes .venv, enriched_data, outputs, and old results", flush=True)
     print(f"  input data uri: {input_data_uri}", flush=True)
     print(f"  input mode: {input_mode}", flush=True)
-    print(f"  output base uri: {output_base_uri()}", flush=True)
+    print(f"  output base uri: {selected_output_base_uri}", flush=True)
     print(f"  output run uri: {job_output_uri}", flush=True)
     print(f"  output mode: {output_mode}", flush=True)
     print(f"  job name: {job_name}", flush=True)
@@ -462,8 +518,7 @@ def main() -> None:
     print(f"  AML mini mode: {bool(cfg('AML_MINI_RUN_ENABLED', False))}", flush=True)
     print(f"  AML mini machine count: {cfg('AML_MINI_RUN_MACHINE_COUNT', 2)}", flush=True)
     print(f"  AML mini model ids: {cfg('AML_MINI_RUN_MODEL_IDS', [])}", flush=True)
-    print(f"  AML_REQUIRE_GPU configured: {bool(cfg('AML_REQUIRE_GPU', False))}", flush=True)
-    print(f"  REQUIRE_GPU resolved for this run: {require_gpu}", flush=True)
+    print(f"  expected device: {'gpu' if compute_target == 'gpu' else 'cpu'} (from AML_COMPUTE_TARGET)", flush=True)
     print(f"  AML_DATA_IDENTITY: {cfg('AML_DATA_IDENTITY', 'user')}", flush=True)
     print("  Historical outputs: enabled; each run gets a job-name folder", flush=True)
 
@@ -508,7 +563,18 @@ def main() -> None:
         print("Then rerun this submit script.", flush=True)
         raise
 
-    write_last_job_info(job_name, job_output_uri, returned_job, compute_target, compute_name, environment_name)
+    write_last_job_info(
+        job_name=job_name,
+        output_uri=job_output_uri,
+        returned_job=returned_job,
+        compute_target=compute_target,
+        compute_name=compute_name,
+        environment_name=environment_name,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        workspace_name=workspace_name,
+        output_base_uri_value=selected_output_base_uri,
+    )
 
     print("Azure ML job submitted.", flush=True)
     print(f"  job name: {returned_job.name}", flush=True)

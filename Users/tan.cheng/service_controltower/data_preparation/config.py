@@ -119,29 +119,25 @@ MAX_MACHINES = None
 # -----------------------------------------------------------------------------
 # Azure ML workspace/job settings
 # -----------------------------------------------------------------------------
-AML_SUBSCRIPTION_ID = "7f07baf7-8bba-4b88-b300-74ba5b15f52d"
-AML_RESOURCE_GROUP = "ai-servicecontroltower"
-AML_WORKSPACE_NAME = "ai-controltower-aml"
-# Choose which compute target to use for the AML run.
-# Set to "cpu" to use the dedicated CPU cluster, or "gpu" to use the GPU cluster.
-AML_COMPUTE_TARGET = "gpu"  # options: "cpu", "gpu"
+# Choose which AML workspace/compute pair to use.
+#   cpu -> ai-controltower-aml / tan-dev-cpu-cluster
+#   gpu -> ehs-safety-aml / tan-dev-gpu
+AML_COMPUTE_TARGET = "cpu"  # options: "cpu", "gpu"
 
-# Target-specific compute names.
+# CPU AML workspace and compute.
+AML_CPU_SUBSCRIPTION_ID = "7f07baf7-8bba-4b88-b300-74ba5b15f52d"
+AML_CPU_RESOURCE_GROUP = "ai-servicecontroltower"
+AML_CPU_WORKSPACE_NAME = "ai-controltower-aml"
 AML_CPU_COMPUTE_NAME = "tan-dev-cpu-cluster"
-AML_GPU_COMPUTE_NAME = "tan-dev-gpu-cluster"
-
-# Optional legacy/direct override. Leave blank to use AML_CPU_COMPUTE_NAME or
-# AML_GPU_COMPUTE_NAME based on AML_COMPUTE_TARGET.
-AML_COMPUTE_NAME = ""
-
-# Target-specific environments. The CPU target can use the same approved
-# environment unless you have a CPU-specific curated/custom environment.
 AML_CPU_ENVIRONMENT = "AzureML-acpt-pytorch-2.8-cuda12.6@latest"
-AML_GPU_ENVIRONMENT = "AzureML-acpt-pytorch-2.8-cuda12.6@latest"
 
-# Optional legacy/direct override. Leave blank to use AML_CPU_ENVIRONMENT or
-# AML_GPU_ENVIRONMENT based on AML_COMPUTE_TARGET.
-AML_ENVIRONMENT = ""
+# GPU AML workspace and compute.
+# This is the older GPU cluster shown in the ehs-safety-aml workspace.
+AML_GPU_SUBSCRIPTION_ID = "7f07baf7-8bba-4b88-b300-74ba5b15f52d"
+AML_GPU_RESOURCE_GROUP = "EHS-Safety"
+AML_GPU_WORKSPACE_NAME = "ehs-safety-aml"
+AML_GPU_COMPUTE_NAME = "tan-dev-gpu"
+AML_GPU_ENVIRONMENT = "AzureML-acpt-pytorch-2.8-cuda12.6@latest"
 
 AML_EXPERIMENT_NAME = "snapshot-build"
 AML_DISPLAY_NAME = "snapshot-build-machine-backbone"
@@ -160,11 +156,8 @@ AML_STREAM_LOGS = True
 # Options: "azure_cli", "managed", "interactive", "default".
 AML_AUTH_MODE = "azure_cli"
 
-# GPU diagnostics/requirement.
-# For CPU runs this is automatically treated as False by submit_snapshot_build_aml_job.py.
-# For GPU smoke tests, set AML_COMPUTE_TARGET = "gpu" and AML_REQUIRE_GPU = True.
-AML_REQUIRE_GPU = True
-REQUIRE_GPU = False
+# GPU validation is automatic. Use AML_COMPUTE_TARGET="gpu" for GPU validation
+# and AML_COMPUTE_TARGET="cpu" for a normal CPU run.
 
 # AML mini-run settings are separate from local mini-run settings. These values
 # are sent to the remote job as environment variables.
@@ -177,19 +170,22 @@ AML_MINI_RUN_MODEL_IDS = []
 # Azure ML data input/output settings - Option B
 # -----------------------------------------------------------------------------
 # Input data is already in Blob Storage. It is NOT uploaded as part of the code
-# package. This URI points to the container shown in Azure Portal.
-# The container should contain:
+# package. The container should contain:
 #   machine.csv, fault_codes.csv, maintenance.csv, operation.csv, warranty.csv,
 #   xgb_feature_freeze(all).csv
 AML_INPUT_DATA_URI = "wasbs://enriched-data@aicontroltower7969986141.blob.core.windows.net/"
 AML_INPUT_MODE = "download"  # options: download, ro_mount
 
-# Outputs are written under this base datastore prefix.
-# submit_snapshot_build_aml_job.py creates a unique job name and writes outputs to:
-#   AML_OUTPUT_BASE_DATA_URI / <job_name> /
-# This keeps historical AML results instead of deleting old runs.
-AML_OUTPUT_BASE_DATA_URI = "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/"
-AML_OUTPUT_DATA_URI = AML_OUTPUT_BASE_DATA_URI  # backward-compatible alias
+# Outputs are written under a job-name folder in the selected AML workspace's
+# workspaceblobstore. CPU and GPU can have separate workspaces, so these are
+# target-specific even though the relative path is the same.
+AML_CPU_OUTPUT_BASE_DATA_URI = "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/"
+AML_GPU_OUTPUT_BASE_DATA_URI = "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/"
+
+# Optional global/backward-compatible output base. Leave blank when using the
+# target-specific output bases above.
+AML_OUTPUT_BASE_DATA_URI = ""
+AML_OUTPUT_DATA_URI = ""  # backward-compatible alias only
 AML_OUTPUT_MODE = "rw_mount"
 
 # Data access identity for private Blob Storage.
@@ -211,3 +207,7 @@ AML_RUN_RESULTS_LOCAL_DIR = PROJECT_ROOT / "data_preparation" / "aml_run_results
 # Optional: set this to download a specific historical run.
 # Leave blank to download the most recently submitted job recorded in AML_LAST_JOB_INFO_PATH.
 AML_DOWNLOAD_JOB_NAME = ""
+
+# Optional target override for downloading a specific historical run.
+# Leave blank to infer from the job name, or use the current AML_COMPUTE_TARGET.
+AML_DOWNLOAD_COMPUTE_TARGET = ""  # options: "", "cpu", "gpu"

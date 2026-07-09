@@ -149,21 +149,12 @@ def main() -> None:
     report_path.write_text(json.dumps(info, indent=2))
     log(f"device report saved to {report_path}")
 
-    # Submit script passes REQUIRE_GPU/AML_REQUIRE_GPU as environment variables.
-    # Those should override config.py so CPU runs do not fail even if config.py
-    # previously had AML_REQUIRE_GPU=True.
-    require_gpu = bool_from_env("REQUIRE_GPU")
-    if require_gpu is None:
-        require_gpu = bool_from_env("AML_REQUIRE_GPU")
-    if require_gpu is None:
-        require_gpu = (
-            bool(cfg("AML_REQUIRE_GPU", False))
-            if os.environ.get("AZUREML_RUN_ID")
-            else bool(cfg("REQUIRE_GPU", False))
-        )
+    compute_target = os.environ.get("AML_COMPUTE_TARGET", str(cfg("AML_COMPUTE_TARGET", "cpu"))).strip().lower()
+    expect_gpu = compute_target == "gpu"
 
-    log(f"require_gpu={require_gpu}")
-    if require_gpu and info["effective_device"] != "gpu":
+    log(f"compute_target={compute_target}")
+    log(f"expected_device={'gpu' if expect_gpu else 'cpu'}")
+    if expect_gpu and info["effective_device"] != "gpu":
         raise RuntimeError(
             "GPU is required by config, but no GPU is visible. Check Azure ML node allocation, "
             "quota/availability, CUDA driver visibility, and the selected curated environment."
