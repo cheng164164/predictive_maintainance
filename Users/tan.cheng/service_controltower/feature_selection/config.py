@@ -23,9 +23,9 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 PROJECT_DIR = Path(__file__).resolve().parent
 
-# Default assumes the unified snapshot dataset is one folder above this project.
-# Replace this with the production unified snapshot file path when ready.
-INPUT_DATA_PATH = PROJECT_DIR.parent / "snapshot_dataframe_mini.csv"
+# Default production path, assuming this project folder sits beside
+# data_preparation/ under the service_controltower project root.
+INPUT_DATA_PATH = PROJECT_DIR.parent / "data_preparation" / "output" / "snapshot_dataframe.csv"
 
 # All generated CSV, JSON, Excel, markdown, and plot outputs are written here.
 OUTPUT_DIR = PROJECT_DIR / "output"
@@ -91,81 +91,140 @@ ONE_HOT_ENCODE_CATEGORICAL = True
 # Matching is case-insensitive and checks the raw source feature name.
 FEATURE_GROUP_RULES = [
     {
-        "group": "fault_codes",
+        # Machine/master-data context. Put this first so any machine_* columns
+        # carried through from the canonical backbone stay together instead of
+        # being captured by generic operation/fault keywords.
+        "group": "machine_context",
         "patterns": [
-            r"fault",
-            r"dtc",
-            r"diagnostic",
-            r"trouble",
-            r"action_level",
-            r"action_",
-            r"occurrence",
-            r"severity",
+            r"^full_model$",
+            r"^machine_",
+            r"serial",
+            r"region",
+            r"dealer",
+            r"customer",
+            r"location",
         ],
     },
     {
+        # Fluid/oil lab-result features. These patterns intentionally match the
+        # exact lab-style frozen feature names from build_snapshot_dataframe.py,
+        # for example Fe_Iron_PPM, Fuel_Fuel_PERCENT, Soot_Soot_Abs, and
+        # Water_Water_PERCENT. Avoid broad words like "fuel" or "oil" here;
+        # otherwise operation features such as fuel_actual_work_conflict_count
+        # or maintenance features such as oil_reset_count could be mis-grouped.
+        "group": "fluid_oil",
+        "patterns": [
+            r"^fluid_sample_",
+            r"fluid_sample",
+            r"days_since_last_fluid_sample",
+            r"^(ag_silver|al_aluminum|cr_chromium|cu_copper|fe_iron|ni_nickel|pb_lead|sn_tin|ti_titanium|v_vanadium)_ppm$",
+            r"^(k_potassium|li_lithium|na_sodium|si_silicon)_ppm$",
+            r"^sediment_sediment_mg_per_l$",
+            r"^solids_solids_percent$",
+            r"^water_water_percent$",
+            r"^fuel_fuel_percent$",
+            r"^gly_glycol_percent$",
+            r"^ethyleneglycol_ethylene_glycol_percent$",
+            r"^polypropyleneglycol_polypropylene_glycol_percent$",
+            r"^soot_soot_",
+        ],
+    },
+    {
+        # Fault-code and event-history features from fault_features_for_model().
+        # Includes count/recency features, action-level features, evidence
+        # scores, component fault counts, and the fault-specific SMR helper
+        # features created in the fault source snapshot.
+        "group": "fault_codes",
+        "patterns": [
+            r"fault",
+            r"^action_",
+            r"action_level",
+            r"occurrence",
+            r"evidence",
+            r"mechanical",
+            r"electrical",
+            r"component",
+            r"severity_score",
+            r"max_log_occurrence",
+            r"sum_log_occurrence",
+        ],
+    },
+    {
+        # Maintenance-monitor / PM features from maintenance_features_for_model().
+        # This rule is evaluated before operation, so features like
+        # engine_reset_count_180d remain maintenance rather than being captured
+        # by an engine keyword.
         "group": "maintenance",
         "patterns": [
             r"maint",
             r"maintenance",
             r"service",
             r"pm_",
+            r"monitor_",
             r"reset",
             r"overdue",
-            r"repair",
+            r"due_now",
+            r"due_or_overdue",
+            r"remaining_hours",
+            r"active_maintenance",
         ],
     },
     {
+        # Warranty/prior-claim features. claim_next_45d is excluded as the target,
+        # but prior claim counts/amounts/recency are candidate features and should
+        # not be left in the default other group.
+        "group": "warranty_prior",
+        "patterns": [
+            r"prior_claim",
+            r"days_since_last_claim",
+            r"has_prior_claim",
+            r"unique_claim_type",
+            r"warranty",
+            r"claim",
+        ],
+    },
+    {
+        # Operation/utilization features from operation_features_for_model().
+        # These patterns are source-specific enough to capture work, engine,
+        # throttle, travel, steering, shift, and observed-day features while
+        # avoiding fluid lab fuel and maintenance reset features above.
         "group": "operation",
         "patterns": [
             r"operation",
-            r"operating",
-            r"engine",
-            r"idle",
-            r"idling",
+            r"actual_work",
+            r"working_hours",
+            r"work_idle",
+            r"work_day",
+            r"engine_running",
+            r"engine_idling",
+            r"engine_observed",
+            r"engine_seconds",
             r"throttle",
             r"travel",
-            r"work",
-            r"working",
-            r"steer",
+            r"moving_back_forth",
+            r"steering",
             r"shift",
-            r"load",
-            r"fuel",
+            r"fuel_actual_work",
+            r"high_throttle",
+            r"long_engine",
+            r"has_operation",
+            r"has_travel_data",
         ],
     },
     {
-        "group": "fluid_oil",
-        "patterns": [
-            r"fluid",
-            r"oil",
-            r"sample",
-            r"contamination",
-            r"viscosity",
-            r"coolant",
-            r"lab",
-        ],
-    },
-    {
+        # SMR/usage-meter features that are not source-specific maintenance,
+        # fault, operation, or fluid sample features. Rules above intentionally
+        # capture fault_smr_delta_90d, smr_since_last_reset, and
+        # fluid_sample_latest_smr before this generic SMR group is reached.
         "group": "smr_usage",
         "patterns": [
-            r"smr",
-            r"hour",
-            r"hours",
+            r"^smr_latest_hours$",
+            r"^smr_delta_",
+            r"^days_since_last_smr$",
+            r"^smr_",
             r"usage",
             r"meter",
-            r"age",
-        ],
-    },
-    {
-        "group": "machine_context",
-        "patterns": [
-            r"full_model",
-            r"model",
-            r"serial",
-            r"region",
-            r"dealer",
-            r"customer",
-            r"location",
+            r"machine_age",
         ],
     },
 ]

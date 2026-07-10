@@ -1,113 +1,263 @@
 # Feature Selection Analysis
 
-This folder contains a config-driven feature-selection analysis workflow for the unified snapshot dataframe.
+This folder contains a config-driven, step-by-step feature-selection analysis workflow for the unified snapshot dataframe.
 
-The scripts now include detailed function-level docstrings and comments so the workflow is easier to review, maintain, and modify.
+The workflow is intentionally split into numbered scripts so you can run one method at a time, inspect its output folder, then continue to the next step. `main.py` is still available when you want to run every step in order.
 
-## How to run
+## Default input
+
+By default, `config.py` expects the production unified snapshot dataframe here:
+
+```text
+../data_preparation/output/snapshot_dataframe.csv
+```
+
+This matches the project layout where `feature_selection/` sits beside `data_preparation/` under the same project root.
+
+Supported input types:
+
+- CSV
+- Parquet
+- Excel
+
+## How to run step by step
+
+Run from inside the `feature_selection` folder:
+
+```bash
+cd feature_selection
+python 00_prepare_data.py
+python 01_unsupervised_selection.py
+python 02_correlation_analysis.py
+python 03_statistical_tests.py
+python 04_xgboost_importance.py
+python 05_permutation_importance.py
+python 06_shap_analysis.py
+python 07_consensus_report.py
+```
+
+Each script runs without command-line arguments. Edit `config.py` to change input paths, split ratios, model settings, feature-group rules, and reporting options.
+
+## Run everything at once
 
 ```bash
 cd feature_selection
 python main.py
 ```
 
-No command-line arguments are required. Edit `config.py` to change the input dataset path, target/date columns, split ratios, model parameters, feature-group rules, and reporting options.
-
-## Default input
-
-By default, `config.py` expects the input file here:
+`main.py` runs the same numbered steps in order and writes a combined summary to:
 
 ```text
-../snapshot_dataframe_mini.csv
+output/00_all_steps_run_summary.json
 ```
 
-For the production unified snapshot dataframe, update this value in `config.py`:
+## Step order and output folders
+
+All outputs are saved under `feature_selection/output`, with one subfolder per step:
+
+```text
+output/
+    00_prepare_data/
+    01_unsupervised_selection/
+    02_correlation_analysis/
+    03_statistical_tests/
+    04_xgboost_importance/
+    05_permutation_importance/
+    06_shap_analysis/
+    07_consensus_report/
+```
+
+### 00_prepare_data.py
+
+Creates the reusable data audit outputs:
+
+- chronological training / validation / test split summary
+- inner `feature_train` / `feature_selection_holdout` split summary
+- candidate feature list
+- raw missing-value counts and percentages before preprocessing
+- prepared feature mapping after imputation / one-hot encoding
+- feature group assignment review
+
+Output folder:
+
+```text
+output/00_prepare_data
+```
+
+### 01_unsupervised_selection.py
+
+Creates unsupervised diagnostics without applying any keep/drop threshold:
+
+- raw feature inventory on `feature_train`
+- prepared feature diagnostics after preprocessing
+- exact constant prepared feature report
+
+Output folder:
+
+```text
+output/01_unsupervised_selection
+```
+
+### 02_correlation_analysis.py
+
+Runs grouped correlation analysis within configured feature groups only.
+
+Output folder:
+
+```text
+output/02_correlation_analysis
+```
+
+Main outputs:
+
+- `01_grouped_correlation_pairs_feature_train.csv`
+- `02_grouped_correlation_summary_feature_train.csv`
+
+### 03_statistical_tests.py
+
+Runs supervised univariate statistical filters on `feature_train` only:
+
+- ANOVA F-test
+- mutual information
+- chi-squared after min-max scaling
+
+Output folder:
+
+```text
+output/03_statistical_tests
+```
+
+### 04_xgboost_importance.py
+
+Trains a temporary XGBoost model on `feature_train` and saves built-in feature importance:
+
+- weight
+- gain
+- cover
+- total gain
+- total cover
+
+It also saves threshold-free metrics on `feature_selection_holdout` for context.
+
+Output folder:
+
+```text
+output/04_xgboost_importance
+```
+
+### 05_permutation_importance.py
+
+Trains the temporary XGBoost model on `feature_train` and computes permutation importance on `feature_selection_holdout`.
+
+Permutation importance uses F2 scoring through:
 
 ```python
-INPUT_DATA_PATH = PROJECT_DIR.parent / "your_unified_snapshot.csv"
+PERMUTATION_SCORING = "f2"
 ```
 
-CSV, Parquet, and Excel inputs are supported.
+Output folder:
+
+```text
+output/05_permutation_importance
+```
+
+### 06_shap_analysis.py
+
+Trains the temporary XGBoost model on `feature_train` and computes SHAP importance on `feature_selection_holdout`.
+
+Output folder:
+
+```text
+output/06_shap_analysis
+```
+
+### 07_consensus_report.py
+
+Reads the outputs from earlier method folders and creates combined review artifacts:
+
+- consensus ranking table
+- combined Excel workbook
+- markdown summary
+
+Output folder:
+
+```text
+output/07_consensus_report
+```
+
+The consensus step does not apply a final keep/drop threshold. It combines available ranks for review only.
 
 ## Split design
 
-The script uses the non-cross-validation workflow discussed. The configured full split uses the requested `0.75/0.15/0.15` values as ratio weights. Because those values sum to `1.05`, the script normalizes them internally and records the effective shares in `00_run_summary.json`.
+The workflow uses the non-cross-validation design discussed:
 
 ```text
 full dataset
-    |-- training_main: ratio weight 0.75
-    |     |-- feature_train: 75% of training_main
-    |     |-- feature_selection_holdout: 25% of training_main
-    |-- validation_holdout: ratio weight 0.15
-    |-- test_holdout: ratio weight 0.15
+    |-- training_main
+    |     |-- feature_train
+    |     |-- feature_selection_holdout
+    |-- validation_holdout
+    |-- test_holdout
 ```
 
-`feature_train` is used for training-only diagnostics and rankings:
+`feature_train` is used for:
 
-- raw feature inventory
-- raw missing-value counts and percentages before preprocessing
-- prepared feature diagnostics after preprocessing
-- exact constant feature report
-- grouped correlation pairs within configured feature groups
-- ANOVA F-test
+- preprocessing fit
+- unsupervised diagnostics
+- grouped correlation
+- ANOVA
 - mutual information
-- chi-squared on min-max scaled features
-- XGBoost feature importance
+- chi-squared
+- temporary XGBoost model training
+- XGBoost built-in feature importance
 
-`feature_selection_holdout` is used for model-based review methods that benefit from holdout data:
+`feature_selection_holdout` is used for:
 
-- permutation importance using F2 scoring
+- permutation importance
 - SHAP importance
-- threshold-free XGBoost holdout metrics
+- threshold-free temporary model metrics
 
-`validation_holdout` and `test_holdout` are not used for feature-ranking reports.
+`validation_holdout` and `test_holdout` are preserved for later model validation and final reporting. They are not used for feature-selection ranking in this project.
+
+## Feature groups for correlation
+
+Correlation analysis is performed within feature groups only to reduce pair volume and make the result easier to review. The grouping rules are defined in:
+
+```python
+config.FEATURE_GROUP_RULES
+```
+
+The current rules explicitly cover:
+
+- machine context
+- fault-code features
+- maintenance features
+- warranty/prior-claim features
+- operation/utilization features
+- SMR/usage-meter features
+- fluid/oil lab-result features
+
+Fluid/oil patterns are intentionally specific, for example `Fe_Iron_PPM`, `Fuel_Fuel_PERCENT`, `Soot_Soot_PERCENT`, and `Water_Water_PERCENT`. Broad patterns such as plain `fuel` or `oil` are avoided so operation and maintenance features are not accidentally mis-grouped.
 
 ## Important behavior
 
-The script does **not** produce a final keep/drop feature freeze. It saves ranked reports and diagnostics so you can review the evidence manually before choosing thresholds or final feature subsets.
+The workflow does **not** produce a final keep/drop feature freeze. It saves ranked reports and diagnostics so you can manually review the evidence before choosing thresholds or final feature subsets.
 
-Correlation analysis is performed **within feature groups only** to reduce pair volume and keep the report easier to review. The grouping rules are defined in `config.FEATURE_GROUP_RULES`. There is no `MAX_CORRELATION_PAIRS_TO_SAVE` setting anymore; all within-group correlation pairs are saved to the CSV report.
-
-Permutation importance uses F2 scoring through `config.PERMUTATION_SCORING = "f2"`. F2 emphasizes recall more than precision. In this script, sklearn permutation importance uses the model's default `predict()` behavior for the F2 scorer.
-
-## Main outputs
-
-All outputs are saved under:
-
-```text
-feature_selection/output
-```
-
-Important files include:
-
-- `feature_selection_report.xlsx`: combined review workbook
-- `feature_selection_summary.md`: human-readable run summary
-- `00_run_summary.json`: machine-readable run summary
-- `01_split_summary.csv`: row/date/target summary by split
-- `01_split_assignments.csv`: outer chronological split audit table
-- `01_inner_training_split_assignments.csv`: inner training split audit table
-- `02_candidate_features.csv`: raw candidate feature list
-- `03_raw_missing_values_before_preprocessing.csv`: missing counts and percentages before imputation/preprocessing
-- `04_raw_feature_inventory_feature_train.csv`: raw feature diagnostics on `feature_train`
-- `05_prepared_feature_mapping.csv`: prepared-to-raw feature mapping with assigned feature group
-- `05_prepared_feature_groups_for_correlation.csv`: feature groups used for grouped correlation analysis
-- `06_prepared_feature_diagnostics_feature_train.csv`: post-encoding/imputation diagnostics
-- `06_constant_features_exact_feature_train.csv`: exact constant feature report
-- `07_grouped_correlation_pairs_feature_train.csv`: sorted within-group correlation pairs
-- `08_anova_f_classif_feature_train.csv`: ANOVA ranking
-- `09_mutual_info_classif_feature_train.csv`: mutual information ranking
-- `10_chi2_minmax_scaled_feature_train.csv`: chi-squared ranking
-- `11_xgboost_importance_feature_train.csv`: XGBoost importance ranking
-- `11_xgboost_threshold_free_metrics_feature_selection_holdout.json`: holdout average precision / ROC-AUC / log-loss where valid
-- `12_permutation_importance_f2_feature_selection_holdout.csv`: permutation importance ranking using F2 scoring
-- `13_shap_importance_feature_selection_holdout.csv`: SHAP ranking
-- `14_consensus_rank_review_no_threshold.csv`: combined review table across methods
-- `plots/`: top-N bar charts for quick review
+Each step writes a `step_run_summary.json` file in its output folder.
 
 ## Main scripts
 
-- `config.py`: all editable run configuration.
-- `main.py`: end-to-end workflow orchestration.
+- `config.py`: editable run configuration.
+- `workflow.py`: shared workflow implementation used by all step scripts.
+- `00_prepare_data.py`: split, missingness, candidate feature, and feature-map reports.
+- `01_unsupervised_selection.py`: raw inventory, prepared diagnostics, constant feature report.
+- `02_correlation_analysis.py`: grouped within-source correlation analysis.
+- `03_statistical_tests.py`: ANOVA, mutual information, chi-squared.
+- `04_xgboost_importance.py`: XGBoost built-in feature importance.
+- `05_permutation_importance.py`: F2 permutation importance.
+- `06_shap_analysis.py`: SHAP importance.
+- `07_consensus_report.py`: combined consensus, Excel, and markdown reports.
+- `main.py`: run all numbered steps in order.
 - `fs_utils.py`: reusable helper functions with detailed docstrings and comments.
 - `requirements.txt`: Python package requirements.
 

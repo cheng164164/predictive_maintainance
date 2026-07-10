@@ -6,10 +6,10 @@ Current supported source files:
     2. fault_codes.csv      fault/event history
     3. maintenance.csv      maintenance-monitor / PM history
     4. operation.csv        daily operation / utilization history
-    5. warranty.csv         warranty/claim history for target labels
+    5. fluid_samples.csv    fluid/oil sample lab results
+    6. warranty.csv         warranty/claim history for target labels
 
 Designed for future extension:
-    - oil / fluid sample data
     - service/work-order data
 
 Expected project layout:
@@ -24,6 +24,7 @@ Expected project layout:
     │   ├── fault_codes.csv
     │   ├── maintenance.csv
     │   ├── operation.csv
+    │   ├── fluid_samples.csv
     │   ├── warranty.csv
     │   └── xgb_feature_freeze(all).csv
     └── requirements.txt
@@ -279,6 +280,39 @@ FROZEN_FEATURES = [
     'steering_to_travel_ratio_90d',
     'auto_quick_shift_hours_sum_90d',
     'manual_variable_shift_hours_sum_90d',
+    'prior_claim_count_365d',
+    'prior_claim_count_180d',
+    'prior_claim_count_90d',
+    'days_since_last_claim',
+    'prior_claim_amount_sum_365d',
+    'prior_claim_amount_max_365d',
+    'unique_claim_type_count_365d',
+    'has_prior_claim_365d',
+    'Ag_Silver_PPM',
+    'Al_Aluminum_PPM',
+    'Cr_Chromium_PPM',
+    'Cu_Copper_PPM',
+    'Fe_Iron_PPM',
+    'Ni_Nickel_PPM',
+    'Pb_Lead_PPM',
+    'Sn_Tin_PPM',
+    'Ti_Titanium_PPM',
+    'V_Vanadium_PPM',
+    'EthyleneGlycol_Ethylene_Glycol_PERCENT',
+    'Fuel_Fuel_PERCENT',
+    'Gly_Glycol_PERCENT',
+    'K_Potassium_PPM',
+    'Li_Lithium_PPM',
+    'Na_Sodium_PPM',
+    'PolypropyleneGlycol_Polypropylene_Glycol_PERCENT',
+    'Sediment_Sediment_MG_PER_L',
+    'Si_Silicon_PPM',
+    'Solids_Solids_PERCENT',
+    'Soot_Soot_Abs',
+    'Soot_Soot_Abs_cm',
+    'Soot_Soot_METHOD_DEPENDENT',
+    'Soot_Soot_PERCENT',
+    'Water_Water_PERCENT',
 ]
 
 COUNT_FEATURES = [
@@ -287,6 +321,7 @@ COUNT_FEATURES = [
     if c.endswith("_count_90d")
     or c.endswith("_count_30d")
     or c.endswith("_count_180d")
+    or c.endswith("_count_365d")
     or c.endswith("_7d")
     or c
     in {
@@ -299,6 +334,8 @@ COUNT_FEATURES = [
         "unique_fault_code_count_90d",
         "unique_component_count_90d",
         "unique_maintenance_type_count_180d",
+        "unique_claim_type_count_365d",
+        "has_prior_claim_365d",
         "strong_fault_count_90d",
         "moderate_fault_count_90d",
     }
@@ -314,6 +351,7 @@ RECENCY_FEATURES = [
     'days_since_last_actual_work_day',
     'days_since_last_engine_running_day',
     'days_since_last_travel_day',
+    'days_since_last_claim',
 ]
 
 NULL_LIKE_STRINGS = {
@@ -348,6 +386,41 @@ MAINTENANCE_TYPE_PATTERNS = {
     "breather": ["breather"],
     "coolant": ["coolant"],
 }
+
+
+# Fluid sample lab-result features listed in xgb_feature_freeze(all).csv.
+# Each snapshot uses the latest non-null value from same-machine samples within
+# FLUID_SAMPLE_LOOKBACK_DAYS before snapshot_date, after collapsing duplicate
+# machine/date samples by max value.
+FLUID_SAMPLE_FEATURES = [
+    'Ag_Silver_PPM',
+    'Al_Aluminum_PPM',
+    'Cr_Chromium_PPM',
+    'Cu_Copper_PPM',
+    'Fe_Iron_PPM',
+    'Ni_Nickel_PPM',
+    'Pb_Lead_PPM',
+    'Sn_Tin_PPM',
+    'Ti_Titanium_PPM',
+    'V_Vanadium_PPM',
+    'EthyleneGlycol_Ethylene_Glycol_PERCENT',
+    'Fuel_Fuel_PERCENT',
+    'Gly_Glycol_PERCENT',
+    'K_Potassium_PPM',
+    'Li_Lithium_PPM',
+    'Na_Sodium_PPM',
+    'PolypropyleneGlycol_Polypropylene_Glycol_PERCENT',
+    'Sediment_Sediment_MG_PER_L',
+    'Si_Silicon_PPM',
+    'Solids_Solids_PERCENT',
+    'Soot_Soot_Abs',
+    'Soot_Soot_Abs_cm',
+    'Soot_Soot_METHOD_DEPENDENT',
+    'Soot_Soot_PERCENT',
+    'Water_Water_PERCENT',
+]
+
+FLUID_SAMPLE_LOOKBACK_DAYS = int(cfg("FLUID_SAMPLE_LOOKBACK_DAYS", 365))
 
 
 # -----------------------------------------------------------------------------
@@ -1093,6 +1166,32 @@ def standardize_warranty(warranty: pd.DataFrame, allowed_model_ids: set[str]) ->
     )
     w["warranty_event_date"] = claim_date.dt.normalize()
     w["claim_number_clean"] = first_existing_col(w, ["claim_number", "CLMNO", "claim_id"], "").astype("string").str.strip()
+    w["claim_type_description_clean"] = first_existing_col(
+        w,
+        [
+            "claim_type_description",
+            "CLAIM_TYPE_DESCRIPTION",
+            "claim_type",
+            "claim_category",
+            "warranty_claim_data_source",
+        ],
+        "",
+    ).astype("string").str.strip()
+    w["claim_amount_clean"] = pd.to_numeric(
+        first_existing_col(
+            w,
+            [
+                "claim_amount",
+                "CLAIM_AMOUNT",
+                "total_claim_amount",
+                "total_amount",
+                "net_claim_amount",
+                "paid_amount",
+            ],
+            0,
+        ),
+        errors="coerce",
+    ).fillna(0)
 
     total_rows = len(w)
     missing_model_id_rows = int(w["model_id"].isna().sum())
@@ -1108,7 +1207,7 @@ def standardize_warranty(warranty: pd.DataFrame, allowed_model_ids: set[str]) ->
 
     summary = {
         "source": "warranty",
-        "source_role": "target_label",
+        "source_role": "target_and_prior_features",
         "input_rows": total_rows,
         "model_id_source": model_id_source,
         "model_id_reconciled_to_backbone_rows": reconciled_model_id_rows,
@@ -1121,6 +1220,71 @@ def standardize_warranty(warranty: pd.DataFrame, allowed_model_ids: set[str]) ->
         "unique_model_ids_after_standardization": out["model_id"].nunique(),
     }
     return out, summary
+
+
+def standardize_fluid_samples(fluid_samples: pd.DataFrame, allowed_model_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Standardize fluid/oil sample records as event rows for snapshot features.
+
+    The source file is expected to have one row per lab sample with machine_id,
+    sample_drawn_date, and the phase-1 numeric lab result columns listed in
+    FLUID_SAMPLE_FEATURES. Rows are restricted to model_id values present in the
+    canonical machine backbone.
+    """
+    fs = fluid_samples.copy()
+    fs["model_id"], model_id_source = normalize_model_id(fs, "fluid_samples")
+    fs["model_id"], reconciled_model_id_rows = reconcile_model_id_to_backbone(
+        fs, fs["model_id"], allowed_model_ids, "fluid_samples"
+    )
+    fs["full_model"] = first_existing_col(fs, ["full_model", "FULL_MODEL", "MODEL", "model"], pd.NA).astype("string").str.strip()
+
+    sample_date = parse_dt(
+        first_existing_col(
+            fs,
+            ["sample_drawn_date", "SAMPLE_DRAWN_DATE", "local_date", "LOCAL_DATE", "event_date", "date"],
+            pd.NaT,
+        )
+    )
+    fs["fluid_sample_event_date"] = sample_date.dt.normalize()
+    fs["fluid_sample_severity_order_clean"] = pd.to_numeric(
+        first_existing_col(fs, ["sample_result_severity_order", "severity_order", "result_severity_order"], np.nan),
+        errors="coerce",
+    )
+    fs["fluid_sample_smr_clean"] = pd.to_numeric(
+        first_existing_col(fs, ["TELEMETRY_SMR_NUMERIC", "telemetry_smr_numeric", "smr_hours", "SMR_HOURS"], np.nan),
+        errors="coerce",
+    )
+
+    for feature in FLUID_SAMPLE_FEATURES:
+        fs[feature] = pd.to_numeric(first_existing_col(fs, [feature], np.nan), errors="coerce")
+
+    total_rows = len(fs)
+    missing_model_id_rows = int(fs["model_id"].isna().sum())
+    missing_date_rows = int(fs["fluid_sample_event_date"].isna().sum())
+    not_in_backbone_rows = int((~fs["model_id"].astype("string").isin(allowed_model_ids) & fs["model_id"].notna()).sum())
+
+    out = fs[
+        fs["model_id"].notna()
+        & fs["fluid_sample_event_date"].notna()
+        & fs["model_id"].astype("string").isin(allowed_model_ids)
+    ].copy()
+    out = out.sort_values(["model_id", "fluid_sample_event_date"]).reset_index(drop=True)
+
+    summary = {
+        "source": "fluid_samples",
+        "source_role": "event_features",
+        "input_rows": total_rows,
+        "model_id_source": model_id_source,
+        "model_id_reconciled_to_backbone_rows": reconciled_model_id_rows,
+        "snapshot_date_source": "sample_drawn_date",
+        "missing_model_id_rows": missing_model_id_rows,
+        "missing_usable_event_date_rows": missing_date_rows,
+        "dropped_missing_event_date_rows": missing_date_rows,
+        "rows_not_in_machine_backbone": not_in_backbone_rows,
+        "rows_after_standardization": len(out),
+        "unique_model_ids_after_standardization": out["model_id"].nunique(),
+    }
+    return out, summary
+
 
 
 # -----------------------------------------------------------------------------
@@ -1549,29 +1713,123 @@ def build_operation_snapshot(backbone: pd.DataFrame, operation: pd.DataFrame) ->
     progress(f"Operation snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
     return result
 
+# -----------------------------------------------------------------------------
+# Fluid sample source feature engineering
+# -----------------------------------------------------------------------------
+def latest_non_null_by_sample_date(window: pd.DataFrame, feature: str) -> float:
+    """Return the latest non-null lab result after same-day max aggregation."""
+    if window.empty or feature not in window.columns:
+        return np.nan
+    values = window[["fluid_sample_event_date", feature]].dropna(subset=[feature])
+    if values.empty:
+        return np.nan
+    # Multiple lab rows can exist for the same machine and sample date. Collapse
+    # the same date with MAX first, then take the latest sample date value.
+    by_date = values.groupby("fluid_sample_event_date", dropna=False)[feature].max().sort_index()
+    return by_date.iloc[-1] if len(by_date) else np.nan
+
+
+def fluid_sample_features_for_model(snap_m: pd.DataFrame, fs_m: pd.DataFrame) -> list[dict]:
+    """Create fluid-sample lab features for one model_id across snapshots.
+
+    The frozen fluid feature names are the lab result names themselves. For each
+    snapshot, the value is the latest non-null same-machine sample result within
+    FLUID_SAMPLE_LOOKBACK_DAYS before snapshot_date. This follows the existing
+    leakage rule because only sample_drawn_date < snapshot_date is used.
+    """
+    out: list[dict] = []
+    dates = fs_m["fluid_sample_event_date"] if "fluid_sample_event_date" in fs_m.columns else pd.Series(dtype="datetime64[ns]")
+    lookback_days = int(cfg("FLUID_SAMPLE_LOOKBACK_DAYS", FLUID_SAMPLE_LOOKBACK_DAYS))
+
+    for snap in snap_m["snapshot_date"]:
+        before = fs_m[dates < snap]
+        window = before[before["fluid_sample_event_date"] >= snap - pd.Timedelta(days=lookback_days)]
+
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
+        for feature in FLUID_SAMPLE_FEATURES:
+            row[feature] = latest_non_null_by_sample_date(window, feature)
+
+        row[f"fluid_sample_count_{lookback_days}d"] = len(window)
+        row["days_since_last_fluid_sample"] = days_between(snap, before["fluid_sample_event_date"].max())
+        row[f"fluid_sample_severity_max_{lookback_days}d"] = (
+            window["fluid_sample_severity_order_clean"].max()
+            if "fluid_sample_severity_order_clean" in window.columns and len(window)
+            else np.nan
+        )
+        row["fluid_sample_latest_smr"] = (
+            before["fluid_sample_smr_clean"].dropna().max()
+            if "fluid_sample_smr_clean" in before.columns and len(before)
+            else np.nan
+        )
+        out.append(row)
+
+    return out
+
+
+def build_fluid_sample_snapshot(backbone: pd.DataFrame, fluid_samples: pd.DataFrame) -> pd.DataFrame:
+    """Build the source-specific fluid sample snapshot dataframe on the backbone."""
+    start = time.perf_counter()
+    rows: list[pd.DataFrame] = []
+    fluid_groups = {k: v for k, v in fluid_samples.groupby("model_id", sort=False)}
+
+    total_models = backbone["model_id"].nunique() if not backbone.empty else 0
+    total_snapshot_rows = len(backbone)
+    processed_snapshot_rows = 0
+    progress(f"Building fluid sample snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
+
+    for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
+        fs_m = fluid_groups.get(model_id, fluid_samples.iloc[0:0])
+        rows.append(pd.DataFrame(fluid_sample_features_for_model(snap_m, fs_m)))
+        processed_snapshot_rows += len(snap_m)
+
+        if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
+            progress(
+                f"Fluid sample snapshot progress: {idx:,}/{total_models:,} model_ids; "
+                f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
+            )
+
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date"])
+    progress(f"Fluid sample snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
+    return result
+
+
 
 # -----------------------------------------------------------------------------
 # Warranty target engineering
 # -----------------------------------------------------------------------------
 def warranty_target_for_model(snap_m: pd.DataFrame, w_m: pd.DataFrame, horizon_days: int) -> list[dict]:
-    """Create claim_next_45d-like target labels for one model_id."""
+    """Create prior-claim features and future claim labels for one model_id."""
     out: list[dict] = []
     dates = w_m["warranty_event_date"] if "warranty_event_date" in w_m.columns else pd.Series(dtype="datetime64[ns]")
 
     for snap in snap_m["snapshot_date"]:
+        before = w_m[dates < snap]
+        w365 = before[before["warranty_event_date"] >= snap - pd.Timedelta(days=365)]
+        w180 = before[before["warranty_event_date"] >= snap - pd.Timedelta(days=180)]
+        w90 = before[before["warranty_event_date"] >= snap - pd.Timedelta(days=90)]
         future = w_m[(dates > snap) & (dates <= snap + pd.Timedelta(days=horizon_days))]
-        out.append(
-            {
-                "model_id": snap_m["model_id"].iloc[0],
-                "snapshot_date": snap,
-                f"claim_next_{horizon_days}d": int(len(future) > 0),
-            }
-        )
+
+        row = {
+            "model_id": snap_m["model_id"].iloc[0],
+            "snapshot_date": snap,
+            "prior_claim_count_365d": len(w365),
+            "prior_claim_count_180d": len(w180),
+            "prior_claim_count_90d": len(w90),
+            "days_since_last_claim": days_between(snap, before["warranty_event_date"].max()),
+            "prior_claim_amount_sum_365d": w365["claim_amount_clean"].sum() if "claim_amount_clean" in w365.columns else 0.0,
+            "prior_claim_amount_max_365d": w365["claim_amount_clean"].max() if "claim_amount_clean" in w365.columns else np.nan,
+            "unique_claim_type_count_365d": w365["claim_type_description_clean"].replace("", np.nan).nunique()
+            if "claim_type_description_clean" in w365.columns
+            else 0,
+            "has_prior_claim_365d": int(len(w365) > 0),
+            f"claim_next_{horizon_days}d": int(len(future) > 0),
+        }
+        out.append(row)
     return out
 
 
 def build_warranty_target_snapshot(backbone: pd.DataFrame, warranty: pd.DataFrame, horizon_days: int = 45) -> pd.DataFrame:
-    """Build the warranty target dataframe on the machine backbone."""
+    """Build the warranty target/prior-feature dataframe on the machine backbone."""
     start = time.perf_counter()
     rows: list[pd.DataFrame] = []
     warranty_groups = {k: v for k, v in warranty.groupby("model_id", sort=False)}
@@ -1579,7 +1837,7 @@ def build_warranty_target_snapshot(backbone: pd.DataFrame, warranty: pd.DataFram
     total_models = backbone["model_id"].nunique() if not backbone.empty else 0
     total_snapshot_rows = len(backbone)
     processed_snapshot_rows = 0
-    progress(f"Building warranty target snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
+    progress(f"Building warranty target/prior snapshot for {total_models:,} model_ids and {total_snapshot_rows:,} machine-backbone rows...")
 
     for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
         w_m = warranty_groups.get(model_id, warranty.iloc[0:0])
@@ -1588,14 +1846,14 @@ def build_warranty_target_snapshot(backbone: pd.DataFrame, warranty: pd.DataFram
 
         if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
             progress(
-                f"Warranty target progress: {idx:,}/{total_models:,} model_ids; "
+                f"Warranty snapshot progress: {idx:,}/{total_models:,} model_ids; "
                 f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
             )
 
     result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date", f"claim_next_{horizon_days}d"])
     if horizon_days == 45 and "claim_next_45d" not in result.columns and f"claim_next_{horizon_days}d" in result.columns:
         result = result.rename(columns={f"claim_next_{horizon_days}d": "claim_next_45d"})
-    progress(f"Warranty target snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
+    progress(f"Warranty target/prior snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
     return result
 
 
@@ -1810,6 +2068,7 @@ def build_snapshot_dataframe(
     machine_path: str | Path,
     maintenance_path: str | Path,
     operation_path: Optional[str | Path] = None,
+    fluid_samples_path: Optional[str | Path] = None,
     warranty_path: Optional[str | Path] = None,
     output_dir: str | Path = OUTPUT_DIR,
     feature_freeze_path: Optional[str | Path] = None,
@@ -1820,6 +2079,7 @@ def build_snapshot_dataframe(
         - fault_snapshot
         - maintenance_snapshot
         - operation_snapshot, when operation.csv exists
+        - fluid_sample_snapshot, when fluid_samples.csv exists
         - warranty_target_snapshot, when warranty.csv exists
     """
     overall_start = time.perf_counter()
@@ -1838,7 +2098,7 @@ def build_snapshot_dataframe(
     cleaning_summaries: list[dict] = []
     standardization_summaries: list[dict] = []
 
-    progress("Step 1/10: Loading and lightly cleaning source CSV files...")
+    progress("Step 1/11: Loading and lightly cleaning source CSV files...")
     raw_machine, profiles, summary = load_and_clean_csv(machine_path, "machine", output_dir)
     all_profiles.extend(profiles)
     cleaning_summaries.append(summary)
@@ -1863,6 +2123,15 @@ def build_snapshot_dataframe(
     else:
         progress("operation.csv not found/configured. Operation features will be created as 0-filled columns.")
 
+    raw_fluid_samples = None
+    if fluid_samples_path is not None:
+        raw_fluid_samples, profiles, summary = load_and_clean_csv(fluid_samples_path, "fluid_samples", output_dir)
+        all_profiles.extend(profiles)
+        cleaning_summaries.append(summary)
+        progress(f"fluid_samples loaded: {len(raw_fluid_samples):,} rows, {len(raw_fluid_samples.columns):,} columns")
+    else:
+        progress("fluid_samples.csv not found/configured. Fluid sample features will be created as 0-filled columns.")
+
     raw_warranty = None
     if warranty_path is not None:
         raw_warranty, profiles, summary = load_and_clean_csv(warranty_path, "warranty", output_dir)
@@ -1876,7 +2145,7 @@ def build_snapshot_dataframe(
         write_combined_cleaning_reports(output_dir, all_profiles, cleaning_summaries)
         progress("Missing-value and light-cleaning reports written.")
 
-    progress("Step 2/10: Standardizing machine.csv as canonical snapshot backbone...")
+    progress("Step 2/11: Standardizing machine.csv as canonical snapshot backbone...")
     backbone, summary = standardize_machine_backbone(raw_machine)
     standardization_summaries.append(summary)
     progress(
@@ -1894,7 +2163,7 @@ def build_snapshot_dataframe(
     )
     save_source_snapshot(backbone, "machine_backbone.csv")
 
-    progress("Step 3/10: Standardizing event sources and forcing them to machine backbone model_ids...")
+    progress("Step 3/11: Standardizing event sources and forcing them to machine backbone model_ids...")
     fault, summary = standardize_faults(raw_fault, allowed_model_ids=allowed_model_ids)
     standardization_summaries.append(summary)
     progress(
@@ -1924,6 +2193,17 @@ def build_snapshot_dataframe(
             f"rows after standardization={summary['rows_after_standardization']:,}"
         )
 
+    fluid_samples = None
+    if raw_fluid_samples is not None:
+        fluid_samples, summary = standardize_fluid_samples(raw_fluid_samples, allowed_model_ids=allowed_model_ids)
+        standardization_summaries.append(summary)
+        progress(
+            "Fluid sample date/model-id quality: "
+            f"missing usable date rows={summary['missing_usable_event_date_rows']:,}; "
+            f"rows not in machine backbone={summary['rows_not_in_machine_backbone']:,}; "
+            f"rows after standardization={summary['rows_after_standardization']:,}"
+        )
+
     warranty = None
     if raw_warranty is not None:
         warranty, summary = standardize_warranty(raw_warranty, allowed_model_ids=allowed_model_ids)
@@ -1940,13 +2220,13 @@ def build_snapshot_dataframe(
 
     source_snapshots: dict[str, pd.DataFrame] = {}
 
-    progress("Step 4/10: Building fault source snapshot dataframe on machine backbone...")
+    progress("Step 4/11: Building fault source snapshot dataframe on machine backbone...")
     fault_snapshot = build_fault_snapshot(backbone, fault)
     validate_source_snapshot_alignment("fault_snapshot", backbone, fault_snapshot)
     save_source_snapshot(fault_snapshot, "fault_snapshot.csv")
     source_snapshots["fault_snapshot"] = fault_snapshot
 
-    progress("Step 5/10: Building maintenance source snapshot dataframe on machine backbone...")
+    progress("Step 5/11: Building maintenance source snapshot dataframe on machine backbone...")
     maintenance_snapshot = build_maintenance_snapshot(backbone, pm)
     validate_source_snapshot_alignment("maintenance_snapshot", backbone, maintenance_snapshot)
     save_source_snapshot(maintenance_snapshot, "maintenance_snapshot.csv")
@@ -1954,17 +2234,27 @@ def build_snapshot_dataframe(
 
     operation_snapshot = None
     if operation is not None:
-        progress("Step 6/10: Building operation source snapshot dataframe on machine backbone...")
+        progress("Step 6/11: Building operation source snapshot dataframe on machine backbone...")
         operation_snapshot = build_operation_snapshot(backbone, operation)
         validate_source_snapshot_alignment("operation_snapshot", backbone, operation_snapshot)
         save_source_snapshot(operation_snapshot, "operation_snapshot.csv")
         source_snapshots["operation_snapshot"] = operation_snapshot
     else:
-        progress("Step 6/10: Skipping operation snapshot because operation.csv is not available.")
+        progress("Step 6/11: Skipping operation snapshot because operation.csv is not available.")
+
+    fluid_sample_snapshot = None
+    if fluid_samples is not None:
+        progress("Step 7/11: Building fluid sample source snapshot dataframe on machine backbone...")
+        fluid_sample_snapshot = build_fluid_sample_snapshot(backbone, fluid_samples)
+        validate_source_snapshot_alignment("fluid_sample_snapshot", backbone, fluid_sample_snapshot)
+        save_source_snapshot(fluid_sample_snapshot, "fluid_sample_snapshot.csv")
+        source_snapshots["fluid_sample_snapshot"] = fluid_sample_snapshot
+    else:
+        progress("Step 7/11: Skipping fluid sample snapshot because fluid_samples.csv is not available.")
 
     warranty_target_snapshot = None
     if warranty is not None:
-        progress("Step 7/10: Building warranty target snapshot dataframe on machine backbone...")
+        progress("Step 8/11: Building warranty target snapshot dataframe on machine backbone...")
         warranty_target_snapshot = build_warranty_target_snapshot(
             backbone,
             warranty,
@@ -1974,24 +2264,26 @@ def build_snapshot_dataframe(
         save_source_snapshot(warranty_target_snapshot, "warranty_target_snapshot.csv")
         source_snapshots["warranty_target_snapshot"] = warranty_target_snapshot
     else:
-        progress("Step 7/10: Skipping warranty target snapshot because warranty.csv is not available.")
+        progress("Step 8/11: Skipping warranty target snapshot because warranty.csv is not available.")
 
-    progress("Step 8/10: Writing source snapshot alignment summary...")
+    progress("Step 9/11: Writing source snapshot alignment summary...")
     write_source_alignment_summary(output_dir, backbone, source_snapshots)
 
-    progress("Step 9/10: Joining source snapshots into unified snapshot dataframe...")
+    progress("Step 10/11: Joining source snapshots into unified snapshot dataframe...")
     unified = backbone.copy()
     unified = unified.merge(fault_snapshot, on=["model_id", "snapshot_date"], how="left")
     unified = unified.merge(maintenance_snapshot, on=["model_id", "snapshot_date"], how="left")
     if operation_snapshot is not None:
         unified = unified.merge(operation_snapshot, on=["model_id", "snapshot_date"], how="left")
+    if fluid_sample_snapshot is not None:
+        unified = unified.merge(fluid_sample_snapshot, on=["model_id", "snapshot_date"], how="left")
     if warranty_target_snapshot is not None:
         unified = unified.merge(warranty_target_snapshot, on=["model_id", "snapshot_date"], how="left")
     elif "claim_next_45d" not in unified.columns:
         unified["claim_next_45d"] = np.nan
     progress(f"Unified snapshot shape before finalization: {unified.shape[0]:,} rows x {unified.shape[1]:,} columns")
 
-    progress("Step 10/10: Finalizing missing values and validating frozen features...")
+    progress("Step 11/11: Finalizing missing values and validating frozen features...")
     unified = finalize_snapshot_df(unified, feature_freeze_path=feature_freeze_path)
     write_mini_validation_outputs(unified, output_dir)
 
@@ -2023,6 +2315,7 @@ def main() -> None:
     machine_path = resolve_existing_path(cfg("MACHINE_PATH", INPUT_DIR / "machine.csv"), "MACHINE_PATH")
     maintenance_path = resolve_existing_path(cfg("MAINTENANCE_PATH", INPUT_DIR / "maintenance.csv"), "MAINTENANCE_PATH")
     operation_path = optional_existing_path(cfg("OPERATION_PATH", INPUT_DIR / "operation.csv"))
+    fluid_samples_path = optional_existing_path(cfg("FLUID_SAMPLES_PATH", INPUT_DIR / "fluid_samples.csv"))
     warranty_path = optional_existing_path(cfg("WARRANTY_PATH", INPUT_DIR / "warranty.csv"))
     feature_freeze_path = optional_existing_path(
         cfg("FEATURE_FREEZE_PATH", INPUT_DIR / "xgb_feature_freeze(all).csv")
@@ -2039,6 +2332,7 @@ def main() -> None:
     print(f"Target model families used for filtering: {', '.join(TARGET_MODEL_FAMILIES)}")
     print(f"Mini run enabled: {bool(cfg('MINI_RUN_ENABLED', False))}")
     print(f"Operation path: {operation_path if operation_path else 'not found'}")
+    print(f"Fluid samples path: {fluid_samples_path if fluid_samples_path else 'not found'}")
     print(f"Warranty path: {warranty_path if warranty_path else 'not found'}")
 
     df = build_snapshot_dataframe(
@@ -2046,6 +2340,7 @@ def main() -> None:
         machine_path=machine_path,
         maintenance_path=maintenance_path,
         operation_path=operation_path,
+        fluid_samples_path=fluid_samples_path,
         warranty_path=warranty_path,
         output_dir=OUTPUT_DIR,
         feature_freeze_path=feature_freeze_path,
@@ -2064,6 +2359,7 @@ def main() -> None:
         "source_snapshot_dir": str(SOURCE_SNAPSHOT_DIR),
         "canonical_backbone": "machine.csv model_id + snapshot_date",
         "operation_path": str(operation_path) if operation_path else None,
+        "fluid_samples_path": str(fluid_samples_path) if fluid_samples_path else None,
         "warranty_path": str(warranty_path) if warranty_path else None,
     }
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -3,4 +3,5 @@ machine,358878,358878,0,3,3,0,,0,0,0
 fault_codes,682641,682641,0,38,38,0,,376907,376907,0
 maintenance,245640,245640,0,27,26,1,related_component_2,555628,309988,0
 operation,1815979,1815979,0,109,109,0,,3790438,3790438,0
+fluid_samples,43186,43186,0,47,43,4,"Sediment_Sediment_MG_PER_L, Solids_Solids_PERCENT, Soot_Soot_Abs, Soot_Soot_ABS_PER_CM",513094,340350,0
 warranty,8484,8484,0,9,9,0,,69,87,18

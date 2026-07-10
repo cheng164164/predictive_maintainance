@@ -1,9 +1,9 @@
 {
-  "job_name": "snapshot-build-cpu-20260709-141737",
-  "returned_job_name": "snapshot-build-cpu-20260709-141737",
-  "output_uri": "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/snapshot-build-cpu-20260709-141737/",
-  "submitted_at_utc": "2026-07-09T14:24:44.922309+00:00",
-  "studio_url": "https://ml.azure.com/runs/snapshot-build-cpu-20260709-141737?wsid=/subscriptions/7f07baf7-8bba-4b88-b300-74ba5b15f52d/resourcegroups/ai-servicecontroltower/workspaces/ai-controltower-aml&tid=58be8688-6625-4e52-80d8-c17f3a9ae08a",
+  "job_name": "snapshot-build-cpu-20260710-022542",
+  "returned_job_name": "snapshot-build-cpu-20260710-022542",
+  "output_uri": "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/snapshot-build-cpu-20260710-022542/",
+  "submitted_at_utc": "2026-07-10T02:34:19.912204+00:00",
+  "studio_url": "https://ml.azure.com/runs/snapshot-build-cpu-20260710-022542?wsid=/subscriptions/7f07baf7-8bba-4b88-b300-74ba5b15f52d/resourcegroups/ai-servicecontroltower/workspaces/ai-controltower-aml&tid=58be8688-6625-4e52-80d8-c17f3a9ae08a",
   "experiment_name": "snapshot-build",
   "compute_target": "cpu",
   "compute": "tan-dev-cpu-cluster",
@@ -12,5 +12,5 @@
   "resource_group": "ai-servicecontroltower",
   "workspace_name": "ai-controltower-aml",
   "output_base_uri": "azureml://datastores/workspaceblobstore/paths/service_controltower/snapshot_build_outputs/",
-  "mini_run_enabled": true
+  "mini_run_enabled": false
 }

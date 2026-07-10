@@ -352,6 +352,96 @@ operation,cleaned,movement_invalid_flag,int64,1815979,0,0.0,0,1815979,1,0 | 0 | 
 operation,cleaned,shift_mode_invalid_flag,int64,1815979,0,0.0,0,1815979,1,0 | 0 | 0
 operation,cleaned,travel_gt_working_flag,int64,1815979,0,0.0,0,1815979,2,0 | 0 | 0
 operation,cleaned,shift_mode_sum_gt_travel_flag,int64,1815979,0,0.0,0,1815979,2,0 | 0 | 0
+fluid_samples,raw,fluid_sample_key,object,43186,0,0.0,0,43186,43186,D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50AD - 521059 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DG - 646826 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DP - 642791
+fluid_samples,raw,fluid_sample_key_samples,object,43186,0,0.0,0,43186,43186,D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50AD - 521059 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DG - 646826 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DP - 642791
+fluid_samples,raw,fluid_sample_key_samples2,object,43186,5,0.0116,0,43181,43181,D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50AD - 521059 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DG - 646826 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DP - 642791
+fluid_samples,raw,FULL_MODEL,object,43186,0,0.0,0,43186,5,D71EX-24 | D71EX-24 | D71EX-24
+fluid_samples,raw,SERIAL,int64,43186,0,0.0,0,43186,2326,70155 | 70155 | 70155
+fluid_samples,raw,machine_id,object,43186,0,0.0,0,43186,2326,D71EX-24 70155 | D71EX-24 70155 | D71EX-24 70155
+fluid_samples,raw,PRODUCT_TYPE,object,43186,0,0.0,0,43186,1,CRAWLER DOZER | CRAWLER DOZER | CRAWLER DOZER
+fluid_samples,raw,TELEMETRY_SMR_NUMERIC,float64,43186,0,0.0,0,43186,2315,5982.52 | 5982.52 | 5982.52
+fluid_samples,raw,IS_ACTIVE,bool,43186,0,0.0,0,43186,1,True | True | True
+fluid_samples,raw,LAB_NAME,object,43186,0,0.0,0,43186,5,NORTHAMERICA-FLUIDLIFE | NORTHAMERICA-FLUIDLIFE | NORTHAMERICA-FLUIDLIFE
+fluid_samples,raw,LABS_SAMPLE_NUMBER,object,43186,0,0.0,0,43186,43180,50AD - 521059 | 50DG - 646826 | 50DP - 642791
+fluid_samples,raw,sample_drawn_date,object,43186,5,0.0116,0,43181,1597,2022-03-09 | 2023-08-14 | 2022-12-28
+fluid_samples,raw,sample_result_severity_order,int64,43186,0,0.0,0,43186,6,2 | 0 | 0
+fluid_samples,raw,all_result_row_count,int64,43186,0,0.0,0,43186,28,27 | 27 | 27
+fluid_samples,raw,all_distinct_lab_result_key_count,int64,43186,0,0.0,0,43186,28,27 | 27 | 27
+fluid_samples,raw,all_distinct_feature_ready_key_count,int64,43186,0,0.0,0,43186,28,27 | 27 | 27
+fluid_samples,raw,phase1_feature_count,int64,43186,0,0.0,0,43186,13,16 | 16 | 16
+fluid_samples,raw,phase1_numeric_feature_count,int64,43186,0,0.0,0,43186,14,14 | 14 | 14
+fluid_samples,raw,phase1_source_row_count,int64,43186,0,0.0,0,43186,13,16 | 16 | 16
+fluid_samples,raw,phase1_features_with_multiple_source_rows,int64,43186,0,0.0,0,43186,2,0 | 0 | 0
+fluid_samples,raw,phase1_features_with_multiple_lab_result_keys,int64,43186,0,0.0,0,43186,2,0 | 0 | 0
+fluid_samples,raw,Ag_Silver_PPM,float64,43186,593,1.3731,0,42593,124,0.0 | 0.0 | 0.0
+fluid_samples,raw,Al_Aluminum_PPM,float64,43186,564,1.306,0,42622,372,1.0 | 0.0 | 5.0
+fluid_samples,raw,Cr_Chromium_PPM,float64,43186,637,1.475,0,42549,177,0.0 | 0.0 | 1.0
+fluid_samples,raw,Cu_Copper_PPM,float64,43186,564,1.306,0,42622,512,10.0 | 6.0 | 2.0
+fluid_samples,raw,EthyleneGlycol_Ethylene_Glycol_PERCENT,float64,43186,43101,99.8032,0,85,9,0.005 | 0.005 | 0.005
+fluid_samples,raw,Fe_Iron_PPM,float64,43186,564,1.306,0,42622,1308,5.0 | 5.0 | 32.0
+fluid_samples,raw,Fuel_Fuel_PERCENT,float64,43186,41926,97.0824,0,1260,202,4.66 | 1.0 | 1.0
+fluid_samples,raw,Gly_Glycol_PERCENT,float64,43186,42680,98.8283,0,506,101,0.005 | 0.005 | 52.8
+fluid_samples,raw,K_Potassium_PPM,float64,43186,564,1.306,0,42622,375,3.0 | 1.0 | 2.0
+fluid_samples,raw,Li_Lithium_PPM,float64,43186,5169,11.9692,0,38017,8,0.0 | 0.0 | 0.0
+fluid_samples,raw,Na_Sodium_PPM,float64,43186,564,1.306,0,42622,335,2.0 | 3.0 | 2.0
+fluid_samples,raw,Ni_Nickel_PPM,float64,43186,639,1.4796,0,42547,123,0.0 | 0.0 | 0.0
+fluid_samples,raw,Pb_Lead_PPM,float64,43186,564,1.306,0,42622,134,4.0 | 2.0 | 0.0
+fluid_samples,raw,PolypropyleneGlycol_Polypropylene_Glycol_PERCENT,float64,43186,43101,99.8032,0,85,1,0.005 | 0.005 | 0.005
+fluid_samples,raw,Sediment_Sediment_MG_PER_L,float64,43186,43186,100.0,0,0,0,
+fluid_samples,raw,Si_Silicon_PPM,float64,43186,564,1.306,0,42622,914,14.0 | 14.0 | 31.0
+fluid_samples,raw,Sn_Tin_PPM,float64,43186,565,1.3083,0,42621,143,0.0 | 0.0 | 0.0
+fluid_samples,raw,Solids_Solids_PERCENT,float64,43186,43186,100.0,0,0,0,
+fluid_samples,raw,Soot_Soot_Abs,float64,43186,43186,100.0,0,0,0,
+fluid_samples,raw,Soot_Soot_Abs_cm,float64,43186,42063,97.3996,0,1123,15,0.7 | 0.6 | 0.1
+fluid_samples,raw,Soot_Soot_ABS_PER_CM,float64,43186,43186,100.0,0,0,0,
+fluid_samples,raw,Soot_Soot_METHOD_DEPENDENT,float64,43186,42675,98.8167,0,511,14,0.1 | 0.3 | 0.05
+fluid_samples,raw,Soot_Soot_PERCENT,float64,43186,34291,79.403,0,8895,188,0.4 | 0.64 | 0.45
+fluid_samples,raw,Ti_Titanium_PPM,float64,43186,632,1.4634,0,42554,190,1.0 | 1.0 | 1.0
+fluid_samples,raw,V_Vanadium_PPM,float64,43186,645,1.4935,0,42541,115,0.0 | 0.0 | 0.0
+fluid_samples,raw,Water_Water_PERCENT,float64,43186,37675,87.2389,0,5511,72,0.05 | 0.05 | 0.05
+fluid_samples,cleaned,fluid_sample_key,string,43186,0,0.0,0,43186,43186,D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50AD - 521059 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DG - 646826 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DP - 642791
+fluid_samples,cleaned,fluid_sample_key_samples,string,43186,0,0.0,0,43186,43186,D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50AD - 521059 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DG - 646826 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DP - 642791
+fluid_samples,cleaned,fluid_sample_key_samples2,string,43186,5,0.0116,0,43181,43181,D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50AD - 521059 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DG - 646826 | D71EX-24 70155||NORTHAMERICA-FLUIDLIFE||50DP - 642791
+fluid_samples,cleaned,FULL_MODEL,string,43186,0,0.0,0,43186,5,D71EX-24 | D71EX-24 | D71EX-24
+fluid_samples,cleaned,SERIAL,int64,43186,0,0.0,0,43186,2326,70155 | 70155 | 70155
+fluid_samples,cleaned,machine_id,string,43186,0,0.0,0,43186,2326,D71EX-24 70155 | D71EX-24 70155 | D71EX-24 70155
+fluid_samples,cleaned,PRODUCT_TYPE,string,43186,0,0.0,0,43186,1,CRAWLER DOZER | CRAWLER DOZER | CRAWLER DOZER
+fluid_samples,cleaned,TELEMETRY_SMR_NUMERIC,float64,43186,0,0.0,0,43186,2315,5982.52 | 5982.52 | 5982.52
+fluid_samples,cleaned,IS_ACTIVE,bool,43186,0,0.0,0,43186,1,True | True | True
+fluid_samples,cleaned,LAB_NAME,string,43186,0,0.0,0,43186,5,NORTHAMERICA-FLUIDLIFE | NORTHAMERICA-FLUIDLIFE | NORTHAMERICA-FLUIDLIFE
+fluid_samples,cleaned,LABS_SAMPLE_NUMBER,string,43186,0,0.0,0,43186,43180,50AD - 521059 | 50DG - 646826 | 50DP - 642791
+fluid_samples,cleaned,sample_drawn_date,string,43186,5,0.0116,0,43181,1597,2022-03-09 | 2023-08-14 | 2022-12-28
+fluid_samples,cleaned,sample_result_severity_order,int64,43186,0,0.0,0,43186,6,2 | 0 | 0
+fluid_samples,cleaned,all_result_row_count,int64,43186,0,0.0,0,43186,28,27 | 27 | 27
+fluid_samples,cleaned,all_distinct_lab_result_key_count,int64,43186,0,0.0,0,43186,28,27 | 27 | 27
+fluid_samples,cleaned,all_distinct_feature_ready_key_count,int64,43186,0,0.0,0,43186,28,27 | 27 | 27
+fluid_samples,cleaned,phase1_feature_count,int64,43186,0,0.0,0,43186,13,16 | 16 | 16
+fluid_samples,cleaned,phase1_numeric_feature_count,int64,43186,0,0.0,0,43186,14,14 | 14 | 14
+fluid_samples,cleaned,phase1_source_row_count,int64,43186,0,0.0,0,43186,13,16 | 16 | 16
+fluid_samples,cleaned,phase1_features_with_multiple_source_rows,int64,43186,0,0.0,0,43186,2,0 | 0 | 0
+fluid_samples,cleaned,phase1_features_with_multiple_lab_result_keys,int64,43186,0,0.0,0,43186,2,0 | 0 | 0
+fluid_samples,cleaned,Ag_Silver_PPM,float64,43186,593,1.3731,0,42593,124,0.0 | 0.0 | 0.0
+fluid_samples,cleaned,Al_Aluminum_PPM,float64,43186,564,1.306,0,42622,372,1.0 | 0.0 | 5.0
+fluid_samples,cleaned,Cr_Chromium_PPM,float64,43186,637,1.475,0,42549,177,0.0 | 0.0 | 1.0
+fluid_samples,cleaned,Cu_Copper_PPM,float64,43186,564,1.306,0,42622,512,10.0 | 6.0 | 2.0
+fluid_samples,cleaned,EthyleneGlycol_Ethylene_Glycol_PERCENT,float64,43186,43101,99.8032,0,85,9,0.005 | 0.005 | 0.005
+fluid_samples,cleaned,Fe_Iron_PPM,float64,43186,564,1.306,0,42622,1308,5.0 | 5.0 | 32.0
+fluid_samples,cleaned,Fuel_Fuel_PERCENT,float64,43186,41926,97.0824,0,1260,202,4.66 | 1.0 | 1.0
+fluid_samples,cleaned,Gly_Glycol_PERCENT,float64,43186,42680,98.8283,0,506,101,0.005 | 0.005 | 52.8
+fluid_samples,cleaned,K_Potassium_PPM,float64,43186,564,1.306,0,42622,375,3.0 | 1.0 | 2.0
+fluid_samples,cleaned,Li_Lithium_PPM,float64,43186,5169,11.9692,0,38017,8,0.0 | 0.0 | 0.0
+fluid_samples,cleaned,Na_Sodium_PPM,float64,43186,564,1.306,0,42622,335,2.0 | 3.0 | 2.0
+fluid_samples,cleaned,Ni_Nickel_PPM,float64,43186,639,1.4796,0,42547,123,0.0 | 0.0 | 0.0
+fluid_samples,cleaned,Pb_Lead_PPM,float64,43186,564,1.306,0,42622,134,4.0 | 2.0 | 0.0
+fluid_samples,cleaned,PolypropyleneGlycol_Polypropylene_Glycol_PERCENT,float64,43186,43101,99.8032,0,85,1,0.005 | 0.005 | 0.005
+fluid_samples,cleaned,Si_Silicon_PPM,float64,43186,564,1.306,0,42622,914,14.0 | 14.0 | 31.0
+fluid_samples,cleaned,Sn_Tin_PPM,float64,43186,565,1.3083,0,42621,143,0.0 | 0.0 | 0.0
+fluid_samples,cleaned,Soot_Soot_Abs_cm,float64,43186,42063,97.3996,0,1123,15,0.7 | 0.6 | 0.1
+fluid_samples,cleaned,Soot_Soot_METHOD_DEPENDENT,float64,43186,42675,98.8167,0,511,14,0.1 | 0.3 | 0.05
+fluid_samples,cleaned,Soot_Soot_PERCENT,float64,43186,34291,79.403,0,8895,188,0.4 | 0.64 | 0.45
+fluid_samples,cleaned,Ti_Titanium_PPM,float64,43186,632,1.4634,0,42554,190,1.0 | 1.0 | 1.0
+fluid_samples,cleaned,V_Vanadium_PPM,float64,43186,645,1.4935,0,42541,115,0.0 | 0.0 | 0.0
+fluid_samples,cleaned,Water_Water_PERCENT,float64,43186,37675,87.2389,0,5511,72,0.05 | 0.05 | 0.05
 warranty,raw,machine_id,object,8484,0,0.0,0,8484,1961,D71EX-24-70155 | D71EX-24-70155 | D71EX-24-70163
 warranty,raw,claim_number,int64,8484,0,0.0,0,8484,8484,2208000 | 2158501 | 2624264
 warranty,raw,local_date,object,8484,0,0.0,0,8484,1425,2022-01-18 | 2021-08-26 | 2026-03-17

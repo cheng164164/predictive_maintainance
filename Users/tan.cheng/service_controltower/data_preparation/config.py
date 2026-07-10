@@ -60,6 +60,7 @@ MACHINE_PATH = INPUT_DIR / "machine.csv"
 FAULT_CODES_PATH = INPUT_DIR / "fault_codes.csv"
 MAINTENANCE_PATH = INPUT_DIR / "maintenance.csv"
 OPERATION_PATH = INPUT_DIR / "operation.csv"
+FLUID_SAMPLES_PATH = INPUT_DIR / "fluid_samples.csv"
 WARRANTY_PATH = INPUT_DIR / "warranty.csv"
 
 # Updated feature freeze file. Keep both names supported for local experiments.
@@ -99,6 +100,7 @@ MIN_SNAPSHOT_DATE = None
 MAX_SNAPSHOT_DATE = None
 HORIZON_DAYS = 45
 SNAPSHOT_FREQ_DAYS = 14
+FLUID_SAMPLE_LOOKBACK_DAYS = 365
 WRITE_CLEANING_REPORTS = True
 PROGRESS_EVERY_MACHINES = 100
 
@@ -110,7 +112,7 @@ INCLUDE_QA_HELPER_COLUMNS = True
 # -----------------------------------------------------------------------------
 # Local mini-run settings
 # -----------------------------------------------------------------------------
-MINI_RUN_ENABLED = True
+MINI_RUN_ENABLED = False
 MINI_RUN_MACHINE_COUNT = 2
 MINI_RUN_MODEL_IDS = []
 MAX_MACHINES = None
@@ -123,6 +125,14 @@ MAX_MACHINES = None
 #   cpu -> ai-controltower-aml / tan-dev-cpu-cluster
 #   gpu -> ehs-safety-aml / tan-dev-gpu
 AML_COMPUTE_TARGET = "cpu"  # options: "cpu", "gpu"
+
+# Optional global/legacy overrides. Leave these blank when using separate
+# CPU/GPU workspace settings below.
+AML_SUBSCRIPTION_ID = ""
+AML_RESOURCE_GROUP = ""
+AML_WORKSPACE_NAME = ""
+AML_COMPUTE_NAME = ""
+AML_ENVIRONMENT = ""
 
 # CPU AML workspace and compute.
 AML_CPU_SUBSCRIPTION_ID = "7f07baf7-8bba-4b88-b300-74ba5b15f52d"
@@ -161,7 +171,7 @@ AML_AUTH_MODE = "azure_cli"
 
 # AML mini-run settings are separate from local mini-run settings. These values
 # are sent to the remote job as environment variables.
-AML_MINI_RUN_ENABLED = True
+AML_MINI_RUN_ENABLED = False
 AML_MINI_RUN_MACHINE_COUNT = 2
 AML_MINI_RUN_MODEL_IDS = []
 
@@ -171,8 +181,8 @@ AML_MINI_RUN_MODEL_IDS = []
 # -----------------------------------------------------------------------------
 # Input data is already in Blob Storage. It is NOT uploaded as part of the code
 # package. The container should contain:
-#   machine.csv, fault_codes.csv, maintenance.csv, operation.csv, warranty.csv,
-#   xgb_feature_freeze(all).csv
+#   machine.csv, fault_codes.csv, maintenance.csv, operation.csv,
+#   fluid_samples.csv, warranty.csv, xgb_feature_freeze(all).csv
 AML_INPUT_DATA_URI = "wasbs://enriched-data@aicontroltower7969986141.blob.core.windows.net/"
 AML_INPUT_MODE = "download"  # options: download, ro_mount
 
