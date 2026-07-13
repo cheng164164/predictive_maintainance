@@ -1,4 +1,4 @@
-"""Step 03: run ANOVA, mutual information, and chi-squared feature rankings."""
+"""Step 03: run statistical rankings after confirmed correlation pruning."""
 from workflow import run_statistical_tests
 
 

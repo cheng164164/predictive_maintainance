@@ -412,6 +412,7 @@ def raw_feature_inventory(
             row.update(
                 {
                     "mean": float(sn.mean()) if sn.notna().any() else np.nan,
+                    "variance": float(sn.var()) if sn.notna().sum() > 1 else np.nan,
                     "std": float(sn.std()) if sn.notna().sum() > 1 else np.nan,
                     "min": float(sn.min()) if sn.notna().any() else np.nan,
                     "p25": float(sn.quantile(0.25)) if sn.notna().any() else np.nan,
@@ -433,6 +434,83 @@ def raw_feature_inventory(
                     row["mean_when_target_1"] = np.nan
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def identify_high_missing_features(
+    raw_missing: pd.DataFrame,
+    split_name: str,
+    threshold: float,
+) -> pd.DataFrame:
+    """Return source features whose raw missing rate exceeds a threshold.
+
+    Parameters
+    ----------
+    raw_missing:
+        Output of raw_missing_value_report across one or more dataset splits.
+    split_name:
+        Split used to make the feature-screening decision. In this project this
+        should be "feature_train" so future validation/test periods do not
+        influence which columns are removed.
+    threshold:
+        Missing-rate threshold expressed as a fraction, for example 0.90 means
+        drop features with more than 90% missing values in the decision split.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per feature exceeding the threshold, with the drop reason added.
+    """
+
+    if raw_missing.empty:
+        return pd.DataFrame()
+
+    decision_rows = raw_missing[raw_missing["split"] == split_name].copy()
+    if decision_rows.empty:
+        raise ValueError(f"Missingness report does not contain split '{split_name}'.")
+
+    decision_rows["missing_rate"] = decision_rows["missing_percent"] / 100.0
+    out = decision_rows[decision_rows["missing_rate"] > float(threshold)].copy()
+    if out.empty:
+        return out
+
+    out["drop_reason"] = (
+        "feature_train_missing_rate_gt_" + str(float(threshold))
+    )
+    return out.sort_values(["missing_rate", "feature"], ascending=[False, True]).reset_index(drop=True)
+
+
+def identify_zero_variance_features(raw_inventory: pd.DataFrame) -> pd.DataFrame:
+    """Return raw source features with no observed variation in feature_train.
+
+    Numeric columns are flagged when their non-missing values have zero variance
+    or, equivalently, one or fewer unique non-missing values. Non-numeric columns
+    are flagged when they have one or fewer unique non-missing values. This
+    source-level filter runs before preprocessing so downstream correlation and
+    model-based reports start from a smaller, cleaner feature set.
+    """
+
+    if raw_inventory.empty:
+        return raw_inventory.copy()
+
+    out = raw_inventory.copy()
+    unique_count = pd.to_numeric(out.get("unique_count"), errors="coerce").fillna(0)
+    variance = pd.to_numeric(out.get("variance"), errors="coerce")
+    is_numeric = out.get("is_numeric_raw", False)
+    if not isinstance(is_numeric, pd.Series):
+        is_numeric = pd.Series(bool(is_numeric), index=out.index)
+
+    out["is_zero_variance_or_constant"] = (
+        unique_count <= 1
+    ) | (
+        is_numeric.astype(bool) & variance.notna() & (variance == 0)
+    )
+    out["drop_reason"] = "zero_variance_or_constant_in_feature_train"
+
+    return (
+        out[out["is_zero_variance_or_constant"]]
+        .sort_values(["unique_count", "feature"], ascending=[True, True])
+        .reset_index(drop=True)
+    )
 
 
 def _safe_feature_name(name: str, existing: set) -> str:
@@ -729,11 +807,667 @@ def grouped_correlation_pairs(
             ]
         )
 
+
     return (
         pd.concat(all_pairs, ignore_index=True)
         .sort_values(["feature_group", "abs_correlation"], ascending=[True, False])
         .reset_index(drop=True)
     )
+
+
+def _feature_name_priority(name: str) -> float:
+    """Return a deterministic interpretability score used for correlation pruning.
+
+    The score is intentionally simple and transparent. It is not a model-based
+    importance score; it only helps choose a representative when two or more
+    features are highly correlated in feature_train.
+    """
+
+    s = str(name).lower()
+    score = 0.0
+
+    positive_patterns = [
+        ("severity_score", 30.0),
+        ("fault_count", 24.0),
+        ("occurrence", 18.0),
+        ("working_hours", 16.0),
+        ("engine_running", 15.0),
+        ("actual_work", 14.0),
+        ("remaining_hours", 13.0),
+        ("days_since", 12.0),
+        ("count", 10.0),
+        ("sum_", 8.0),
+        ("max_", 8.0),
+        ("mean_", 6.0),
+        ("smr", 5.0),
+    ]
+    negative_patterns = [
+        ("has_", -8.0),
+        ("flag", -8.0),
+        ("valid", -8.0),
+        ("observed_day_count", -6.0),
+        ("missing", -6.0),
+        ("unknown", -4.0),
+    ]
+
+    for pattern, value in positive_patterns:
+        if pattern in s:
+            score += value
+    for pattern, value in negative_patterns:
+        if pattern in s:
+            score += value
+
+    return score
+
+
+def prepared_feature_quality_table(
+    X: pd.DataFrame,
+    feature_map: pd.DataFrame,
+    raw_inventory: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Build transparent feature-quality scores for correlation pruning.
+
+    The output is used only to choose/recommend which feature to keep when a
+    correlation component or pair contains redundant features. The score favors
+    lower raw missingness, more observed variation, and more interpretable source
+    feature names. It does not use the target variable.
+    """
+
+    required_cols = {"prepared_feature", "source_feature", "feature_group"}
+    if not required_cols.issubset(feature_map.columns):
+        missing = sorted(required_cols - set(feature_map.columns))
+        raise ValueError(f"feature_map is missing required columns: {missing}")
+
+    fmap = feature_map[
+        ["prepared_feature", "source_feature", "feature_group"]
+    ].drop_duplicates("prepared_feature").copy()
+
+    prep_diag = prepared_feature_diagnostics(X)[
+        ["prepared_feature", "unique_count", "variance", "zero_rate", "is_constant_exact"]
+    ].rename(
+        columns={
+            "unique_count": "prepared_unique_count",
+            "variance": "prepared_variance",
+            "zero_rate": "prepared_zero_rate",
+        }
+    )
+    out = fmap.merge(prep_diag, on="prepared_feature", how="left")
+
+    if raw_inventory is not None and not raw_inventory.empty and "feature" in raw_inventory.columns:
+        raw_cols = [
+            c
+            for c in [
+                "feature",
+                "missing_rate",
+                "unique_count",
+                "variance",
+                "is_numeric_raw",
+            ]
+            if c in raw_inventory.columns
+        ]
+        raw = raw_inventory[raw_cols].drop_duplicates("feature").copy()
+        raw = raw.rename(
+            columns={
+                "feature": "source_feature",
+                "missing_rate": "raw_missing_rate",
+                "unique_count": "raw_unique_count",
+                "variance": "raw_variance",
+            }
+        )
+        out = out.merge(raw, on="source_feature", how="left")
+    else:
+        out["raw_missing_rate"] = np.nan
+        out["raw_unique_count"] = np.nan
+        out["raw_variance"] = np.nan
+        out["is_numeric_raw"] = np.nan
+
+    raw_missing = pd.to_numeric(out.get("raw_missing_rate"), errors="coerce").fillna(0.0)
+    raw_unique = pd.to_numeric(out.get("raw_unique_count"), errors="coerce").fillna(0.0)
+    prep_unique = pd.to_numeric(out.get("prepared_unique_count"), errors="coerce").fillna(0.0)
+    prep_variance = pd.to_numeric(out.get("prepared_variance"), errors="coerce").fillna(0.0)
+
+    name_priority = out.apply(
+        lambda row: _feature_name_priority(row.get("source_feature", ""))
+        + 0.25 * _feature_name_priority(row.get("prepared_feature", "")),
+        axis=1,
+    )
+
+    out["feature_name_priority_score"] = name_priority.astype(float)
+    out["correlation_pruning_score"] = (
+        -100.0 * raw_missing
+        + 2.0 * np.log1p(raw_unique)
+        + 1.0 * np.log1p(prep_unique)
+        + 0.01 * np.log1p(np.maximum(prep_variance, 0.0))
+        + out["feature_name_priority_score"]
+    )
+
+    return out.sort_values(
+        ["correlation_pruning_score", "prepared_feature"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def _connected_components_from_pairs(pairs: pd.DataFrame) -> List[List[str]]:
+    """Return connected components from feature_1/feature_2 pair rows."""
+
+    adjacency: Dict[str, set] = {}
+    if pairs.empty:
+        return []
+
+    for _, row in pairs.iterrows():
+        f1 = str(row["feature_1"])
+        f2 = str(row["feature_2"])
+        adjacency.setdefault(f1, set()).add(f2)
+        adjacency.setdefault(f2, set()).add(f1)
+
+    components: List[List[str]] = []
+    seen = set()
+    for start in sorted(adjacency):
+        if start in seen:
+            continue
+        stack = [start]
+        component = []
+        seen.add(start)
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbor in sorted(adjacency.get(node, [])):
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        components.append(sorted(component))
+    return components
+
+
+def _feature_quality_lookup(feature_quality: pd.DataFrame) -> Dict[str, dict]:
+    """Create a prepared_feature -> row dictionary from feature-quality output."""
+
+    if feature_quality.empty or "prepared_feature" not in feature_quality.columns:
+        return {}
+    return feature_quality.set_index("prepared_feature").to_dict(orient="index")
+
+
+def _pick_keep_feature(features: Sequence[str], feature_quality: pd.DataFrame) -> str:
+    """Choose one representative feature from a correlated feature set."""
+
+    lookup = _feature_quality_lookup(feature_quality)
+
+    def sort_key(feature: str) -> tuple:
+        q = lookup.get(feature, {})
+        score = q.get("correlation_pruning_score", -np.inf)
+        missing = q.get("raw_missing_rate", np.inf)
+        prep_unique = q.get("prepared_unique_count", -np.inf)
+        return (
+            float(score) if pd.notna(score) else -np.inf,
+            -float(missing) if pd.notna(missing) else -np.inf,
+            float(prep_unique) if pd.notna(prep_unique) else -np.inf,
+            str(feature),
+        )
+
+    return max(list(features), key=sort_key)
+
+
+def _max_abs_corr_involving_feature(pairs: pd.DataFrame, feature: str) -> float:
+    mask = (pairs["feature_1"] == feature) | (pairs["feature_2"] == feature)
+    vals = pd.to_numeric(pairs.loc[mask, "abs_correlation"], errors="coerce")
+    return float(vals.max()) if vals.notna().any() else np.nan
+
+
+def _abs_corr_between_features(pairs: pd.DataFrame, feature_a: str, feature_b: str) -> float:
+    mask = (
+        ((pairs["feature_1"] == feature_a) & (pairs["feature_2"] == feature_b))
+        | ((pairs["feature_1"] == feature_b) & (pairs["feature_2"] == feature_a))
+    )
+    vals = pd.to_numeric(pairs.loc[mask, "abs_correlation"], errors="coerce")
+    return float(vals.max()) if vals.notna().any() else np.nan
+
+
+def build_correlation_auto_prune_report(
+    corr_pairs: pd.DataFrame,
+    feature_quality: pd.DataFrame,
+    auto_drop_threshold: float,
+) -> pd.DataFrame:
+    """Build auto-pruning decisions for abs(correlation) >= threshold.
+
+    The function treats highly correlated pairs as a graph and keeps one
+    representative per connected component. All other features in that component
+    become auto-drop candidates. Only features appearing in pairs above the
+    threshold can be auto-dropped.
+    """
+
+    columns = [
+        "correlation_component_id",
+        "component_size",
+        "feature_group",
+        "prepared_feature",
+        "source_feature",
+        "recommendation_action",
+        "drop_confirmed",
+        "kept_prepared_feature",
+        "kept_source_feature",
+        "max_abs_correlation_in_component",
+        "max_abs_correlation_to_kept_feature",
+        "correlation_pruning_score",
+        "raw_missing_rate",
+        "prepared_unique_count",
+        "recommendation_reason",
+    ]
+    if corr_pairs.empty:
+        return pd.DataFrame(columns=columns)
+
+    high_pairs = corr_pairs[
+        pd.to_numeric(corr_pairs["abs_correlation"], errors="coerce") >= float(auto_drop_threshold)
+    ].copy()
+    if high_pairs.empty:
+        return pd.DataFrame(columns=columns)
+
+    q_lookup = _feature_quality_lookup(feature_quality)
+    rows = []
+    for i, component in enumerate(_connected_components_from_pairs(high_pairs), start=1):
+        component_pairs = high_pairs[
+            high_pairs["feature_1"].isin(component) & high_pairs["feature_2"].isin(component)
+        ].copy()
+        kept = _pick_keep_feature(component, feature_quality)
+        kept_source = q_lookup.get(kept, {}).get("source_feature")
+        component_id = f"C{i:04d}"
+        for feature in component:
+            q = q_lookup.get(feature, {})
+            is_keep = feature == kept
+            rows.append(
+                {
+                    "correlation_component_id": component_id,
+                    "component_size": len(component),
+                    "feature_group": q.get("feature_group"),
+                    "prepared_feature": feature,
+                    "source_feature": q.get("source_feature"),
+                    "recommendation_action": "keep" if is_keep else "drop",
+                    "drop_confirmed": bool(not is_keep),
+                    "kept_prepared_feature": kept,
+                    "kept_source_feature": kept_source,
+                    "max_abs_correlation_in_component": _max_abs_corr_involving_feature(component_pairs, feature),
+                    "max_abs_correlation_to_kept_feature": np.nan if is_keep else _abs_corr_between_features(component_pairs, feature, kept),
+                    "correlation_pruning_score": q.get("correlation_pruning_score"),
+                    "raw_missing_rate": q.get("raw_missing_rate"),
+                    "prepared_unique_count": q.get("prepared_unique_count"),
+                    "recommendation_reason": (
+                        f"Kept as representative of component with abs_corr >= {auto_drop_threshold:.2f}."
+                        if is_keep
+                        else f"Auto-drop: redundant with kept feature '{kept}' at abs_corr >= {auto_drop_threshold:.2f}."
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["correlation_component_id", "recommendation_action", "prepared_feature"],
+        ascending=[True, False, True],
+    ).reset_index(drop=True)
+
+
+def build_correlation_manual_review_report(
+    corr_pairs: pd.DataFrame,
+    feature_quality: pd.DataFrame,
+    review_threshold: float,
+    auto_drop_threshold: float,
+    auto_drop_features: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Build pair-level manual review choices for 0.90 <= abs(corr) < 0.95.
+
+    The default thresholds come from config.py. Each row represents one pairwise
+    choice and includes a recommended drop feature, but drop_confirmed is False
+    so the user can review before applying it downstream.
+    """
+
+    columns = [
+        "manual_pair_id",
+        "feature_group",
+        "feature_1",
+        "source_feature_1",
+        "feature_1_pruning_score",
+        "feature_1_raw_missing_rate",
+        "feature_2",
+        "source_feature_2",
+        "feature_2_pruning_score",
+        "feature_2_raw_missing_rate",
+        "correlation",
+        "abs_correlation",
+        "recommended_keep_feature",
+        "recommended_drop_feature",
+        "recommendation_reason",
+        "drop_confirmed",
+        "confirmed_drop_feature",
+        "review_notes",
+    ]
+    if corr_pairs.empty:
+        return pd.DataFrame(columns=columns)
+
+    abs_corr = pd.to_numeric(corr_pairs["abs_correlation"], errors="coerce")
+    review_pairs = corr_pairs[
+        (abs_corr >= float(review_threshold)) & (abs_corr < float(auto_drop_threshold))
+    ].copy()
+    if review_pairs.empty:
+        return pd.DataFrame(columns=columns)
+
+    q_lookup = _feature_quality_lookup(feature_quality)
+    auto_drop_set = set(auto_drop_features or [])
+    rows = []
+
+    for i, row in enumerate(
+        review_pairs.sort_values("abs_correlation", ascending=False).itertuples(index=False),
+        start=1,
+    ):
+        f1 = str(getattr(row, "feature_1"))
+        f2 = str(getattr(row, "feature_2"))
+        q1 = q_lookup.get(f1, {})
+        q2 = q_lookup.get(f2, {})
+        s1 = q1.get("correlation_pruning_score", -np.inf)
+        s2 = q2.get("correlation_pruning_score", -np.inf)
+
+        if f1 in auto_drop_set and f2 not in auto_drop_set:
+            keep_feature, drop_feature = f2, f1
+            reason = "Recommended because this feature is already auto-dropped in an abs_corr >= auto threshold component."
+        elif f2 in auto_drop_set and f1 not in auto_drop_set:
+            keep_feature, drop_feature = f1, f2
+            reason = "Recommended because this feature is already auto-dropped in an abs_corr >= auto threshold component."
+        elif float(s1 if pd.notna(s1) else -np.inf) >= float(s2 if pd.notna(s2) else -np.inf):
+            keep_feature, drop_feature = f1, f2
+            reason = "Recommended drop has lower correlation-pruning score based on missingness, variation, and name heuristics."
+        else:
+            keep_feature, drop_feature = f2, f1
+            reason = "Recommended drop has lower correlation-pruning score based on missingness, variation, and name heuristics."
+
+        rows.append(
+            {
+                "manual_pair_id": f"M{i:05d}",
+                "feature_group": getattr(row, "feature_group", None),
+                "feature_1": f1,
+                "source_feature_1": q1.get("source_feature"),
+                "feature_1_pruning_score": q1.get("correlation_pruning_score"),
+                "feature_1_raw_missing_rate": q1.get("raw_missing_rate"),
+                "feature_2": f2,
+                "source_feature_2": q2.get("source_feature"),
+                "feature_2_pruning_score": q2.get("correlation_pruning_score"),
+                "feature_2_raw_missing_rate": q2.get("raw_missing_rate"),
+                "correlation": getattr(row, "correlation"),
+                "abs_correlation": getattr(row, "abs_correlation"),
+                "recommended_keep_feature": keep_feature,
+                "recommended_drop_feature": drop_feature,
+                "recommendation_reason": reason,
+                "drop_confirmed": False,
+                "confirmed_drop_feature": "",
+                "review_notes": "Set drop_confirmed=True in the confirmed-drop template if you agree with this recommendation.",
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns).reset_index(drop=True)
+
+
+def build_correlation_confirmed_drop_template(
+    auto_prune_report: pd.DataFrame,
+    manual_review_report: pd.DataFrame,
+    feature_quality: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create the user-editable confirmed-drop template for downstream steps."""
+
+    columns = [
+        "prepared_feature",
+        "source_feature",
+        "feature_group",
+        "drop_confirmed",
+        "decision_source",
+        "pair_or_component_count",
+        "max_abs_correlation",
+        "recommendation_reason",
+        "review_notes",
+    ]
+    q_lookup = _feature_quality_lookup(feature_quality)
+    rows = []
+
+    if auto_prune_report is not None and not auto_prune_report.empty:
+        auto_drops = auto_prune_report[
+            auto_prune_report["recommendation_action"] == "drop"
+        ].copy()
+        for _, row in auto_drops.iterrows():
+            feature = row["prepared_feature"]
+            q = q_lookup.get(feature, {})
+            rows.append(
+                {
+                    "prepared_feature": feature,
+                    "source_feature": q.get("source_feature", row.get("source_feature")),
+                    "feature_group": q.get("feature_group", row.get("feature_group")),
+                    "drop_confirmed": True,
+                    "decision_source": "auto_ge_auto_threshold",
+                    "pair_or_component_count": 1,
+                    "max_abs_correlation": row.get("max_abs_correlation_in_component"),
+                    "recommendation_reason": row.get("recommendation_reason"),
+                    "review_notes": "Auto-confirmed. Change drop_confirmed to False if you want to keep it.",
+                }
+            )
+
+    if manual_review_report is not None and not manual_review_report.empty:
+        manual = manual_review_report.copy()
+        manual = manual[manual["recommended_drop_feature"].notna()]
+        manual = manual[manual["recommended_drop_feature"].astype(str).str.len() > 0]
+        if not manual.empty:
+            grouped = (
+                manual.groupby("recommended_drop_feature", dropna=False)
+                .agg(
+                    pair_or_component_count=("manual_pair_id", "count"),
+                    max_abs_correlation=("abs_correlation", "max"),
+                    example_keep_feature=("recommended_keep_feature", "first"),
+                    recommendation_reason=("recommendation_reason", "first"),
+                )
+                .reset_index()
+            )
+            existing_features = {r["prepared_feature"] for r in rows}
+            for _, row in grouped.iterrows():
+                feature = row["recommended_drop_feature"]
+                if feature in existing_features:
+                    continue
+                q = q_lookup.get(feature, {})
+                rows.append(
+                    {
+                        "prepared_feature": feature,
+                        "source_feature": q.get("source_feature"),
+                        "feature_group": q.get("feature_group"),
+                        "drop_confirmed": False,
+                        "decision_source": "manual_recommended_review_090_to_lt_auto_threshold",
+                        "pair_or_component_count": row.get("pair_or_component_count"),
+                        "max_abs_correlation": row.get("max_abs_correlation"),
+                        "recommendation_reason": (
+                            str(row.get("recommendation_reason"))
+                            + f" Example keep feature: {row.get('example_keep_feature')}."
+                        ),
+                        "review_notes": "Manual review needed. Change drop_confirmed to True if you agree.",
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["drop_confirmed", "max_abs_correlation", "prepared_feature"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+
+def build_correlation_pruning_reports(
+    corr_pairs: pd.DataFrame,
+    X: pd.DataFrame,
+    feature_map: pd.DataFrame,
+    raw_inventory: Optional[pd.DataFrame],
+    review_threshold: float,
+    auto_drop_threshold: float,
+) -> Dict[str, pd.DataFrame]:
+    """Build all correlation-pruning reports used by step 02."""
+
+    feature_quality = prepared_feature_quality_table(
+        X=X,
+        feature_map=feature_map,
+        raw_inventory=raw_inventory,
+    )
+
+    if corr_pairs.empty:
+        correlated_pairs = corr_pairs.copy()
+    else:
+        correlated_pairs = corr_pairs[
+            pd.to_numeric(corr_pairs["abs_correlation"], errors="coerce") >= float(review_threshold)
+        ].copy()
+        correlated_pairs = correlated_pairs.sort_values(
+            ["abs_correlation", "feature_group", "feature_1", "feature_2"],
+            ascending=[False, True, True, True],
+        ).reset_index(drop=True)
+
+    auto_prune = build_correlation_auto_prune_report(
+        corr_pairs=corr_pairs,
+        feature_quality=feature_quality,
+        auto_drop_threshold=auto_drop_threshold,
+    )
+    auto_drop_features = auto_prune.loc[
+        auto_prune.get("recommendation_action", pd.Series(dtype=str)) == "drop",
+        "prepared_feature",
+    ].tolist() if not auto_prune.empty else []
+
+    manual_review = build_correlation_manual_review_report(
+        corr_pairs=corr_pairs,
+        feature_quality=feature_quality,
+        review_threshold=review_threshold,
+        auto_drop_threshold=auto_drop_threshold,
+        auto_drop_features=auto_drop_features,
+    )
+    confirmed_template = build_correlation_confirmed_drop_template(
+        auto_prune_report=auto_prune,
+        manual_review_report=manual_review,
+        feature_quality=feature_quality,
+    )
+
+    return {
+        "feature_quality": feature_quality,
+        "correlated_pairs_ge_review_threshold": correlated_pairs,
+        "auto_prune_report": auto_prune,
+        "manual_review_report": manual_review,
+        "confirmed_drop_template": confirmed_template,
+    }
+
+
+def _normalize_confirmation_value(value) -> bool:
+    """Normalize editable CSV values such as True/yes/1/drop to bool."""
+
+    if isinstance(value, bool):
+        return value
+    if pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "t", "1", "yes", "y", "drop", "confirmed"}
+
+
+def load_confirmed_correlation_drop_features(path: Path) -> pd.DataFrame:
+    """Load a user-edited correlation drop file.
+
+    If a drop_confirmed column exists, only truthy rows are used. If the file is
+    a plain one-column list without drop_confirmed, every listed feature is
+    treated as confirmed. The output always contains a prepared_feature column.
+    """
+
+    columns = ["prepared_feature", "drop_confirmed", "decision_source", "load_source"]
+    if path is None or not Path(path).exists():
+        return pd.DataFrame(columns=columns)
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    candidate_cols = [
+        "prepared_feature",
+        "drop_feature",
+        "feature",
+        "recommended_drop_feature",
+        "confirmed_drop_feature",
+    ]
+    feature_col = next((c for c in candidate_cols if c in df.columns), None)
+    if feature_col is None:
+        raise ValueError(
+            f"Confirmed correlation drop file does not contain one of these columns: {candidate_cols}. Path: {path}"
+        )
+
+    if "drop_confirmed" in df.columns:
+        confirmed_mask = df["drop_confirmed"].apply(_normalize_confirmation_value)
+    else:
+        confirmed_mask = pd.Series(True, index=df.index)
+
+    out = df.loc[confirmed_mask].copy()
+    out["prepared_feature"] = out[feature_col].astype(str).str.strip()
+
+    if "confirmed_drop_feature" in df.columns and feature_col != "confirmed_drop_feature":
+        extra = df.loc[confirmed_mask, ["confirmed_drop_feature"]].copy()
+        extra["prepared_feature"] = extra["confirmed_drop_feature"].astype(str).str.strip()
+        extra = extra[extra["prepared_feature"].notna()]
+        extra = extra[~extra["prepared_feature"].isin(["", "nan", "None"])]
+        if not extra.empty:
+            for col in out.columns:
+                if col not in extra.columns:
+                    extra[col] = np.nan
+            out = pd.concat([out, extra[out.columns]], ignore_index=True)
+
+    out = out[out["prepared_feature"].notna()]
+    out = out[~out["prepared_feature"].isin(["", "nan", "None"])]
+    out["drop_confirmed"] = True
+    if "decision_source" not in out.columns:
+        out["decision_source"] = "manual_confirmed"
+    out["load_source"] = str(path)
+
+    return out.drop_duplicates("prepared_feature").reset_index(drop=True)
+
+
+def drop_prepared_features(
+    prepared: PreparedData,
+    drop_features: Sequence[str],
+) -> Tuple[PreparedData, pd.DataFrame]:
+    """Return a PreparedData object with selected prepared columns removed."""
+
+    requested = sorted({str(f).strip() for f in drop_features if str(f).strip()})
+    existing = [f for f in requested if f in prepared.X_feature_train.columns]
+    missing = [f for f in requested if f not in prepared.X_feature_train.columns]
+
+    audit_rows = []
+    for feature in existing:
+        audit_rows.append(
+            {
+                "prepared_feature": feature,
+                "drop_requested": True,
+                "drop_applied": True,
+                "status": "dropped",
+            }
+        )
+    for feature in missing:
+        audit_rows.append(
+            {
+                "prepared_feature": feature,
+                "drop_requested": True,
+                "drop_applied": False,
+                "status": "not_found_in_current_prepared_matrix",
+            }
+        )
+    audit = pd.DataFrame(
+        audit_rows,
+        columns=["prepared_feature", "drop_requested", "drop_applied", "status"],
+    )
+
+    if not existing:
+        return prepared, audit
+
+    new_feature_map = prepared.feature_map[
+        ~prepared.feature_map["prepared_feature"].isin(existing)
+    ].copy().reset_index(drop=True)
+
+    return PreparedData(
+        X_feature_train=prepared.X_feature_train.drop(columns=existing),
+        X_feature_holdout=prepared.X_feature_holdout.drop(columns=existing),
+        X_validation=prepared.X_validation.drop(columns=existing),
+        X_test=prepared.X_test.drop(columns=existing),
+        feature_map=new_feature_map,
+        numeric_input_cols=list(prepared.numeric_input_cols),
+        categorical_input_cols=list(prepared.categorical_input_cols),
+        preprocessor=prepared.preprocessor,
+    ), audit
 
 
 def _check_binary_target(y: pd.Series) -> Tuple[bool, str]:

@@ -14,6 +14,8 @@ By default, `config.py` expects the production unified snapshot dataframe here:
 
 This matches the project layout where `feature_selection/` sits beside `data_preparation/` under the same project root.
 
+`config.py` also drops these sparse fluid-sample metadata columns immediately after loading the snapshot dataframe, so older snapshot CSVs can be used without rebuilding the snapshot: `days_since_last_fluid_sample`, `fluid_sample_severity_max_365d`, and `fluid_sample_latest_smr`.
+
 Supported input types:
 
 - CSV
@@ -69,12 +71,25 @@ output/
 
 ### 00_prepare_data.py
 
-Creates the reusable data audit outputs:
+Creates the reusable data audit outputs and applies the first early feature-quality filter.
+
+This step now removes raw source columns whose **feature_train missing rate is greater than 90%** before preprocessing and downstream methods. The threshold is controlled in `config.py`:
+
+```python
+DROP_FEATURES_WITH_HIGH_MISSINGNESS = True
+HIGH_MISSINGNESS_THRESHOLD = 0.90
+```
+
+Main outputs include:
 
 - chronological training / validation / test split summary
 - inner `feature_train` / `feature_selection_holdout` split summary
-- candidate feature list
+- initial candidate feature list before early filters
+- final candidate feature list after early filters
 - raw missing-value counts and percentages before preprocessing
+- dropped high-missingness feature report
+- dropped zero-variance feature report
+- preselection filter summary
 - prepared feature mapping after imputation / one-hot encoding
 - feature group assignment review
 
@@ -86,11 +101,21 @@ output/00_prepare_data
 
 ### 01_unsupervised_selection.py
 
-Creates unsupervised diagnostics without applying any keep/drop threshold:
+Creates source-level unsupervised diagnostics and applies the second early feature-quality filter.
 
-- raw feature inventory on `feature_train`
-- prepared feature diagnostics after preprocessing
-- exact constant prepared feature report
+This step removes raw source columns that are **constant / zero-variance in feature_train** before correlation, statistical tests, XGBoost, permutation, and SHAP are run. The behavior is controlled in `config.py`:
+
+```python
+DROP_ZERO_VARIANCE_FEATURES = True
+```
+
+Main outputs include:
+
+- raw feature inventory after the high-missingness filter
+- dropped zero-variance / constant raw feature report
+- raw feature inventory after both early filters
+- prepared feature diagnostics after both early filters
+- constant prepared feature check after both early filters
 
 Output folder:
 
@@ -101,6 +126,8 @@ output/01_unsupervised_selection
 ### 02_correlation_analysis.py
 
 Runs grouped correlation analysis within configured feature groups only.
+
+This step starts from the smaller prepared feature set after the high-missingness and zero-variance filters have already been applied.
 
 Output folder:
 
@@ -120,6 +147,8 @@ Runs supervised univariate statistical filters on `feature_train` only:
 - ANOVA F-test
 - mutual information
 - chi-squared after min-max scaling
+
+This step also uses the smaller feature set after the early quality filters.
 
 Output folder:
 
@@ -185,7 +214,7 @@ Output folder:
 output/07_consensus_report
 ```
 
-The consensus step does not apply a final keep/drop threshold. It combines available ranks for review only.
+The consensus step does not apply a final importance-based keep/drop threshold. It combines available ranks for review only.
 
 ## Split design
 
@@ -203,7 +232,8 @@ full dataset
 `feature_train` is used for:
 
 - preprocessing fit
-- unsupervised diagnostics
+- high-missingness feature screening
+- zero-variance / constant feature screening
 - grouped correlation
 - ANOVA
 - mutual information
@@ -241,7 +271,12 @@ Fluid/oil patterns are intentionally specific, for example `Fe_Iron_PPM`, `Fuel_
 
 ## Important behavior
 
-The workflow does **not** produce a final keep/drop feature freeze. It saves ranked reports and diagnostics so you can manually review the evidence before choosing thresholds or final feature subsets.
+The workflow now applies two early source-level quality filters before downstream methods:
+
+1. Drop features with more than 90% missing values in `feature_train`.
+2. Drop features that are constant / zero-variance in `feature_train`.
+
+The workflow still does **not** produce a final importance-based feature freeze. It saves ranked reports and diagnostics so you can manually review correlation, statistical tests, XGBoost, permutation, and SHAP evidence before choosing final thresholds or feature subsets.
 
 Each step writes a `step_run_summary.json` file in its output folder.
 
@@ -249,8 +284,8 @@ Each step writes a `step_run_summary.json` file in its output folder.
 
 - `config.py`: editable run configuration.
 - `workflow.py`: shared workflow implementation used by all step scripts.
-- `00_prepare_data.py`: split, missingness, candidate feature, and feature-map reports.
-- `01_unsupervised_selection.py`: raw inventory, prepared diagnostics, constant feature report.
+- `00_prepare_data.py`: split, missingness, high-missingness filter, candidate feature, and feature-map reports.
+- `01_unsupervised_selection.py`: raw inventory, zero-variance filter, prepared diagnostics, constant feature reports.
 - `02_correlation_analysis.py`: grouped within-source correlation analysis.
 - `03_statistical_tests.py`: ANOVA, mutual information, chi-squared.
 - `04_xgboost_importance.py`: XGBoost built-in feature importance.

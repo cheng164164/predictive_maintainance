@@ -1896,8 +1896,22 @@ def validate_source_snapshot_alignment(source_name: str, backbone: pd.DataFrame,
 
 
 def finalize_snapshot_df(df: pd.DataFrame, feature_freeze_path: Optional[str | Path] = None) -> pd.DataFrame:
-    """Fill feature missing values and order columns for model training."""
+    """Fill feature missing values and order columns for model training.
+
+    The three fluid-sample metadata columns below are useful for QA while
+    building the source snapshot, but they are intentionally removed from the
+    unified modeling dataframe for now. They are sparse in the current data and
+    are not part of the frozen model feature list, so dropping them here prevents
+    them from flowing into downstream feature-selection runs.
+    """
     out = df.copy()
+
+    fluid_metadata_cols_to_drop = [
+        "days_since_last_fluid_sample",
+        "fluid_sample_severity_max_365d",
+        "fluid_sample_latest_smr",
+    ]
+    out = out.drop(columns=[c for c in fluid_metadata_cols_to_drop if c in out.columns])
 
     for col in FROZEN_FEATURES:
         if col not in out.columns:

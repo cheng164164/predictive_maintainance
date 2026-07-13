@@ -1,4 +1,4 @@
-"""Step 02: run grouped within-source correlation analysis."""
+"""Step 02: run grouped correlation analysis and create auto/manual pruning files."""
 from workflow import run_correlation_analysis
 
 
