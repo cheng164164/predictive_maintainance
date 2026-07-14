@@ -1,12 +1,11 @@
 """Step 00: create chronological train / validation / test split reports."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pandas as pd
 
 import config
 from ml_utils import (
+    apply_sentinel_cleaning,
     chronological_split,
     ensure_dir,
     make_split_summary,
@@ -18,7 +17,6 @@ from ml_utils import (
 )
 
 
-
 def _ordered_unique(values):
     out = []
     for value in values:
@@ -27,13 +25,39 @@ def _ordered_unique(values):
     return out
 
 
-def _export_reduced_snapshot_dataframe(df, split, step_dir):
-    """Optionally save a source-level snapshot dataframe for one model variant."""
+def _load_and_prepare_snapshot():
+    """Load snapshot data, apply configured early drops, and clean 9999 sentinels."""
+
+    df = read_snapshot(config.INPUT_DATA_PATH, config.DATE_COL)
+
+    source_cols_to_drop = [
+        c for c in getattr(config, "SOURCE_COLUMNS_TO_DROP_BEFORE_MODELING", []) if c in df.columns
+    ]
+    if source_cols_to_drop:
+        df = df.drop(columns=source_cols_to_drop)
+
+    df, sentinel_report = apply_sentinel_cleaning(
+        df=df,
+        enabled=getattr(config, "SENTINEL_CLEANING_ENABLED", False),
+        sentinel_value=getattr(config, "SENTINEL_VALUE", 9999),
+        columns_to_clean=getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}),
+        replace_with=getattr(config, "SENTINEL_REPLACE_WITH", None),
+    )
+    return df, source_cols_to_drop, sentinel_report
+
+
+def _export_reduced_snapshot_dataframe(df, step_dir):
+    """Optionally save a source-level reduced dataframe for one model variant.
+
+    The export keeps identifier/date/target columns for traceability, then keeps
+    only the source-level feature columns required by the configured model
+    variant. It does not include the train/validation/test split column.
+    """
 
     if not getattr(config, "SAVE_REDUCED_SNAPSHOT_DATAFRAME", False):
         return None
 
-    variant = str(getattr(config, "REDUCED_SNAPSHOT_MODEL_VARIANT", "D"))
+    variant = str(getattr(config, "REDUCED_SNAPSHOT_MODEL_VARIANT", "C"))
     if variant not in config.FEATURE_SETS:
         raise ValueError(
             f"REDUCED_SNAPSHOT_MODEL_VARIANT='{variant}' is not defined in config.FEATURE_SETS."
@@ -50,31 +74,26 @@ def _export_reduced_snapshot_dataframe(df, split, step_dir):
         error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES,
     )
 
-    base_cols = _ordered_unique(
-        list(config.ID_COLS or [])
-        + [config.DATE_COL, config.TARGET_COL]
-        + list(getattr(config, "SECONDARY_SORT_COLS", []) or [])
+    required_context_cols = _ordered_unique(
+        list(getattr(config, "ID_COLS", []) or [])
+        + [getattr(config, "DATE_COL", None), getattr(config, "TARGET_COL", None)]
     )
-    base_cols = [c for c in base_cols if c in df.columns]
-    export_cols = _ordered_unique(base_cols + present_source_features)
+    missing_context_cols = [c for c in required_context_cols if c not in df.columns]
+    if missing_context_cols:
+        raise ValueError(
+            "Reduced snapshot export requires these context columns, but they are missing: "
+            f"{missing_context_cols}"
+        )
 
-    pieces = []
-    for split_name, split_df in [
-        ("training_main", split.train),
-        ("validation_holdout", split.validation),
-        ("test_holdout", split.test),
-    ]:
-        part = split_df[export_cols].copy()
-        if getattr(config, "REDUCED_SNAPSHOT_INCLUDE_SPLIT_COLUMN", True):
-            part.insert(len(base_cols), "split", split_name)
-        pieces.append(part)
-
-    reduced_df = pd.concat(pieces, ignore_index=True)
+    # Reduced source-level export: keep machine ID/date/target, then model feature columns.
+    # The split column is intentionally excluded.
+    export_cols = _ordered_unique(required_context_cols + present_source_features)
+    reduced_df = df[export_cols].copy()
 
     output_filename = getattr(
         config,
         "REDUCED_SNAPSHOT_OUTPUT_FILENAME",
-        f"06_snapshot_dataframe_model_{variant}_reduced.csv",
+        f"06_snapshot_dataframe_model_{variant}_reduced_snapshot.csv",
     )
     output_path = step_dir / output_filename
     reduced_df.to_csv(output_path, index=False)
@@ -84,35 +103,39 @@ def _export_reduced_snapshot_dataframe(df, split, step_dir):
         "output_path": str(output_path),
         "rows": int(len(reduced_df)),
         "columns": int(len(reduced_df.columns)),
+        "context_columns": required_context_cols,
+        "feature_columns": present_source_features,
         "selected_prepared_feature_count": int(len(selected_prepared)),
         "required_source_feature_count": int(len(required_source_features)),
         "present_source_feature_count": int(len(present_source_features)),
         "missing_source_feature_count": int(len(missing_source_features)),
         "missing_source_features": missing_source_features,
-        "base_columns": base_cols,
-        "source_feature_columns": present_source_features,
-        "include_split_column": bool(getattr(config, "REDUCED_SNAPSHOT_INCLUDE_SPLIT_COLUMN", True)),
+        "excluded_columns": {
+            "split_col": "split",
+        },
+        "categorical_features_kept_in_source_format": True,
     }
     write_json(metadata, step_dir / "06_snapshot_dataframe_model_reduced_metadata.json")
 
     print(
-        f"Reduced source snapshot for Model {variant} saved: {output_path} "
-        f"({len(reduced_df)} rows, {len(reduced_df.columns)} columns)"
+        f"Reduced snapshot for Model {variant} saved: {output_path} "
+        f"({len(reduced_df)} rows, {len(required_context_cols)} context columns, "
+        f"{len(present_source_features)} feature columns)"
     )
     return metadata
+
 
 def run() -> None:
     step_dir = config.OUTPUT_DIR / "00_data_split"
     ensure_dir(step_dir)
 
     resolved_input = resolve_input_path(config.INPUT_DATA_PATH)
-    df = read_snapshot(config.INPUT_DATA_PATH, config.DATE_COL)
+    df, source_cols_to_drop, sentinel_report = _load_and_prepare_snapshot()
 
-    source_cols_to_drop = [
-        c for c in getattr(config, "SOURCE_COLUMNS_TO_DROP_BEFORE_MODELING", []) if c in df.columns
-    ]
-    if source_cols_to_drop:
-        df = df.drop(columns=source_cols_to_drop)
+    if not sentinel_report.empty:
+        sentinel_report.to_csv(step_dir / "01b_sentinel_cleaning_report.csv", index=False)
+        cleaned_count = int((sentinel_report["status"] == "cleaned").sum())
+        print(f"Sentinel cleaning completed for {cleaned_count} configured columns.")
 
     if config.TARGET_COL not in df.columns:
         raise ValueError(f"TARGET_COL='{config.TARGET_COL}' was not found in input data.")
@@ -148,6 +171,9 @@ def run() -> None:
                     "is_machine_context_feature": bool(
                         feature in set(getattr(config, "PROTECTED_MACHINE_CONTEXT_PREPARED_FEATURES", []))
                     ),
+                    "is_sentinel_indicator_feature": bool(
+                        source in set(getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}).values())
+                    ),
                     "included_in_model_A": feature in set(config.FEATURE_SETS.get("A", [])),
                     "included_in_model_B": feature in set(config.FEATURE_SETS.get("B", [])),
                     "included_in_model_C": feature in set(config.FEATURE_SETS.get("C", [])),
@@ -171,29 +197,30 @@ def run() -> None:
     feature_set_detail_df = pd.DataFrame(feature_set_detail_rows)
     feature_set_detail_df.to_csv(step_dir / "04_feature_sets_prepared_features.csv", index=False)
 
-    if "D" in config.FEATURE_SETS:
-        model_d_features_df = feature_set_detail_df[
-            feature_set_detail_df["model_variant"] == "D"
-        ].copy()
-        model_d_features_df.insert(
-            5,
-            "model_d_feature_source_reason",
-            model_d_features_df.apply(
-                lambda row: "retained_from_model_C"
-                if row["prepared_feature"] in set(config.FEATURE_SETS.get("C", []))
-                else "added_back_machine_context",
-                axis=1,
-            ),
-        )
-        model_d_features_df.to_csv(step_dir / "05_model_D_prepared_features.csv", index=False)
-        print(
-            f"Model D prepared feature list saved: "
-            f"{step_dir / '05_model_D_prepared_features.csv'} "
-            f"({len(model_d_features_df)} features)"
-        )
+    for variant in ["C", "D"]:
+        if variant in config.FEATURE_SETS:
+            model_features_df = feature_set_detail_df[
+                feature_set_detail_df["model_variant"] == variant
+            ].copy()
+            if variant == "D":
+                model_features_df.insert(
+                    5,
+                    "model_d_feature_source_reason",
+                    model_features_df.apply(
+                        lambda row: "retained_from_model_C"
+                        if row["prepared_feature"] in set(config.FEATURE_SETS.get("C", []))
+                        else "added_back_machine_context",
+                        axis=1,
+                    ),
+                )
+            model_features_df.to_csv(step_dir / f"05_model_{variant}_prepared_features.csv", index=False)
+            print(
+                f"Model {variant} prepared feature list saved: "
+                f"{step_dir / f'05_model_{variant}_prepared_features.csv'} "
+                f"({len(model_features_df)} features)"
+            )
 
-
-    reduced_snapshot_metadata = _export_reduced_snapshot_dataframe(df, split, step_dir)
+    reduced_snapshot_metadata = _export_reduced_snapshot_dataframe(df, step_dir)
 
     write_json(
         {
@@ -211,6 +238,8 @@ def run() -> None:
             },
             "effective_normalized_split_ratios": effective_ratios,
             "source_columns_dropped_before_modeling": source_cols_to_drop,
+            "sentinel_cleaning_enabled": bool(getattr(config, "SENTINEL_CLEANING_ENABLED", False)),
+            "sentinel_cleaning_report_file": "01b_sentinel_cleaning_report.csv" if not sentinel_report.empty else None,
             "reduced_snapshot_export_enabled": bool(getattr(config, "SAVE_REDUCED_SNAPSHOT_DATAFRAME", False)),
             "reduced_snapshot_export": reduced_snapshot_metadata,
             "output_dir": str(step_dir),

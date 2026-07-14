@@ -12,7 +12,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -146,6 +146,69 @@ def read_snapshot(path: Path, date_col: str) -> pd.DataFrame:
         missing = int(df[date_col].isna().sum())
         raise ValueError(f"DATE_COL='{date_col}' has {missing} missing/unparseable dates.")
     return df
+
+
+
+def apply_sentinel_cleaning(
+    df: pd.DataFrame,
+    enabled: bool,
+    sentinel_value: float,
+    columns_to_clean: Mapping[str, str],
+    replace_with: Any = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Clean sentinel days-since values and add has_prior indicators.
+
+    For each configured source column:
+        indicator = 1 when a real prior event exists
+        indicator = 0 when the sentinel value is present
+        source column sentinel values are replaced with missing/replace_with
+
+    Returns the cleaned dataframe and a report dataframe.
+    """
+
+    out = df.copy()
+    rows = []
+    if not enabled:
+        return out, pd.DataFrame(rows)
+
+    for source_col, indicator_col in dict(columns_to_clean or {}).items():
+        if source_col not in out.columns:
+            rows.append(
+                {
+                    "source_column": source_col,
+                    "indicator_column": indicator_col,
+                    "status": "source_column_missing",
+                    "rows": int(len(out)),
+                    "sentinel_count": 0,
+                    "sentinel_rate": np.nan,
+                }
+            )
+            continue
+
+        numeric = pd.to_numeric(out[source_col], errors="coerce")
+        sentinel_mask = numeric.eq(float(sentinel_value))
+        out[indicator_col] = (~sentinel_mask & numeric.notna()).astype(int)
+
+        if replace_with is None:
+            out.loc[sentinel_mask, source_col] = np.nan
+        else:
+            out.loc[sentinel_mask, source_col] = replace_with
+
+        rows.append(
+            {
+                "source_column": source_col,
+                "indicator_column": indicator_col,
+                "status": "cleaned",
+                "rows": int(len(out)),
+                "sentinel_value": sentinel_value,
+                "sentinel_count": int(sentinel_mask.sum()),
+                "sentinel_rate": float(sentinel_mask.mean()) if len(out) else np.nan,
+                "indicator_positive_count": int(out[indicator_col].sum()),
+                "indicator_positive_rate": float(out[indicator_col].mean()) if len(out) else np.nan,
+            }
+        )
+
+    return out, pd.DataFrame(rows)
 
 
 def chronological_split(
@@ -503,12 +566,45 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
     return max(neg / pos, 1.0)
 
 
-def make_xgb_params(default_params: dict, override_params: Optional[dict], y: pd.Series, use_scale_pos_weight: bool) -> dict:
+def make_xgb_params(
+    default_params: dict,
+    override_params: Optional[dict],
+    y: pd.Series,
+    use_scale_pos_weight: bool,
+) -> dict:
+    """Resolve XGBoost parameters for one training fold/run.
+
+    Explicit values in override_params win. This is important for grid-searching
+    scale_pos_weight. If USE_SCALE_POS_WEIGHT=True and the override does not
+    provide scale_pos_weight, the fold-specific neg/pos ratio is used.
+
+    Supported scale_pos_weight override values:
+        - number: use the number directly
+        - "auto", "balanced", "computed": compute neg/pos on this y
+        - None, "none", "off": remove scale_pos_weight from params
+    """
     params = dict(default_params)
-    if override_params:
-        params.update(override_params)
-    if use_scale_pos_weight:
+    overrides = dict(override_params or {})
+    params.update(overrides)
+
+    override_has_spw = "scale_pos_weight" in overrides
+    if override_has_spw:
+        value = overrides.get("scale_pos_weight")
+        if isinstance(value, str):
+            value_normalized = value.strip().lower()
+            if value_normalized in {"auto", "balanced", "computed"}:
+                params["scale_pos_weight"] = compute_scale_pos_weight(y)
+            elif value_normalized in {"none", "off", "false"}:
+                params.pop("scale_pos_weight", None)
+            else:
+                params["scale_pos_weight"] = float(value)
+        elif value is None:
+            params.pop("scale_pos_weight", None)
+        else:
+            params["scale_pos_weight"] = value
+    elif use_scale_pos_weight:
         params["scale_pos_weight"] = compute_scale_pos_weight(y)
+
     return params
 
 
@@ -521,6 +617,93 @@ def train_xgboost_classifier(X: pd.DataFrame, y: pd.Series, params: dict):
     model = XGBClassifier(**params)
     model.fit(X, y, verbose=False)
     return model
+
+
+
+def make_algorithm_params(
+    algorithm: str,
+    default_params: dict,
+    override_params: Optional[dict],
+    y: pd.Series,
+    use_scale_pos_weight: bool = False,
+) -> dict:
+    """Resolve parameters for supported algorithms.
+
+    XGBoost uses make_xgb_params so scale_pos_weight can be numeric or "auto".
+    Non-XGBoost algorithms currently use configured defaults plus overrides.
+    """
+
+    algorithm = str(algorithm).lower()
+    if algorithm == "xgboost":
+        return make_xgb_params(default_params, override_params, y, use_scale_pos_weight)
+    params = dict(default_params or {})
+    params.update(dict(override_params or {}))
+    return params
+
+
+def train_classifier(algorithm: str, X: pd.DataFrame, y: pd.Series, params: dict):
+    """Train a supported classifier and return the fitted model."""
+
+    algorithm = str(algorithm).lower()
+    y = pd.Series(y).astype(int)
+    if y.nunique(dropna=True) < 2:
+        raise ValueError(f"{algorithm} training target has fewer than two classes.")
+
+    if algorithm == "xgboost":
+        return train_xgboost_classifier(X, y, params)
+
+    if algorithm == "lightgbm":
+        try:
+            from lightgbm import LGBMClassifier
+        except ImportError as exc:
+            raise ImportError(
+                "LightGBM is requested but is not installed. Install it with `pip install lightgbm` "
+                "or remove 'lightgbm' from MODEL_ALGORITHMS_TO_RUN in config.py."
+            ) from exc
+        model = LGBMClassifier(**params)
+        model.fit(X, y)
+        return model
+
+    if algorithm == "random_forest":
+        from sklearn.ensemble import RandomForestClassifier
+        model = RandomForestClassifier(**params)
+        model.fit(X, y)
+        return model
+
+    raise ValueError(
+        f"Unsupported algorithm '{algorithm}'. Supported values: xgboost, lightgbm, random_forest."
+    )
+
+
+def model_feature_importance(model, feature_names: Sequence[str], algorithm: str) -> pd.DataFrame:
+    """Return feature-importance dataframe for the fitted model when available."""
+
+    algorithm = str(algorithm).lower()
+    if algorithm == "xgboost" and hasattr(model, "get_booster"):
+        out = xgboost_importance(model, feature_names)
+        out.insert(0, "algorithm", algorithm)
+        return out
+
+    rows = pd.DataFrame({"prepared_feature": list(feature_names)})
+    rows.insert(0, "algorithm", algorithm)
+    if hasattr(model, "feature_importances_"):
+        col = f"{algorithm}_feature_importance"
+        rows[col] = np.asarray(model.feature_importances_, dtype=float)
+        rows[f"rank_{col}"] = rows[col].rank(ascending=False, method="min")
+        return rows.sort_values(col, ascending=False).reset_index(drop=True)
+    rows["importance_warning"] = "model does not expose feature_importances_"
+    return rows
+
+
+def predict_probability(model, X: pd.DataFrame) -> np.ndarray:
+    """Return positive-class probabilities from a fitted classifier."""
+
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("Model does not expose predict_proba; cannot compute probability metrics.")
+    prob = model.predict_proba(X)
+    if prob.ndim != 2 or prob.shape[1] < 2:
+        raise ValueError("predict_proba did not return a two-class probability matrix.")
+    return prob[:, 1]
 
 
 def threshold_free_metrics(y_true: pd.Series, probability: np.ndarray) -> dict:
@@ -807,11 +990,36 @@ def xgboost_importance(model, feature_names: Sequence[str]) -> pd.DataFrame:
     return rows.sort_values(["xgb_total_gain", "xgb_gain"], ascending=False).reset_index(drop=True)
 
 
-def make_param_grid(default_params: dict, hyperparameter_grid: Sequence[dict]) -> List[dict]:
-    """Return parameter overrides to evaluate. Empty grid means one default run."""
+def make_param_grid(default_params: dict, hyperparameter_grid: Any) -> List[dict]:
+    """Return parameter overrides to evaluate. Empty grid means one default run.
+
+    Supported config formats:
+        1. [] or None
+           -> one default run.
+        2. list[dict]
+           -> explicit parameter-set overrides.
+        3. dict[str, list]
+           -> Cartesian product of candidate values, similar to sklearn GridSearchCV.
+
+    default_params is accepted for backward compatibility and future validation;
+    it is not mutated.
+    """
 
     if not hyperparameter_grid:
         return [{}]
+
+    if isinstance(hyperparameter_grid, Mapping):
+        keys = list(hyperparameter_grid.keys())
+        value_lists = []
+        for key in keys:
+            values = hyperparameter_grid[key]
+            if isinstance(values, (list, tuple, set)):
+                value_lists.append(list(values))
+            else:
+                value_lists.append([values])
+        overrides = [dict(zip(keys, combo)) for combo in itertools.product(*value_lists)]
+        return overrides or [{}]
+
     return [dict(x) for x in hyperparameter_grid]
 
 
@@ -844,8 +1052,10 @@ def prediction_frame(
 
 def save_model_artifacts(model, prepared: PreparedData, output_dir: Path, metadata: dict) -> None:
     ensure_dir(output_dir)
-    model_path = output_dir / "final_xgboost_model.json"
-    model.save_model(str(model_path))
+    algorithm = str(metadata.get("algorithm", "model")).lower()
+    joblib.dump(model, output_dir / f"final_{algorithm}_model.joblib")
+    if algorithm == "xgboost" and hasattr(model, "save_model"):
+        model.save_model(str(output_dir / "final_xgboost_model.json"))
     joblib.dump(prepared.preprocessor, output_dir / "final_preprocessor.joblib")
     write_json(metadata, output_dir / "final_model_metadata.json")
     pd.DataFrame({"prepared_feature": prepared.selected_prepared_features}).to_csv(

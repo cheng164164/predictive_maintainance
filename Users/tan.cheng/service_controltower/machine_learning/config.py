@@ -46,7 +46,7 @@ TEST_RATIO = 0.15
 # -----------------------------------------------------------------------------
 # Expanding-window CV inside training_main only
 # -----------------------------------------------------------------------------
-CV_N_SPLITS = 4
+CV_N_SPLITS = 1
 CV_VALIDATION_WINDOW_DAYS = 45
 CV_GAP_DAYS = 45
 CV_MIN_TRAIN_ROWS = 1000
@@ -71,7 +71,26 @@ ERROR_ON_MISSING_SOURCE_FEATURES = True
 # current training data, add it as an all-zero column. This is useful for one-hot
 # categories absent in a specific training period. Missing source columns are
 # still controlled by ERROR_ON_MISSING_SOURCE_FEATURES.
-ADD_MISSING_PREPARED_FEATURES_AS_ZERO = False
+ADD_MISSING_PREPARED_FEATURES_AS_ZERO = True
+
+# -----------------------------------------------------------------------------
+# 9999 sentinel cleaning
+# -----------------------------------------------------------------------------
+# Recommended approach: do not treat 9999 as a real number of days. For each
+# configured days-since column, create a has_prior_* indicator and replace the
+# sentinel value with missing. The numeric imputer then handles the cleaned
+# days-since value while the indicator preserves the "no prior event observed"
+# signal.
+SENTINEL_CLEANING_ENABLED = True
+SENTINEL_VALUE = 9999
+SENTINEL_REPLACE_WITH = None  # None means pandas NA/NaN
+SENTINEL_COLUMNS_TO_CLEAN = {
+    "days_since_last_fault": "has_prior_fault",
+    "days_since_last_severe_fault": "has_prior_severe_fault",
+    "days_since_last_claim": "has_prior_claim",
+    "days_since_last_reset": "has_prior_reset",
+    "days_since_last_smr": "has_prior_smr",
+}
 
 # -----------------------------------------------------------------------------
 # Feature variants
@@ -202,6 +221,7 @@ MODEL_C_ADDITIONAL_DROP_PREPARED_FEATURES = ['num__actual_work_day_ratio_change_
  'num__fuel_actual_work_conflict_count_90d',
  'cat__full_model_D71EX_24',
  'cat__full_model_D71PX_24',
+ 'cat__full_model_D71EXI_24',
  'num__has_fault_90d']
 
 PREPARED_TO_SOURCE_FEATURE = {'cat__full_model_D71EXI_24': 'full_model',
@@ -327,6 +347,34 @@ MODEL_D_PREPARED_FEATURES = [
     or f in set(PROTECTED_MACHINE_CONTEXT_PREPARED_FEATURES)
 ]
 
+
+
+def _append_sentinel_indicator_features(prepared_features):
+    """Add has_prior_* prepared features after selected cleaned days-since features."""
+    if not SENTINEL_CLEANING_ENABLED:
+        return list(prepared_features)
+    source_to_indicator_prepared = {
+        source: f"num__{indicator}"
+        for source, indicator in SENTINEL_COLUMNS_TO_CLEAN.items()
+    }
+    out = []
+    for feature in prepared_features:
+        if feature not in out:
+            out.append(feature)
+        source = PREPARED_TO_SOURCE_FEATURE.get(feature)
+        indicator_prepared = source_to_indicator_prepared.get(source)
+        if indicator_prepared and indicator_prepared not in out:
+            out.append(indicator_prepared)
+    return out
+
+if SENTINEL_CLEANING_ENABLED:
+    for _source_col, _indicator_col in SENTINEL_COLUMNS_TO_CLEAN.items():
+        PREPARED_TO_SOURCE_FEATURE[f"num__{_indicator_col}"] = _indicator_col
+    MODEL_A_PREPARED_FEATURES = _append_sentinel_indicator_features(MODEL_A_PREPARED_FEATURES)
+    MODEL_B_PREPARED_FEATURES = _append_sentinel_indicator_features(MODEL_B_PREPARED_FEATURES)
+    MODEL_C_PREPARED_FEATURES = _append_sentinel_indicator_features(MODEL_C_PREPARED_FEATURES)
+    MODEL_D_PREPARED_FEATURES = _append_sentinel_indicator_features(MODEL_D_PREPARED_FEATURES)
+
 FEATURE_SETS = {
     "A": MODEL_A_PREPARED_FEATURES,
     "B": MODEL_B_PREPARED_FEATURES,
@@ -337,27 +385,39 @@ FEATURE_SETS = {
 # Run CV and validation training for these variants. Test evaluation should be
 # done only for the final selected variant unless EVALUATE_TEST_FOR_ALL_VARIANTS
 # is intentionally set to True.
-MODEL_VARIANTS_TO_RUN = ["A", "B", "C", "D"]
+# For coarse hyperparameter tuning, run the current preferred variant first.
+# Change to ["A", "B", "C", "D"] if you want to compare all variants.
+MODEL_VARIANTS_TO_RUN = ["C"]
 
 # If True, choose the final test-evaluated variant using validation F2 after the
 # max flagged-rate constraint. If False, FINAL_MODEL_VARIANT is used.
 AUTO_SELECT_FINAL_VARIANT_BY_VALIDATION_F2 = True
-FINAL_MODEL_VARIANT = "A"
+FINAL_MODEL_ALGORITHM = "xgboost"
+FINAL_MODEL_VARIANT = "C"
 EVALUATE_TEST_FOR_ALL_VARIANTS = False
 
 
 # -----------------------------------------------------------------------------
 # Optional reduced source snapshot export
 # -----------------------------------------------------------------------------
-# When enabled, 00_split_data.py saves a source-level snapshot dataframe reduced
-# to the source columns required by one selected model variant. For Model D this
-# means ID/date/target columns plus the original source columns that generate
-# MODEL_D_PREPARED_FEATURES. One-hot prepared features such as cat__full_model_*
-# are represented by their original source column, e.g. full_model.
+# When enabled, 00_split_data.py saves a source-level dataframe reduced to the
+# context columns plus the feature columns required by the selected model variant.
+# Included context columns: ID_COLS, DATE_COL, and TARGET_COL.
+# The train/validation/test split column is intentionally excluded.
+# Categorical features are kept in their original source format instead of being
+# one-hot encoded in this export.
 SAVE_REDUCED_SNAPSHOT_DATAFRAME = False
-REDUCED_SNAPSHOT_MODEL_VARIANT = "D"
-REDUCED_SNAPSHOT_OUTPUT_FILENAME = "06_snapshot_dataframe_model_D_reduced.csv"
-REDUCED_SNAPSHOT_INCLUDE_SPLIT_COLUMN = False
+REDUCED_SNAPSHOT_MODEL_VARIANT = "C"
+REDUCED_SNAPSHOT_OUTPUT_FILENAME = "06_snapshot_dataframe_model_C_reduced_snapshot.csv"
+
+# -----------------------------------------------------------------------------
+# Model algorithms
+# -----------------------------------------------------------------------------
+# When HYPERPARAMETER_TUNING_ENABLED=False, each algorithm listed here is run
+# once using its default settings. When tuning is enabled, the current workflow
+# tunes XGBoost only using HYPERPARAMETER_SEARCH_GRID.
+MODEL_ALGORITHMS_TO_RUN = ["xgboost", "lightgbm", "random_forest"]
+HYPERPARAMETER_TUNING_ALGORITHM = "xgboost"
 
 # -----------------------------------------------------------------------------
 # XGBoost settings
@@ -365,9 +425,9 @@ REDUCED_SNAPSHOT_INCLUDE_SPLIT_COLUMN = False
 RANDOM_STATE = 42
 USE_SCALE_POS_WEIGHT = True
 
-# Project default parameters for now. Later, add dictionaries to
-# HYPERPARAMETER_GRID to tune with expanding-window CV. The selected parameter
-# set is the one with the highest mean validation average_precision.
+# Project default parameters used when hyperparameter tuning is disabled.
+# These are also the base parameters that HYPERPARAMETER_SEARCH_GRID overrides
+# when hyperparameter tuning is enabled.
 XGB_DEFAULT_PARAMS = {
     "n_estimators": 300,
     "max_depth": 4,
@@ -381,12 +441,75 @@ XGB_DEFAULT_PARAMS = {
     "n_jobs": 1,
 }
 
-# Example for later tuning:
-# HYPERPARAMETER_GRID = [
-#     {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 300},
-#     {"max_depth": 4, "learning_rate": 0.03, "n_estimators": 500},
-# ]
-HYPERPARAMETER_GRID = []
+# Default/non-tuned comparison models. These intentionally keep mostly native
+# defaults plus reproducibility settings.
+LIGHTGBM_DEFAULT_PARAMS = {
+    "objective": "binary",
+    "boosting_type": "gbdt",
+    "n_estimators": 500,
+    "learning_rate": 0.03,
+    "num_leaves": 31,
+    "max_depth": -1,
+    "min_child_samples": 50,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.0,
+    "reg_lambda": 1.0,
+    "class_weight": "balanced",
+    "random_state": RANDOM_STATE,
+    "n_jobs": 1,
+    "verbose": -1,
+}
+
+
+RANDOM_FOREST_DEFAULT_PARAMS = {
+    "n_estimators": 500,
+    "max_depth": None,
+    "min_samples_split": 20,
+    "min_samples_leaf": 10,
+    "max_features": "sqrt",
+    "class_weight": "balanced_subsample",
+    "bootstrap": True,
+    "random_state": RANDOM_STATE,
+    "n_jobs": 1,
+}
+
+# ----------------------------------------------------------------------------
+# Hyperparameter tuning control
+# ----------------------------------------------------------------------------
+# Simple switch:
+#   False -> run one CV pass using XGB_DEFAULT_PARAMS and the original
+#            USE_SCALE_POS_WEIGHT behavior.
+#   True  -> expand HYPERPARAMETER_SEARCH_GRID and select the parameter set with
+#            the highest mean CV average_precision for each model variant.
+HYPERPARAMETER_TUNING_ENABLED = False
+
+# Coarse XGBoost grid search. Used only when HYPERPARAMETER_TUNING_ENABLED=True.
+# You can configure this as either:
+#   1) a dict of parameter ranges/lists, which creates a Cartesian product, or
+#   2) a list of explicit parameter dictionaries.
+#
+# scale_pos_weight options:
+#   - numeric values such as 1, 3, 5, 7 use that exact class weight.
+#   - "auto" computes neg/pos separately inside each CV training fold.
+#   - omit scale_pos_weight and set USE_SCALE_POS_WEIGHT=True to use "auto".
+#
+# This is intentionally coarse for a first pass. For faster runs, reduce values
+# or run only MODEL_VARIANTS_TO_RUN = ["C"].
+HYPERPARAMETER_SEARCH_GRID = {
+    "n_estimators": [300, 600],
+    "max_depth": [3, 4],
+    "learning_rate": [0.03],
+    "min_child_weight": [5, 20],
+    "subsample": [0.85],
+    "colsample_bytree": [0.85],
+    "scale_pos_weight": [1, 3, "auto"],
+}
+
+# Backward-compatible alias. You can ignore this and use
+# HYPERPARAMETER_SEARCH_GRID going forward.
+HYPERPARAMETER_GRID = HYPERPARAMETER_SEARCH_GRID
 
 # -----------------------------------------------------------------------------
 # Validation threshold selection and reporting

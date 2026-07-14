@@ -1,20 +1,24 @@
 """Step 01: expanding-window date-based CV inside training_main only."""
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 
 import config
 from ml_utils import (
+    apply_sentinel_cleaning,
     build_expanding_window_folds,
     chronological_split,
     ensure_dir,
     fit_transform_prepared_features,
-    make_param_grid,
-    make_xgb_params,
     machine_level_top_k_metrics,
+    make_algorithm_params,
+    make_param_grid,
     metrics_at_threshold,
     param_set_id,
+    predict_probability,
     prediction_frame,
     read_snapshot,
     select_best_threshold,
@@ -24,19 +28,32 @@ from ml_utils import (
     threshold_grid,
     threshold_search,
     top_k_metrics,
-    train_xgboost_classifier,
+    train_classifier,
     validate_source_features,
     write_json,
 )
 
 
-def _prepare_split():
+def _load_and_prepare_snapshot():
     df = read_snapshot(config.INPUT_DATA_PATH, config.DATE_COL)
     source_cols_to_drop = [
         c for c in getattr(config, "SOURCE_COLUMNS_TO_DROP_BEFORE_MODELING", []) if c in df.columns
     ]
     if source_cols_to_drop:
         df = df.drop(columns=source_cols_to_drop)
+
+    df, sentinel_report = apply_sentinel_cleaning(
+        df=df,
+        enabled=getattr(config, "SENTINEL_CLEANING_ENABLED", False),
+        sentinel_value=getattr(config, "SENTINEL_VALUE", 9999),
+        columns_to_clean=getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}),
+        replace_with=getattr(config, "SENTINEL_REPLACE_WITH", None),
+    )
+    return df, sentinel_report
+
+
+def _prepare_split():
+    df, sentinel_report = _load_and_prepare_snapshot()
     split, effective_ratios = chronological_split(
         df=df,
         date_col=config.DATE_COL,
@@ -45,14 +62,45 @@ def _prepare_split():
         test_ratio=config.TEST_RATIO,
         secondary_sort_cols=config.SECONDARY_SORT_COLS,
     )
-    return df, split, effective_ratios
+    return df, split, effective_ratios, sentinel_report
+
+
+def _default_params_for_algorithm(algorithm: str) -> dict:
+    algorithm = str(algorithm).lower()
+    if algorithm == "xgboost":
+        return dict(config.XGB_DEFAULT_PARAMS)
+    if algorithm == "lightgbm":
+        return dict(getattr(config, "LIGHTGBM_DEFAULT_PARAMS", {}))
+    if algorithm == "random_forest":
+        return dict(getattr(config, "RANDOM_FOREST_DEFAULT_PARAMS", {}))
+    raise ValueError(f"Unsupported algorithm configured: {algorithm}")
+
+
+def _effective_run_plan() -> tuple[list[str], list[dict], bool]:
+    """Return algorithms and parameter overrides according to config."""
+
+    tuning_enabled = bool(getattr(config, "HYPERPARAMETER_TUNING_ENABLED", False))
+    if tuning_enabled:
+        algorithm = str(getattr(config, "HYPERPARAMETER_TUNING_ALGORITHM", "xgboost")).lower()
+        if algorithm != "xgboost":
+            raise ValueError("Current hyperparameter tuning workflow supports XGBoost only.")
+        grid = getattr(config, "HYPERPARAMETER_SEARCH_GRID", None)
+        if grid is None:
+            grid = getattr(config, "HYPERPARAMETER_GRID", [])
+        return [algorithm], make_param_grid(config.XGB_DEFAULT_PARAMS, grid), True
+
+    algorithms = [str(a).lower() for a in getattr(config, "MODEL_ALGORITHMS_TO_RUN", ["xgboost"])]
+    return algorithms, [{}], False
 
 
 def run() -> None:
     step_dir = config.OUTPUT_DIR / "01_cross_validation"
     ensure_dir(step_dir)
 
-    _, split, effective_ratios = _prepare_split()
+    _, split, effective_ratios, sentinel_report = _prepare_split()
+    if not sentinel_report.empty:
+        sentinel_report.to_csv(step_dir / "01b_sentinel_cleaning_report.csv", index=False)
+
     training_df = split.train.sort_values(config.DATE_COL, kind="mergesort").reset_index(drop=True)
 
     folds, fold_audit = build_expanding_window_folds(
@@ -74,140 +122,175 @@ def run() -> None:
             "CV_GAP_DAYS, and minimum row/positive thresholds in config.py."
         )
 
-    param_overrides = make_param_grid(config.XGB_DEFAULT_PARAMS, config.HYPERPARAMETER_GRID)
+    algorithms, param_overrides, tuning_enabled = _effective_run_plan()
+    search_mode = "xgboost_hyperparameter_tuning" if tuning_enabled else "default_algorithm_comparison"
+    total_model_fits = len(algorithms) * len(config.MODEL_VARIANTS_TO_RUN) * len(param_overrides) * len(folds)
+    current_fit = 0
+
+    print("CV run plan")
+    print(f"  mode: {search_mode}")
+    print(f"  algorithms: {algorithms}")
+    print(f"  model variants: {config.MODEL_VARIANTS_TO_RUN}")
+    print(f"  parameter configurations per algorithm: {len(param_overrides)}")
+    print(f"  folds: {len(folds)}")
+    print(f"  total model fits: {total_model_fits}")
+    if tuning_enabled:
+        print(f"  XGBoost tuning configurations: {len(param_overrides)}")
+
     all_metric_rows = []
     all_topk_rows = []
     all_machine_topk_rows = []
     all_prediction_frames = []
 
-    for variant in config.MODEL_VARIANTS_TO_RUN:
-        selected_prepared = config.FEATURE_SETS[variant]
-        source_features = source_features_for_prepared_features(
-            selected_prepared, config.PREPARED_TO_SOURCE_FEATURE
-        )
-        present_sources, missing_sources = validate_source_features(
-            training_df, source_features, error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES
-        )
-        if missing_sources:
-            print(f"[WARN] Variant {variant}: missing source features ignored: {missing_sources}")
+    for algorithm in algorithms:
+        default_params = _default_params_for_algorithm(algorithm)
+        for variant in config.MODEL_VARIANTS_TO_RUN:
+            selected_prepared = config.FEATURE_SETS[variant]
+            source_features = source_features_for_prepared_features(
+                selected_prepared, config.PREPARED_TO_SOURCE_FEATURE
+            )
+            present_sources, missing_sources = validate_source_features(
+                training_df, source_features, error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES
+            )
+            if missing_sources:
+                print(f"[WARN] algorithm={algorithm} variant={variant}: missing source features ignored: {missing_sources}")
 
-        for param_idx, override in enumerate(param_overrides, start=1):
-            pid = param_set_id(override, param_idx)
-            for fold in folds:
-                fold_train = training_df.iloc[fold.train_index].copy()
-                fold_val = training_df.iloc[fold.validation_index].copy()
-                y_train = target_series(fold_train, config.TARGET_COL)
-                y_val = target_series(fold_val, config.TARGET_COL)
-
-                prepared = fit_transform_prepared_features(
-                    train_df=fold_train,
-                    validation_df=fold_val,
-                    test_df=None,
-                    source_features=present_sources,
-                    selected_prepared_features=selected_prepared,
-                    numeric_impute_strategy=config.NUMERIC_IMPUTE_STRATEGY,
-                    categorical_impute_strategy=config.CATEGORICAL_IMPUTE_STRATEGY,
-                    one_hot_encode_categorical=config.ONE_HOT_ENCODE_CATEGORICAL,
-                    add_missing_prepared_features_as_zero=config.ADD_MISSING_PREPARED_FEATURES_AS_ZERO,
-                )
-
-                params = make_xgb_params(
-                    config.XGB_DEFAULT_PARAMS,
-                    override,
-                    y_train,
-                    use_scale_pos_weight=config.USE_SCALE_POS_WEIGHT,
-                )
-                model = train_xgboost_classifier(prepared.X_train, y_train, params)
-                prob = model.predict_proba(prepared.X_validation)[:, 1]
-
-                free = threshold_free_metrics(y_val, prob)
-                default_metrics = metrics_at_threshold(
-                    y_val, prob, threshold=config.CV_DEFAULT_THRESHOLD, beta=config.THRESHOLD_BETA
-                )
-                cv_search = threshold_search(
-                    y_true=y_val,
-                    probability=prob,
-                    thresholds=threshold_grid(config.THRESHOLD_MIN, config.THRESHOLD_MAX, config.THRESHOLD_GRID_SIZE),
-                    beta=config.THRESHOLD_BETA,
-                    max_flagged_rate=config.CV_MAX_FLAGGED_RATE_FOR_BEST_F2,
-                )
-                best = select_best_threshold(cv_search, beta=config.THRESHOLD_BETA)
-
-                row = {
-                    "model_variant": variant,
-                    "param_set_id": pid,
-                    "param_override": override,
-                    "fold_id": fold.fold_id,
-                    "train_start_date": fold.train_start_date,
-                    "train_end_date": fold.train_end_date,
-                    "gap_start_date": fold.gap_start_date,
-                    "gap_end_date": fold.gap_end_date,
-                    "validation_start_date": fold.validation_start_date,
-                    "validation_end_date": fold.validation_end_date,
-                    "selected_prepared_feature_count": len(selected_prepared),
-                    "required_source_feature_count": len(present_sources),
-                    "missing_selected_prepared_feature_count": len(prepared.missing_selected_prepared_features),
-                }
-                row.update({f"threshold_free_{k}": v for k, v in free.items()})
-                row.update({f"default_threshold_{k}": v for k, v in default_metrics.items()})
-                row.update({f"best_cv_threshold_{k}": v for k, v in best.items()})
-                all_metric_rows.append(row)
-
-                topk_df = top_k_metrics(y_val, prob, config.TOP_K_RATES)
-                topk_df.insert(0, "validation_end_date", fold.validation_end_date)
-                topk_df.insert(0, "validation_start_date", fold.validation_start_date)
-                topk_df.insert(0, "fold_id", fold.fold_id)
-                topk_df.insert(0, "param_set_id", pid)
-                topk_df.insert(0, "model_variant", variant)
-                all_topk_rows.append(topk_df)
-
-                pred_df = None
-                if config.SAVE_CV_PREDICTIONS or config.ENABLE_MACHINE_LEVEL_TOP_K:
-                    pred_df = prediction_frame(
-                        fold_val,
-                        config.DATE_COL,
-                        config.ID_COLS,
-                        y_val,
-                        prob,
-                        threshold=best["threshold"],
+            for param_idx, override in enumerate(param_overrides, start=1):
+                pid = param_set_id(override, param_idx)
+                for fold in folds:
+                    current_fit += 1
+                    print(
+                        f"[CV {current_fit}/{total_model_fits}] "
+                        f"algorithm={algorithm} variant={variant} param={pid} fold={fold.fold_id}"
                     )
-                    pred_df.insert(0, "fold_id", fold.fold_id)
-                    pred_df.insert(0, "param_set_id", pid)
-                    pred_df.insert(0, "model_variant", variant)
 
-                if config.ENABLE_MACHINE_LEVEL_TOP_K and pred_df is not None:
-                    machine_topk_df = machine_level_top_k_metrics(
-                        prediction_df=pred_df,
-                        probability_col="probability",
-                        target_col="y_true",
-                        machine_id_col=config.MACHINE_ID_COL,
-                        top_k_rates=config.MACHINE_TOP_K_RATES,
-                        date_col=config.DATE_COL,
-                        probability_aggregation=config.MACHINE_PROBABILITY_AGGREGATION,
-                        target_aggregation=config.MACHINE_TARGET_AGGREGATION,
+                    fold_train = training_df.iloc[fold.train_index].copy()
+                    fold_val = training_df.iloc[fold.validation_index].copy()
+                    y_train = target_series(fold_train, config.TARGET_COL)
+                    y_val = target_series(fold_val, config.TARGET_COL)
+
+                    prepared = fit_transform_prepared_features(
+                        train_df=fold_train,
+                        validation_df=fold_val,
+                        test_df=None,
+                        source_features=present_sources,
+                        selected_prepared_features=selected_prepared,
+                        numeric_impute_strategy=config.NUMERIC_IMPUTE_STRATEGY,
+                        categorical_impute_strategy=config.CATEGORICAL_IMPUTE_STRATEGY,
+                        one_hot_encode_categorical=config.ONE_HOT_ENCODE_CATEGORICAL,
+                        add_missing_prepared_features_as_zero=config.ADD_MISSING_PREPARED_FEATURES_AS_ZERO,
                     )
-                    machine_topk_df.insert(0, "validation_end_date", fold.validation_end_date)
-                    machine_topk_df.insert(0, "validation_start_date", fold.validation_start_date)
-                    machine_topk_df.insert(0, "fold_id", fold.fold_id)
-                    machine_topk_df.insert(0, "param_set_id", pid)
-                    machine_topk_df.insert(0, "model_variant", variant)
-                    all_machine_topk_rows.append(machine_topk_df)
 
-                if config.SAVE_CV_PREDICTIONS and pred_df is not None:
-                    all_prediction_frames.append(pred_df)
+                    params = make_algorithm_params(
+                        algorithm=algorithm,
+                        default_params=default_params,
+                        override_params=override,
+                        y=y_train,
+                        use_scale_pos_weight=config.USE_SCALE_POS_WEIGHT if algorithm == "xgboost" else False,
+                    )
+                    model = train_classifier(algorithm, prepared.X_train, y_train, params)
+                    prob = predict_probability(model, prepared.X_validation)
 
-                print(
-                    f"CV variant={variant} param={pid} fold={fold.fold_id}: "
-                    f"AP={free.get('average_precision', np.nan):.4f}, "
-                    f"best_F2={best.get('f2', np.nan):.4f}, "
-                    f"flagged={best.get('flagged_rate', np.nan):.2%}"
-                )
+                    free = threshold_free_metrics(y_val, prob)
+                    default_metrics = metrics_at_threshold(
+                        y_val, prob, threshold=config.CV_DEFAULT_THRESHOLD, beta=config.THRESHOLD_BETA
+                    )
+                    cv_search = threshold_search(
+                        y_true=y_val,
+                        probability=prob,
+                        thresholds=threshold_grid(
+                            config.THRESHOLD_MIN,
+                            config.THRESHOLD_MAX,
+                            config.THRESHOLD_GRID_SIZE,
+                        ),
+                        beta=config.THRESHOLD_BETA,
+                        max_flagged_rate=config.CV_MAX_FLAGGED_RATE_FOR_BEST_F2,
+                    )
+                    best = select_best_threshold(cv_search, beta=config.THRESHOLD_BETA)
+
+                    row = {
+                        "algorithm": algorithm,
+                        "model_variant": variant,
+                        "param_set_id": pid,
+                        "param_override": override,
+                        "param_override_json": json.dumps(override, sort_keys=True, default=str),
+                        "resolved_model_params_json": json.dumps(params, sort_keys=True, default=str),
+                        "resolved_scale_pos_weight": params.get("scale_pos_weight", np.nan),
+                        "fold_id": fold.fold_id,
+                        "train_start_date": fold.train_start_date,
+                        "train_end_date": fold.train_end_date,
+                        "gap_start_date": fold.gap_start_date,
+                        "gap_end_date": fold.gap_end_date,
+                        "validation_start_date": fold.validation_start_date,
+                        "validation_end_date": fold.validation_end_date,
+                        "selected_prepared_feature_count": len(selected_prepared),
+                        "required_source_feature_count": len(present_sources),
+                        "missing_selected_prepared_feature_count": len(prepared.missing_selected_prepared_features),
+                    }
+                    row.update({f"threshold_free_{k}": v for k, v in free.items()})
+                    row.update({f"default_threshold_{k}": v for k, v in default_metrics.items()})
+                    row.update({f"best_cv_threshold_{k}": v for k, v in best.items()})
+                    all_metric_rows.append(row)
+
+                    topk_df = top_k_metrics(y_val, prob, config.TOP_K_RATES)
+                    topk_df.insert(0, "validation_end_date", fold.validation_end_date)
+                    topk_df.insert(0, "validation_start_date", fold.validation_start_date)
+                    topk_df.insert(0, "fold_id", fold.fold_id)
+                    topk_df.insert(0, "param_set_id", pid)
+                    topk_df.insert(0, "model_variant", variant)
+                    topk_df.insert(0, "algorithm", algorithm)
+                    all_topk_rows.append(topk_df)
+
+                    pred_df = None
+                    if config.SAVE_CV_PREDICTIONS or config.ENABLE_MACHINE_LEVEL_TOP_K:
+                        pred_df = prediction_frame(
+                            fold_val,
+                            config.DATE_COL,
+                            config.ID_COLS,
+                            y_val,
+                            prob,
+                            threshold=best["threshold"],
+                        )
+                        pred_df.insert(0, "fold_id", fold.fold_id)
+                        pred_df.insert(0, "param_set_id", pid)
+                        pred_df.insert(0, "model_variant", variant)
+                        pred_df.insert(0, "algorithm", algorithm)
+
+                    if config.ENABLE_MACHINE_LEVEL_TOP_K and pred_df is not None:
+                        machine_topk_df = machine_level_top_k_metrics(
+                            prediction_df=pred_df,
+                            probability_col="probability",
+                            target_col="y_true",
+                            machine_id_col=config.MACHINE_ID_COL,
+                            top_k_rates=config.MACHINE_TOP_K_RATES,
+                            date_col=config.DATE_COL,
+                            probability_aggregation=config.MACHINE_PROBABILITY_AGGREGATION,
+                            target_aggregation=config.MACHINE_TARGET_AGGREGATION,
+                        )
+                        machine_topk_df.insert(0, "validation_end_date", fold.validation_end_date)
+                        machine_topk_df.insert(0, "validation_start_date", fold.validation_start_date)
+                        machine_topk_df.insert(0, "fold_id", fold.fold_id)
+                        machine_topk_df.insert(0, "param_set_id", pid)
+                        machine_topk_df.insert(0, "model_variant", variant)
+                        machine_topk_df.insert(0, "algorithm", algorithm)
+                        all_machine_topk_rows.append(machine_topk_df)
+
+                    if config.SAVE_CV_PREDICTIONS and pred_df is not None:
+                        all_prediction_frames.append(pred_df)
+
+                    print(
+                        f"    AP={free.get('average_precision', np.nan):.4f}, "
+                        f"best_F2={best.get('f2', np.nan):.4f}, "
+                        f"recall={best.get('recall', np.nan):.4f}, "
+                        f"precision={best.get('precision', np.nan):.4f}, "
+                        f"flagged={best.get('flagged_rate', np.nan):.2%}"
+                    )
 
     metrics_df = pd.DataFrame(all_metric_rows)
     metrics_path = step_dir / "02_cv_metrics_by_fold.csv"
     metrics_df.to_csv(metrics_path, index=False)
 
-    group_cols = ["model_variant", "param_set_id"]
+    group_cols = ["algorithm", "model_variant", "param_set_id"]
     summary = (
         metrics_df.groupby(group_cols, dropna=False)
         .agg(
@@ -225,20 +308,56 @@ def run() -> None:
             mean_best_cv_flagged_rate=("best_cv_threshold_flagged_rate", "mean"),
         )
         .reset_index()
-        .sort_values(["model_variant", "mean_average_precision"], ascending=[True, False])
+        .sort_values(["algorithm", "model_variant", "mean_average_precision"], ascending=[True, True, False])
     )
+
+    param_details = (
+        metrics_df.groupby(group_cols, dropna=False)
+        .agg(
+            param_override_json=("param_override_json", "first"),
+            resolved_model_params_json=("resolved_model_params_json", "first"),
+            mean_resolved_scale_pos_weight=("resolved_scale_pos_weight", "mean"),
+        )
+        .reset_index()
+    )
+    summary = summary.merge(param_details, on=group_cols, how="left")
+
     summary["selected_by_cv_mean_average_precision"] = False
-    for variant in summary["model_variant"].unique():
-        idx = summary[summary["model_variant"] == variant]["mean_average_precision"].idxmax()
+    for (algorithm, variant), sub in summary.groupby(["algorithm", "model_variant"]):
+        idx = sub["mean_average_precision"].idxmax()
         summary.loc[idx, "selected_by_cv_mean_average_precision"] = True
     summary.to_csv(step_dir / "03_cv_param_summary.csv", index=False)
+
+    if tuning_enabled:
+        tuning_results = summary.copy()
+        tuning_results.to_csv(step_dir / "10_hyperparameter_tuning_results.csv", index=False)
+        tuning_best = tuning_results[tuning_results["selected_by_cv_mean_average_precision"]].copy()
+        tuning_best.to_csv(step_dir / "11_hyperparameter_tuning_best_by_variant.csv", index=False)
+        write_json(
+            {
+                "hyperparameter_tuning_enabled": True,
+                "algorithm": algorithms[0],
+                "model_variants_to_run": config.MODEL_VARIANTS_TO_RUN,
+                "param_set_count": len(param_overrides),
+                "total_model_fits": total_model_fits,
+                "main_selection_metric": "mean_average_precision",
+                "hyperparameter_search_grid": getattr(
+                    config,
+                    "HYPERPARAMETER_SEARCH_GRID",
+                    getattr(config, "HYPERPARAMETER_GRID", []),
+                ),
+                "base_xgb_default_params": config.XGB_DEFAULT_PARAMS,
+                "use_scale_pos_weight_auto_when_not_in_grid": config.USE_SCALE_POS_WEIGHT,
+            },
+            step_dir / "12_hyperparameter_tuning_config.json",
+        )
 
     if all_topk_rows:
         topk_metrics_df = pd.concat(all_topk_rows, ignore_index=True)
         topk_metrics_df.to_csv(step_dir / "06_cv_top_k_metrics_by_fold.csv", index=False)
 
         topk_summary = (
-            topk_metrics_df.groupby(["model_variant", "param_set_id", "top_k_rate"], dropna=False)
+            topk_metrics_df.groupby(["algorithm", "model_variant", "param_set_id", "top_k_rate"], dropna=False)
             .agg(
                 fold_count=("fold_id", "count"),
                 mean_precision_at_k=("precision_at_k", "mean"),
@@ -252,7 +371,7 @@ def run() -> None:
                 mean_min_probability_in_top_k=("min_probability_in_top_k", "mean"),
             )
             .reset_index()
-            .sort_values(["model_variant", "param_set_id", "top_k_rate"])
+            .sort_values(["algorithm", "model_variant", "param_set_id", "top_k_rate"])
         )
         topk_summary.to_csv(step_dir / "07_cv_top_k_summary.csv", index=False)
 
@@ -261,7 +380,7 @@ def run() -> None:
         machine_topk_metrics_df.to_csv(step_dir / "08_cv_machine_top_k_metrics_by_fold.csv", index=False)
 
         machine_topk_summary = (
-            machine_topk_metrics_df.groupby(["model_variant", "param_set_id", "top_k_rate"], dropna=False)
+            machine_topk_metrics_df.groupby(["algorithm", "model_variant", "param_set_id", "top_k_rate"], dropna=False)
             .agg(
                 fold_count=("fold_id", "count"),
                 mean_machine_count=("machine_count", "mean"),
@@ -280,17 +399,22 @@ def run() -> None:
                 mean_min_probability_in_top_k=("min_probability_in_top_k", "mean"),
             )
             .reset_index()
-            .sort_values(["model_variant", "param_set_id", "top_k_rate"])
+            .sort_values(["algorithm", "model_variant", "param_set_id", "top_k_rate"])
         )
         machine_topk_summary.to_csv(step_dir / "09_cv_machine_top_k_summary.csv", index=False)
 
     selected = {}
     for _, row in summary[summary["selected_by_cv_mean_average_precision"]].iterrows():
+        algorithm = row["algorithm"]
         variant = row["model_variant"]
         pid = row["param_set_id"]
-        match = metrics_df[(metrics_df["model_variant"] == variant) & (metrics_df["param_set_id"] == pid)].iloc[0]
+        match = metrics_df[
+            (metrics_df["algorithm"] == algorithm)
+            & (metrics_df["model_variant"] == variant)
+            & (metrics_df["param_set_id"] == pid)
+        ].iloc[0]
         override = match["param_override"]
-        selected[variant] = {
+        selected.setdefault(algorithm, {})[variant] = {
             "param_set_id": pid,
             "param_override": override,
             "mean_average_precision": float(row["mean_average_precision"]),
@@ -309,18 +433,26 @@ def run() -> None:
             "output_dir": str(step_dir),
             "effective_outer_split_ratios": effective_ratios,
             "model_variants_to_run": config.MODEL_VARIANTS_TO_RUN,
+            "algorithms_to_run": algorithms,
             "cv_n_splits_requested": config.CV_N_SPLITS,
             "cv_n_splits_used": len(folds),
             "cv_gap_days": config.CV_GAP_DAYS,
             "cv_validation_window_days": config.CV_VALIDATION_WINDOW_DAYS,
-            "main_hyperparameter_metric": "mean_average_precision",
+            "search_mode": search_mode,
+            "hyperparameter_tuning_enabled": tuning_enabled,
+            "hyperparameter_param_set_count": len(param_overrides),
+            "total_model_fits": total_model_fits,
+            "use_scale_pos_weight_auto_when_not_in_grid": config.USE_SCALE_POS_WEIGHT,
+            "main_hyperparameter_metric": "mean_average_precision" if tuning_enabled else None,
+            "sentinel_cleaning_enabled": bool(getattr(config, "SENTINEL_CLEANING_ENABLED", False)),
             "machine_level_top_k_enabled": config.ENABLE_MACHINE_LEVEL_TOP_K,
             "machine_id_col": config.MACHINE_ID_COL if config.ENABLE_MACHINE_LEVEL_TOP_K else None,
             "notes": [
                 "Expanding-window CV is performed inside training_main only.",
-                "Each fold uses a 45-day configurable gap by default between training end and CV validation start.",
-                "F2, recall, precision, flagged rate, and snapshot top-K precision/recall are reported per fold but mean average precision selects hyperparameters.",
-                "If ENABLE_MACHINE_LEVEL_TOP_K=True, machine-level top-K precision/recall reports are also generated by aggregating repeated snapshots per machine.",
+                "If HYPERPARAMETER_TUNING_ENABLED=False, XGBoost, LightGBM, and Random Forest run once with configured defaults.",
+                "If HYPERPARAMETER_TUNING_ENABLED=True, XGBoost parameter ranges are evaluated and mean average precision selects hyperparameters.",
+                "F2, recall, precision, flagged rate, snapshot top-K, and optional machine top-K are reported per fold for review.",
+                "9999 sentinel values are cleaned before splitting when SENTINEL_CLEANING_ENABLED=True.",
             ],
         },
         step_dir / "00_run_summary.json",
