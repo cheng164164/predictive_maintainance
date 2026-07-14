@@ -55,6 +55,10 @@ data_preparation/output/
 feature_selection/output/**
 /feature_selection/output/**
 
+/machine_learning/output/**
+machine_learning/output/
+machine_learning/output/**
+
 ###############################################################################
 # JSON outputs
 ###############################################################################
