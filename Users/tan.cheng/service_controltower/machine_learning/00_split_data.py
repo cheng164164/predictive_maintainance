@@ -6,11 +6,13 @@ import pandas as pd
 import config
 from ml_utils import (
     apply_sentinel_cleaning,
+    apply_snapshot_training_filters,
     chronological_split,
     ensure_dir,
     make_split_summary,
     read_snapshot,
     resolve_input_path,
+    source_features_for_model_variants,
     source_features_for_prepared_features,
     validate_source_features,
     write_json,
@@ -25,8 +27,27 @@ def _ordered_unique(values):
     return out
 
 
+
+def _snapshot_filter_feature_columns():
+    """Return source columns used to detect empty or inactive snapshot rows."""
+
+    override = list(getattr(config, "SNAPSHOT_SPARSITY_FEATURE_COLUMNS", []) or [])
+    if override:
+        return _ordered_unique(override)
+
+    variants = list(getattr(config, "MODEL_VARIANTS_TO_RUN", []) or [])
+    if getattr(config, "SAVE_REDUCED_SNAPSHOT_DATAFRAME", False):
+        variants.append(getattr(config, "REDUCED_SNAPSHOT_MODEL_VARIANT", None))
+    variants.append(getattr(config, "FINAL_MODEL_VARIANT", None))
+
+    return source_features_for_model_variants(
+        feature_sets=config.FEATURE_SETS,
+        prepared_to_source=config.PREPARED_TO_SOURCE_FEATURE,
+        model_variants=_ordered_unique(variants),
+    )
+
 def _load_and_prepare_snapshot():
-    """Load snapshot data, apply configured early drops, and clean 9999 sentinels."""
+    """Load snapshot data, apply configured early drops, clean sentinels, and filter invalid rows."""
 
     df = read_snapshot(config.INPUT_DATA_PATH, config.DATE_COL)
 
@@ -43,7 +64,25 @@ def _load_and_prepare_snapshot():
         columns_to_clean=getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}),
         replace_with=getattr(config, "SENTINEL_REPLACE_WITH", None),
     )
-    return df, source_cols_to_drop, sentinel_report
+
+    df, snapshot_filter_report = apply_snapshot_training_filters(
+        df=df,
+        date_col=config.DATE_COL,
+        target_col=config.TARGET_COL,
+        id_cols=config.ID_COLS,
+        feature_columns=_snapshot_filter_feature_columns(),
+        enabled=getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False),
+        drop_after_cutoff=getattr(config, "DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW", False),
+        cutoff_reference_end_date=getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
+        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        drop_all_zero_rows=getattr(config, "DROP_ALL_ZERO_SNAPSHOT_ROWS", True),
+        drop_extreme_sparse_rows=getattr(config, "DROP_EXTREME_SPARSE_SNAPSHOT_ROWS", True),
+        min_nonzero_feature_count=getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
+        nonzero_epsilon=getattr(config, "SPARSE_ROW_NONZERO_EPSILON", 1e-12),
+        numeric_only=getattr(config, "SPARSE_ROW_NUMERIC_ONLY", True),
+        add_diagnostic_columns=getattr(config, "SNAPSHOT_FILTER_ADD_DIAGNOSTIC_COLUMNS", False),
+    )
+    return df, source_cols_to_drop, sentinel_report, snapshot_filter_report
 
 
 def _export_reduced_snapshot_dataframe(df, step_dir):
@@ -130,12 +169,20 @@ def run() -> None:
     ensure_dir(step_dir)
 
     resolved_input = resolve_input_path(config.INPUT_DATA_PATH)
-    df, source_cols_to_drop, sentinel_report = _load_and_prepare_snapshot()
+    df, source_cols_to_drop, sentinel_report, snapshot_filter_report = _load_and_prepare_snapshot()
 
     if not sentinel_report.empty:
         sentinel_report.to_csv(step_dir / "01b_sentinel_cleaning_report.csv", index=False)
         cleaned_count = int((sentinel_report["status"] == "cleaned").sum())
         print(f"Sentinel cleaning completed for {cleaned_count} configured columns.")
+
+    if not snapshot_filter_report.empty:
+        snapshot_filter_report.to_csv(step_dir / "01c_snapshot_training_filter_report.csv", index=False)
+        final_row = snapshot_filter_report[snapshot_filter_report["filter_step"] == "final"]
+        if not final_row.empty:
+            dropped = int(final_row.iloc[0].get("total_rows_dropped", 0))
+            remaining = int(final_row.iloc[0].get("rows_after", len(df)))
+            print(f"Snapshot training filters completed. Dropped {dropped} rows; kept {remaining} rows.")
 
     if config.TARGET_COL not in df.columns:
         raise ValueError(f"TARGET_COL='{config.TARGET_COL}' was not found in input data.")
@@ -240,6 +287,12 @@ def run() -> None:
             "source_columns_dropped_before_modeling": source_cols_to_drop,
             "sentinel_cleaning_enabled": bool(getattr(config, "SENTINEL_CLEANING_ENABLED", False)),
             "sentinel_cleaning_report_file": "01b_sentinel_cleaning_report.csv" if not sentinel_report.empty else None,
+            "snapshot_training_filters_enabled": bool(getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False)),
+            "snapshot_training_filter_report_file": "01c_snapshot_training_filter_report.csv" if not snapshot_filter_report.empty else None,
+            "snapshot_rows_after_training_filters": int(len(df)),
+            "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
+            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+            "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
             "reduced_snapshot_export_enabled": bool(getattr(config, "SAVE_REDUCED_SNAPSHOT_DATAFRAME", False)),
             "reduced_snapshot_export": reduced_snapshot_metadata,
             "output_dir": str(step_dir),

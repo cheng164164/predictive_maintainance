@@ -148,6 +148,315 @@ def read_snapshot(path: Path, date_col: str) -> pd.DataFrame:
     return df
 
 
+def source_features_for_model_variants(
+    feature_sets: Mapping[str, Sequence[str]],
+    prepared_to_source: Mapping[str, str],
+    model_variants: Optional[Sequence[str]],
+) -> List[str]:
+    """Return ordered unique source features required by configured model variants."""
+
+    if model_variants:
+        variants = []
+        for variant in model_variants:
+            if variant and variant not in variants:
+                variants.append(str(variant))
+    else:
+        variants = list(feature_sets.keys())
+
+    out: List[str] = []
+    for variant in variants:
+        if variant not in feature_sets:
+            raise ValueError(f"Model variant '{variant}' is not defined in FEATURE_SETS.")
+        sources = source_features_for_prepared_features(feature_sets[variant], dict(prepared_to_source))
+        for source in sources:
+            if source not in out:
+                out.append(source)
+    return out
+
+
+def _parse_optional_timestamp(value: Any, field_name: str) -> Optional[pd.Timestamp]:
+    """Parse an optional timestamp-like config value."""
+
+    if value is None or value is False:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"{field_name} could not be parsed as a date: {value!r}")
+    return pd.Timestamp(ts).normalize()
+
+
+def _report_row(
+    step: str,
+    enabled: bool,
+    status: str,
+    rows_before: int,
+    rows_after: int,
+    **details: Any,
+) -> dict:
+    row = {
+        "filter_step": step,
+        "enabled": bool(enabled),
+        "status": status,
+        "rows_before": int(rows_before),
+        "rows_after": int(rows_after),
+        "rows_dropped": int(rows_before - rows_after),
+    }
+    row.update(details)
+    return row
+
+
+def apply_snapshot_training_filters(
+    df: pd.DataFrame,
+    date_col: str,
+    target_col: Optional[str] = None,
+    id_cols: Optional[Sequence[str]] = None,
+    feature_columns: Optional[Sequence[str]] = None,
+    enabled: bool = True,
+    drop_after_cutoff: bool = True,
+    cutoff_reference_end_date: Any = None,
+    prediction_horizon_days: int = 45,
+    drop_all_zero_rows: bool = True,
+    drop_extreme_sparse_rows: bool = True,
+    min_nonzero_feature_count: int = 3,
+    nonzero_epsilon: float = 1e-12,
+    numeric_only: bool = True,
+    add_diagnostic_columns: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Filter snapshot rows that are not valid training examples.
+
+    This function applies two types of safeguards before chronological splitting:
+
+    1. Target-window clipping. For a label such as claim_next_45d, snapshots
+       after reference_end_date - 45 days are removed because their full future
+       target window is not observable.
+    2. Active-row filtering. Rows with no non-zero model feature values, or only
+       an extremely small number of non-zero model feature values, are removed.
+       This prevents a full machine-date grid from creating artificial inactive
+       negative examples.
+
+    Sparsity is calculated only from existing numeric model source features by
+    default. Categorical context fields such as full_model are intentionally not
+    counted as activity evidence.
+    """
+
+    out = df.copy()
+    report_rows: List[dict] = []
+    initial_rows = len(out)
+    report_rows.append(
+        _report_row(
+            step="input",
+            enabled=enabled,
+            status="received",
+            rows_before=initial_rows,
+            rows_after=initial_rows,
+        )
+    )
+
+    if not enabled:
+        report_rows.append(
+            _report_row(
+                step="snapshot_training_filters",
+                enabled=False,
+                status="disabled",
+                rows_before=initial_rows,
+                rows_after=initial_rows,
+            )
+        )
+        return out, pd.DataFrame(report_rows)
+
+    if date_col not in out.columns:
+        raise ValueError(f"DATE_COL='{date_col}' was not found before snapshot filtering.")
+
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    if out[date_col].isna().any():
+        missing = int(out[date_col].isna().sum())
+        raise ValueError(f"DATE_COL='{date_col}' has {missing} missing/unparseable dates before filtering.")
+
+    if drop_after_cutoff:
+        reference_end_date = _parse_optional_timestamp(
+            cutoff_reference_end_date, "cutoff_reference_end_date"
+        )
+        before = len(out)
+        if reference_end_date is None:
+            report_rows.append(
+                _report_row(
+                    step="target_window_cutoff",
+                    enabled=True,
+                    status="skipped_no_reference_end_date",
+                    rows_before=before,
+                    rows_after=before,
+                    prediction_horizon_days=int(prediction_horizon_days),
+                )
+            )
+        else:
+            max_valid_snapshot_date = reference_end_date - pd.Timedelta(days=int(prediction_horizon_days))
+            keep_mask = out[date_col] <= max_valid_snapshot_date
+            out = out.loc[keep_mask].copy()
+            report_rows.append(
+                _report_row(
+                    step="target_window_cutoff",
+                    enabled=True,
+                    status="applied",
+                    rows_before=before,
+                    rows_after=len(out),
+                    reference_end_date=reference_end_date.date().isoformat(),
+                    prediction_horizon_days=int(prediction_horizon_days),
+                    max_valid_snapshot_date=max_valid_snapshot_date.date().isoformat(),
+                    removed_snapshot_date_min=(
+                        df.loc[~keep_mask, date_col].min() if (~keep_mask).any() else pd.NaT
+                    ),
+                    removed_snapshot_date_max=(
+                        df.loc[~keep_mask, date_col].max() if (~keep_mask).any() else pd.NaT
+                    ),
+                )
+            )
+    else:
+        before = len(out)
+        report_rows.append(
+            _report_row(
+                step="target_window_cutoff",
+                enabled=False,
+                status="disabled",
+                rows_before=before,
+                rows_after=before,
+            )
+        )
+
+    excluded_cols = set([date_col])
+    if target_col:
+        excluded_cols.add(target_col)
+    for col in id_cols or []:
+        excluded_cols.add(col)
+
+    configured_features = list(feature_columns or [])
+    if configured_features:
+        candidate_cols = [c for c in configured_features if c in out.columns and c not in excluded_cols]
+        missing_feature_cols = [c for c in configured_features if c not in out.columns]
+    else:
+        candidate_cols = [c for c in out.columns if c not in excluded_cols]
+        missing_feature_cols = []
+
+    if numeric_only:
+        numeric_feature_cols = []
+        non_numeric_excluded = []
+        for col in candidate_cols:
+            converted = pd.to_numeric(out[col], errors="coerce")
+            if converted.notna().any():
+                numeric_feature_cols.append(col)
+            else:
+                non_numeric_excluded.append(col)
+    else:
+        numeric_feature_cols = candidate_cols
+        non_numeric_excluded = []
+
+    if not numeric_feature_cols:
+        before = len(out)
+        report_rows.append(
+            _report_row(
+                step="row_activity_sparsity",
+                enabled=True,
+                status="skipped_no_numeric_feature_columns",
+                rows_before=before,
+                rows_after=before,
+                configured_feature_column_count=len(configured_features),
+                candidate_feature_column_count=len(candidate_cols),
+                numeric_feature_column_count=0,
+                missing_configured_feature_column_count=len(missing_feature_cols),
+            )
+        )
+        return out, pd.DataFrame(report_rows)
+
+    nonzero_count = pd.Series(0, index=out.index, dtype=np.int32)
+    eps = float(nonzero_epsilon)
+    for col in numeric_feature_cols:
+        values = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+        nonzero_count += values.abs().gt(eps).astype(np.int32)
+
+    if add_diagnostic_columns:
+        out["snapshot_filter_nonzero_feature_count"] = nonzero_count
+
+    before_zero = len(out)
+    if drop_all_zero_rows:
+        all_zero_mask = nonzero_count.eq(0)
+        out = out.loc[~all_zero_mask].copy()
+        nonzero_count = nonzero_count.loc[out.index]
+        report_rows.append(
+            _report_row(
+                step="all_zero_feature_rows",
+                enabled=True,
+                status="applied",
+                rows_before=before_zero,
+                rows_after=len(out),
+                numeric_feature_column_count=len(numeric_feature_cols),
+                configured_feature_column_count=len(configured_features),
+                candidate_feature_column_count=len(candidate_cols),
+                non_numeric_feature_columns_excluded=";".join(non_numeric_excluded[:50]),
+                missing_configured_feature_column_count=len(missing_feature_cols),
+                missing_configured_feature_columns=";".join(missing_feature_cols[:50]),
+                nonzero_epsilon=eps,
+            )
+        )
+    else:
+        report_rows.append(
+            _report_row(
+                step="all_zero_feature_rows",
+                enabled=False,
+                status="disabled",
+                rows_before=before_zero,
+                rows_after=before_zero,
+                numeric_feature_column_count=len(numeric_feature_cols),
+            )
+        )
+
+    before_sparse = len(out)
+    if drop_extreme_sparse_rows:
+        min_count = int(min_nonzero_feature_count)
+        if min_count < 1:
+            raise ValueError("min_nonzero_feature_count must be at least 1.")
+        sparse_mask = nonzero_count.lt(min_count)
+        out = out.loc[~sparse_mask].copy()
+        report_rows.append(
+            _report_row(
+                step="extreme_sparse_feature_rows",
+                enabled=True,
+                status="applied",
+                rows_before=before_sparse,
+                rows_after=len(out),
+                min_nonzero_feature_count=min_count,
+                numeric_feature_column_count=len(numeric_feature_cols),
+                nonzero_epsilon=eps,
+            )
+        )
+    else:
+        report_rows.append(
+            _report_row(
+                step="extreme_sparse_feature_rows",
+                enabled=False,
+                status="disabled",
+                rows_before=before_sparse,
+                rows_after=before_sparse,
+            )
+        )
+
+    final_rows = len(out)
+    report_rows.append(
+        _report_row(
+            step="final",
+            enabled=True,
+            status="completed",
+            rows_before=initial_rows,
+            rows_after=final_rows,
+            total_rows_dropped=int(initial_rows - final_rows),
+            total_rows_dropped_rate=float((initial_rows - final_rows) / initial_rows) if initial_rows else np.nan,
+            final_snapshot_date_min=out[date_col].min() if final_rows else pd.NaT,
+            final_snapshot_date_max=out[date_col].max() if final_rows else pd.NaT,
+        )
+    )
+    return out, pd.DataFrame(report_rows)
+
+
 
 def apply_sentinel_cleaning(
     df: pd.DataFrame,

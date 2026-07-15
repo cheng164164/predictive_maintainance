@@ -7,6 +7,7 @@ import pandas as pd
 import config
 from ml_utils import (
     apply_sentinel_cleaning,
+    apply_snapshot_training_filters,
     chronological_split,
     ensure_dir,
     fit_transform_prepared_features,
@@ -20,6 +21,7 @@ from ml_utils import (
     read_snapshot,
     save_model_artifacts,
     select_best_threshold,
+    source_features_for_model_variants,
     source_features_for_prepared_features,
     target_series,
     threshold_free_metrics,
@@ -31,6 +33,31 @@ from ml_utils import (
     write_json,
 )
 
+
+
+def _ordered_unique(values):
+    out = []
+    for value in values:
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _snapshot_filter_feature_columns():
+    """Return source columns used to detect empty or inactive snapshot rows."""
+
+    override = list(getattr(config, "SNAPSHOT_SPARSITY_FEATURE_COLUMNS", []) or [])
+    if override:
+        return _ordered_unique(override)
+
+    variants = list(getattr(config, "MODEL_VARIANTS_TO_RUN", []) or [])
+    variants.append(getattr(config, "FINAL_MODEL_VARIANT", None))
+
+    return source_features_for_model_variants(
+        feature_sets=config.FEATURE_SETS,
+        prepared_to_source=config.PREPARED_TO_SOURCE_FEATURE,
+        model_variants=_ordered_unique(variants),
+    )
 
 def _load_and_prepare_snapshot():
     df = read_snapshot(config.INPUT_DATA_PATH, config.DATE_COL)
@@ -47,11 +74,29 @@ def _load_and_prepare_snapshot():
         columns_to_clean=getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}),
         replace_with=getattr(config, "SENTINEL_REPLACE_WITH", None),
     )
-    return df, sentinel_report
+
+    df, snapshot_filter_report = apply_snapshot_training_filters(
+        df=df,
+        date_col=config.DATE_COL,
+        target_col=config.TARGET_COL,
+        id_cols=config.ID_COLS,
+        feature_columns=_snapshot_filter_feature_columns(),
+        enabled=getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False),
+        drop_after_cutoff=getattr(config, "DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW", False),
+        cutoff_reference_end_date=getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
+        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        drop_all_zero_rows=getattr(config, "DROP_ALL_ZERO_SNAPSHOT_ROWS", True),
+        drop_extreme_sparse_rows=getattr(config, "DROP_EXTREME_SPARSE_SNAPSHOT_ROWS", True),
+        min_nonzero_feature_count=getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
+        nonzero_epsilon=getattr(config, "SPARSE_ROW_NONZERO_EPSILON", 1e-12),
+        numeric_only=getattr(config, "SPARSE_ROW_NUMERIC_ONLY", True),
+        add_diagnostic_columns=getattr(config, "SNAPSHOT_FILTER_ADD_DIAGNOSTIC_COLUMNS", False),
+    )
+    return df, sentinel_report, snapshot_filter_report
 
 
 def _prepare_split():
-    df, sentinel_report = _load_and_prepare_snapshot()
+    df, sentinel_report, snapshot_filter_report = _load_and_prepare_snapshot()
     split, effective_ratios = chronological_split(
         df=df,
         date_col=config.DATE_COL,
@@ -60,7 +105,7 @@ def _prepare_split():
         test_ratio=config.TEST_RATIO,
         secondary_sort_cols=config.SECONDARY_SORT_COLS,
     )
-    return df, split, effective_ratios, sentinel_report
+    return df, split, effective_ratios, sentinel_report, snapshot_filter_report
 
 
 def _load_selected_cv_params() -> dict:
@@ -102,9 +147,11 @@ def run() -> None:
     models_dir = step_dir / "model_artifacts"
     ensure_dir(models_dir)
 
-    _, split, effective_ratios, sentinel_report = _prepare_split()
+    _, split, effective_ratios, sentinel_report, snapshot_filter_report = _prepare_split()
     if not sentinel_report.empty:
         sentinel_report.to_csv(step_dir / "00b_sentinel_cleaning_report.csv", index=False)
+    if not snapshot_filter_report.empty:
+        snapshot_filter_report.to_csv(step_dir / "00c_snapshot_training_filter_report.csv", index=False)
 
     selected_cv = _load_selected_cv_params()
     algorithms = _effective_algorithms()
@@ -348,6 +395,10 @@ def run() -> None:
         "categorical_input_cols": final_obj["prepared"].categorical_input_cols,
         "missing_selected_prepared_features_added_as_zero": final_obj["prepared"].missing_selected_prepared_features,
         "sentinel_cleaning_enabled": bool(getattr(config, "SENTINEL_CLEANING_ENABLED", False)),
+        "snapshot_training_filters_enabled": bool(getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False)),
+        "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
+        "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
     }
     write_json(metadata, step_dir / "10_final_model_selection.json")
 
@@ -375,6 +426,12 @@ def run() -> None:
             "max_flagged_rate": config.MAX_FLAGGED_RATE,
             "threshold_beta": config.THRESHOLD_BETA,
             "sentinel_cleaning_enabled": bool(getattr(config, "SENTINEL_CLEANING_ENABLED", False)),
+            "snapshot_training_filters_enabled": bool(getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False)),
+            "snapshot_training_filter_report_file": "00c_snapshot_training_filter_report.csv" if not snapshot_filter_report.empty else None,
+            "snapshot_rows_after_training_filters": int(len(split.train) + len(split.validation) + len(split.test)),
+            "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
+            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+            "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
             "machine_level_top_k_enabled": config.ENABLE_MACHINE_LEVEL_TOP_K,
             "machine_id_col": config.MACHINE_ID_COL if config.ENABLE_MACHINE_LEVEL_TOP_K else None,
             "notes": [
@@ -384,6 +441,8 @@ def run() -> None:
                 "Probability threshold is selected on validation_holdout using F2 with max flagged-rate constraint.",
                 "Test metrics are evaluated after threshold selection.",
                 "9999 sentinel values are cleaned before splitting when SENTINEL_CLEANING_ENABLED=True.",
+                "Snapshot rows after the configured full target-window cutoff are removed before splitting.",
+                "All-zero and extreme-sparse numeric feature rows are removed before splitting when snapshot filters are enabled.",
             ],
         },
         step_dir / "00_run_summary.json",

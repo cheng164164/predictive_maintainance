@@ -36,6 +36,41 @@ SECONDARY_SORT_COLS = ["model_id"]
 SOURCE_COLUMNS_TO_DROP_BEFORE_MODELING = []
 
 # -----------------------------------------------------------------------------
+# Snapshot row filtering and target-window clipping
+# -----------------------------------------------------------------------------
+# The raw snapshot builder may create a full machine-date panel. That can produce
+# many artificial inactive rows where every model feature is zero/blank. These
+# rows are removed before split/CV/final training so the model learns from active
+# machine snapshots instead of from empty machine-date combinations.
+SNAPSHOT_TRAINING_FILTERS_ENABLED = True
+
+# claim_next_45d needs a complete 45-day future observation window. The current
+# warranty source ends on 2026-06-26, so the latest valid snapshot date is
+# 2026-06-26 minus 45 days = 2026-05-12. Snapshot dates after that are clipped.
+DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW = True
+SNAPSHOT_CUTOFF_REFERENCE_END_DATE = "2026-06-26"
+SNAPSHOT_TARGET_HORIZON_DAYS = 45
+
+# Remove rows with no feature activity and rows with extremely limited feature
+# activity. Sparsity is calculated on numeric model source features only by
+# default, so categorical context columns like full_model do not make a row look
+# active by themselves.
+DROP_ALL_ZERO_SNAPSHOT_ROWS = True
+DROP_EXTREME_SPARSE_SNAPSHOT_ROWS = True
+SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT = 5
+SPARSE_ROW_NONZERO_EPSILON = 1e-12
+SPARSE_ROW_NUMERIC_ONLY = True
+
+# Optional override. Leave empty to use the source features required by the
+# configured MODEL_VARIANTS_TO_RUN. Add source column names here only if you want
+# sparsity filtering to use a custom evidence-feature list.
+SNAPSHOT_SPARSITY_FEATURE_COLUMNS = []
+
+# Keep this False for normal modeling. Set True temporarily only when debugging
+# the filtered snapshot, because it adds a diagnostic column to the dataframe.
+SNAPSHOT_FILTER_ADD_DIAGNOSTIC_COLUMNS = False
+
+# -----------------------------------------------------------------------------
 # Outer chronological split: train / validation / test
 # -----------------------------------------------------------------------------
 # These are treated as weights and normalized internally if they do not sum to 1.
@@ -406,7 +441,7 @@ EVALUATE_TEST_FOR_ALL_VARIANTS = False
 # The train/validation/test split column is intentionally excluded.
 # Categorical features are kept in their original source format instead of being
 # one-hot encoded in this export.
-SAVE_REDUCED_SNAPSHOT_DATAFRAME = False
+SAVE_REDUCED_SNAPSHOT_DATAFRAME = True
 REDUCED_SNAPSHOT_MODEL_VARIANT = "C"
 REDUCED_SNAPSHOT_OUTPUT_FILENAME = "06_snapshot_dataframe_model_C_reduced_snapshot.csv"
 
