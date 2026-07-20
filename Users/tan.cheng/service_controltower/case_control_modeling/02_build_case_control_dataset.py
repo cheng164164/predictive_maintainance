@@ -10,6 +10,7 @@ from cc_utils import (
     build_window_features,
     ensure_dir,
     load_sources,
+    select_positive_claims_for_window_config,
     split_case_control_train_validation_test,
     validate_dataset_features,
     window_dataset_id,
@@ -57,12 +58,21 @@ def run() -> None:
         ensure_dir(dataset_dir)
         print(f"Building dataset: {dataset_id}")
 
-        base_rows, control_audit = build_case_control_base_rows(
+        selected_episodes, claim_selection_audit = select_positive_claims_for_window_config(
             episodes=episodes,
+            window_config=window_config,
+            config=config,
+        )
+        claim_selection_audit.to_csv(dataset_dir / "positive_claim_selection_audit.csv", index=False)
+        selected_episodes.to_csv(dataset_dir / "selected_positive_claim_events.csv", index=False)
+
+        base_rows, control_audit = build_case_control_base_rows(
+            episodes=selected_episodes,
             machine_master=machine_master,
             sources=sources,
             window_config=window_config,
             config=config,
+            claim_history_episodes=episodes,
         )
         base_rows.to_csv(dataset_dir / "case_control_base_rows.csv", index=False)
         control_audit.to_csv(dataset_dir / "control_sampling_audit.csv", index=False)
@@ -71,6 +81,8 @@ def run() -> None:
             print(f"  [WARN] No rows generated for {dataset_id}")
             continue
 
+        # Use all claim episodes for prior-claim history features. The selected
+        # episodes only determine which claims become positive case rows.
         full_df = build_window_features(base_rows, sources=sources, episodes=episodes)
         validate_dataset_features(full_df, config)
         full_df, split_summary = split_case_control_train_validation_test(full_df, config)
@@ -131,6 +143,12 @@ def run() -> None:
             "control_require_source_coverage_overlap_window": bool(config.CONTROL_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW),
             "require_positive_source_coverage_overlap_window": bool(config.REQUIRE_POSITIVE_SOURCE_COVERAGE_OVERLAP_WINDOW),
             "max_positive_cases_per_window": config.MAX_POSITIVE_CASES_PER_WINDOW,
+            "positive_claim_selection_mode": getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first"),
+            "claim_events_available_before_selection": int(len(episodes)),
+            "claim_events_selected_before_source_coverage_filter": int(len(selected_episodes)),
+            "claim_events_excluded_by_selection_rule": int((~claim_selection_audit.get("selected_as_positive_claim", pd.Series(dtype=bool)).astype(bool)).sum()) if not claim_selection_audit.empty else 0,
+            "positive_claim_selection_audit_path": str(dataset_dir / "positive_claim_selection_audit.csv"),
+            "selected_positive_claim_events_path": str(dataset_dir / "selected_positive_claim_events.csv"),
         }
         summary.update(_split_counts(full_df))
         write_json(summary, dataset_dir / "dataset_summary.json")
@@ -168,6 +186,9 @@ def run() -> None:
             "validation_dataset_path": str(validation_path),
             "test_dataset_path": str(test_path),
             "dataset_dir": str(dataset_dir),
+            "positive_claim_selection_mode": getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first"),
+            "claim_events_available_before_selection": int(len(episodes)),
+            "claim_events_selected_before_source_coverage_filter": int(len(selected_episodes)),
         }
         dataset_index_row.update(_split_counts(full_df))
         dataset_index_rows.append(dataset_index_row)
@@ -187,6 +208,12 @@ def run() -> None:
             "dataset_count": int(len(dataset_index)),
             "window_configs": config.WINDOW_CONFIGS,
             "controls_per_positive_case": int(config.CONTROLS_PER_POSITIVE_CASE),
+            "positive_claim_selection_mode": getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first"),
+            "positive_claim_selection_rule": (
+                "first claim event per machine only"
+                if str(getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first")).lower().startswith("first")
+                else "first claim event plus later events at least lead_max_days after the previous event"
+            ),
             "component_features_enabled": bool(getattr(config, "ENABLE_COMPONENT_FEATURES", False)),
             "component_feature_groups": getattr(config, "COMPONENT_FEATURE_GROUPS", {}),
             "split": {

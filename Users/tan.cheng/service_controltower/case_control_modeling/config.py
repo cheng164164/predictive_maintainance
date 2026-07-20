@@ -37,11 +37,11 @@ if not SOURCE_DIR.exists() and Path("/mnt/data").exists():
 OUTPUT_DIR = PROJECT_DIR / "output"
 
 # Candidate file names. The first existing file in SOURCE_DIR is used.
-WARRANTY_FILE_CANDIDATES = ["warranty.csv", "warranty(3).csv"]
-FAULT_CODES_FILE_CANDIDATES = ["fault_codes.csv", "fault_codes(1).csv"]
-FLUID_SAMPLES_FILE_CANDIDATES = ["fluid_samples.csv", "fluid_samples(3).csv"]
-MAINTENANCE_FILE_CANDIDATES = ["maintenance.csv", "maintenance(2).csv"]
-OPERATION_FILE_CANDIDATES = ["operation.csv", "operation_partial.csv", "operation_partial(1).csv"]
+WARRANTY_FILE_CANDIDATES = ["warranty.csv", "warranty(4).csv", "warranty(3).csv"]
+FAULT_CODES_FILE_CANDIDATES = ["fault_codes.csv", "fault_codes(2).csv", "fault_codes(1).csv"]
+FLUID_SAMPLES_FILE_CANDIDATES = ["fluid_samples.csv", "fluid_samples(4).csv", "fluid_samples(3).csv"]
+MAINTENANCE_FILE_CANDIDATES = ["maintenance.csv", "maintenance(3).csv", "maintenance(2).csv"]
+OPERATION_FILE_CANDIDATES = ["operation.csv", "operation_partial.csv", "operation_partial(2).csv", "operation_partial(1).csv"]
 
 # -----------------------------------------------------------------------------
 # Date / data cleaning boundaries
@@ -67,6 +67,28 @@ CLAIM_EPISODE_GAP_DAYS = 30
 # Later, you can set KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS=True to reduce target noise.
 KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS = False
 INVALID_CRITICAL_PART_VALUES = {"", "0", "0000", "000000", "nan", "none", "null"}
+
+# -----------------------------------------------------------------------------
+# Positive claim selection mode
+# -----------------------------------------------------------------------------
+# Controls which warranty claim events are allowed to become positive case rows.
+#
+# "first"
+#   Use only the first claim event for each machine. This matches a first-failure
+#   modeling design and prevents repeat-claim history from influencing the target.
+#
+# "multiple"
+#   Use the first claim event for each machine, plus later claim events only when
+#   the later claim is at least lead_max_days after the immediately previous
+#   claim event for the same machine. The lead_max_days value is read from each
+#   WINDOW_CONFIGS entry, so every selected claim has a clean monitoring window
+#   of the same configured length before the claim.
+#
+# Note: claim events come from 01_build_claim_episodes.py. If CLAIM_EPISODE_GAP_DAYS
+# is greater than zero, very close warranty rows are first grouped into claim
+# episodes. Set CLAIM_EPISODE_GAP_DAYS = 0 if you want almost one event per raw
+# warranty claim date instead of episode grouping.
+POSITIVE_CLAIM_SELECTION_MODE = "first"  # allowed: "first", "multiple"
 
 # -----------------------------------------------------------------------------
 # Window-based case-control design
@@ -314,3 +336,14 @@ XGBOOST_FIXED_SCALE_POS_WEIGHT = 1.0
 # CV prediction files can be large. Keep True for first diagnosis; set False later.
 SAVE_CV_PREDICTIONS = True
 SAVE_SMOKE_PREDICTIONS = True
+
+# -----------------------------------------------------------------------------
+# Validation prediction report
+# -----------------------------------------------------------------------------
+# Step 05 trains each configured model on the chronological training split and
+# scores the chronological validation split. The exported files are intended for
+# inspection at both machine-window level and machine summary level.
+VALIDATION_SCORE_THRESHOLD = 0.50
+VALIDATION_TOP_K_RATES = SMOKE_TOP_K_RATES
+VALIDATION_INCLUDE_FEATURE_COLUMNS = True
+VALIDATION_SAVE_MODEL_ARTIFACTS = False

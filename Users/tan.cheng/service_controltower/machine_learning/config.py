@@ -49,7 +49,7 @@ SNAPSHOT_TRAINING_FILTERS_ENABLED = True
 # 2026-06-26 minus 45 days = 2026-05-12. Snapshot dates after that are clipped.
 DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW = True
 SNAPSHOT_CUTOFF_REFERENCE_END_DATE = "2026-06-26"
-SNAPSHOT_TARGET_HORIZON_DAYS = 45
+SNAPSHOT_TARGET_HORIZON_DAYS = 90
 
 # Remove rows with no feature activity and rows with extremely limited feature
 # activity. Sparsity is calculated on numeric model source features only by

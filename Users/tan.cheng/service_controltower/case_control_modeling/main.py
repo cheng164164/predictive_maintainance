@@ -10,6 +10,7 @@ STEPS = [
     ("02_build_case_control_dataset", "02_build_case_control_dataset"),
     ("03_smoke_run", "03_smoke_run"),
     ("04_cross_validation", "04_cross_validation"),
+    ("05_validation_prediction_report", "05_validation_prediction_report"),
 ]
 
 

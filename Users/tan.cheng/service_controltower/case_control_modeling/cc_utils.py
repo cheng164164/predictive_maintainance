@@ -428,6 +428,114 @@ def claim_dates_by_machine(episodes: pd.DataFrame) -> Dict[str, np.ndarray]:
     return out
 
 
+def select_positive_claims_for_window_config(
+    episodes: pd.DataFrame,
+    window_config: Mapping,
+    config,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Select positive claim events for one configured observation window.
+
+    Two simple modes are supported through config.POSITIVE_CLAIM_SELECTION_MODE:
+
+    - "first": keep only the first claim event for each machine.
+    - "multiple": keep the first claim event, plus later claim events only when
+      the later event is at least lead_max_days after the immediately previous
+      chronological claim event for the same machine.
+
+    The threshold intentionally uses the window_config's lead_max_days. This
+    ensures that every selected repeated claim has a full pre-claim monitoring
+    window that does not include the immediately previous claim date. The
+    selection does not compare failure causes, components, or critical parts.
+    """
+
+    if episodes.empty:
+        empty = episodes.copy()
+        return empty, empty
+
+    mode = str(getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first")).strip().lower()
+    mode_aliases = {
+        "first": "first",
+        "first_claim": "first",
+        "first_only": "first",
+        "first_claim_only": "first",
+        "multiple": "multiple",
+        "multi": "multiple",
+        "multiple_claims": "multiple",
+        "recurrent": "multiple",
+        "recurrent_claims": "multiple",
+    }
+    if mode not in mode_aliases:
+        raise ValueError(
+            "Unsupported POSITIVE_CLAIM_SELECTION_MODE="
+            f"{getattr(config, 'POSITIVE_CLAIM_SELECTION_MODE', None)!r}. "
+            "Use 'first' or 'multiple'."
+        )
+    mode = mode_aliases[mode]
+
+    lead_max = int(window_config["lead_max_days"])
+    e = episodes.copy()
+    e["claim_date"] = pd.to_datetime(e["claim_date"], errors="coerce")
+    e = e.dropna(subset=["machine_key", "claim_date"]).copy()
+    sort_cols = ["machine_key", "claim_date"]
+    if "claim_episode_id" in e.columns:
+        sort_cols.append("claim_episode_id")
+    e = e.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    e["claim_sequence_number"] = e.groupby("machine_key", dropna=False).cumcount() + 1
+    e["machine_claim_event_count"] = e.groupby("machine_key", dropna=False)["claim_date"].transform("size")
+    e["previous_claim_date_same_machine"] = e.groupby("machine_key", dropna=False)["claim_date"].shift(1)
+    e["days_since_previous_claim_same_machine"] = (
+        e["claim_date"] - e["previous_claim_date_same_machine"]
+    ).dt.days.astype(float)
+    e["is_first_claim_for_machine"] = e["claim_sequence_number"].eq(1)
+    e["positive_claim_selection_mode"] = mode
+    e["lead_max_days_threshold_for_repeat_claim"] = lead_max
+
+    if mode == "first":
+        e["selected_as_positive_claim"] = e["is_first_claim_for_machine"]
+        e["claim_selection_reason"] = np.where(
+            e["selected_as_positive_claim"],
+            "first_claim_for_machine",
+            "excluded_not_first_claim_for_machine",
+        )
+    else:
+        gap_ok = e["days_since_previous_claim_same_machine"].ge(float(lead_max))
+        e["selected_as_positive_claim"] = e["is_first_claim_for_machine"] | gap_ok.fillna(False)
+        e["claim_selection_reason"] = np.where(
+            e["is_first_claim_for_machine"],
+            "first_claim_for_machine",
+            np.where(
+                gap_ok.fillna(False),
+                "included_gap_from_previous_claim_ge_lead_max_days",
+                "excluded_gap_from_previous_claim_lt_lead_max_days",
+            ),
+        )
+
+    audit_cols = [
+        "positive_claim_selection_mode",
+        "lead_max_days_threshold_for_repeat_claim",
+        "selected_as_positive_claim",
+        "claim_selection_reason",
+        "machine_key",
+        "full_model",
+        "serial",
+        "claim_episode_id",
+        "claim_date",
+        "claim_sequence_number",
+        "machine_claim_event_count",
+        "is_first_claim_for_machine",
+        "previous_claim_date_same_machine",
+        "days_since_previous_claim_same_machine",
+        "claim_count_in_episode",
+        "claim_numbers",
+        "critical_fail_part_numbers",
+    ]
+    audit_cols = [c for c in audit_cols if c in e.columns]
+    audit = e[audit_cols].copy()
+    selected = e[e["selected_as_positive_claim"]].copy().reset_index(drop=True)
+    return selected, audit.reset_index(drop=True)
+
+
 def has_claim_between(dates_by_machine: Mapping[str, np.ndarray], machine_key: str, start, end) -> bool:
     dates = dates_by_machine.get(machine_key)
     if dates is None or len(dates) == 0:
@@ -481,6 +589,7 @@ def build_case_control_base_rows(
     sources: Mapping[str, pd.DataFrame],
     window_config: Mapping,
     config,
+    claim_history_episodes: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(config.RANDOM_STATE)
     lead_max = int(window_config["lead_max_days"])
@@ -489,12 +598,16 @@ def build_case_control_base_rows(
         raise ValueError("lead_max_days must be greater than lead_min_days.")
 
     coverage = build_source_coverage(sources)
+    # Use the full claim-history table for prior-claim features and control
+    # exclusion checks, even when only a subset of claims is selected as
+    # positive modeling cases for the current window configuration.
+    history_for_claim_checks = claim_history_episodes if claim_history_episodes is not None else episodes
+    dates_by_machine = claim_dates_by_machine(history_for_claim_checks)
     episodes = episodes.merge(
         coverage[["machine_key", "first_source_date", "last_source_date", "source_record_count_total"]],
         on="machine_key",
         how="left",
     )
-    dates_by_machine = claim_dates_by_machine(episodes)
 
     positive_rows = []
     skipped_rows = []
@@ -514,7 +627,7 @@ def build_case_control_base_rows(
                     "window_end": window_end,
                 })
                 continue
-        positive_rows.append({
+        positive_row = {
             "row_role": "case",
             "target": 1,
             "case_control_group_id": f"{window_config['name']}__{ep['claim_episode_id']}",
@@ -533,7 +646,20 @@ def build_case_control_base_rows(
             "claim_numbers": ep.get("claim_numbers", ""),
             "claim_type_descriptions": ep.get("claim_type_descriptions", ""),
             "critical_fail_part_numbers": ep.get("critical_fail_part_numbers", ""),
-        })
+        }
+        for extra_col in [
+            "positive_claim_selection_mode",
+            "lead_max_days_threshold_for_repeat_claim",
+            "claim_sequence_number",
+            "machine_claim_event_count",
+            "is_first_claim_for_machine",
+            "previous_claim_date_same_machine",
+            "days_since_previous_claim_same_machine",
+            "claim_selection_reason",
+        ]:
+            if extra_col in ep.index:
+                positive_row[extra_col] = ep.get(extra_col)
+        positive_rows.append(positive_row)
     positives = pd.DataFrame(positive_rows)
     if getattr(config, "MAX_POSITIVE_CASES_PER_WINDOW", None):
         n = int(config.MAX_POSITIVE_CASES_PER_WINDOW)

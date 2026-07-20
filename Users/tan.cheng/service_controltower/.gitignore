@@ -63,6 +63,9 @@ machine_learning/output/**
 case_control_modeling/output/
 case_control_modeling/output/**
 
+/failure_risk_model/output/**
+failure_risk_model/output/**
+
 ###############################################################################
 # JSON outputs
 ###############################################################################
