@@ -7,12 +7,16 @@ import config
 from cc_utils import (
     build_case_control_base_rows,
     build_machine_master,
+    build_population_random_negative_base_rows,
+    build_asof_population_evaluation_base_rows,
     build_window_features,
+    annotate_future_claim_outcomes,
     ensure_dir,
     load_sources,
     select_positive_claims_for_window_config,
     split_case_control_train_validation_test,
     validate_dataset_features,
+    window_config_name,
     window_dataset_id,
     write_json,
 )
@@ -53,6 +57,7 @@ def run() -> None:
 
     dataset_index_rows = []
     for window_config in config.WINDOW_CONFIGS:
+        window_name = window_config_name(window_config)
         dataset_id = window_dataset_id(window_config, config)
         dataset_dir = step_dir / dataset_id
         ensure_dir(dataset_dir)
@@ -84,6 +89,7 @@ def run() -> None:
         # Use all claim episodes for prior-claim history features. The selected
         # episodes only determine which claims become positive case rows.
         full_df = build_window_features(base_rows, sources=sources, episodes=episodes)
+        full_df = annotate_future_claim_outcomes(full_df, claim_history_episodes=episodes, config=config)
         validate_dataset_features(full_df, config)
         full_df, split_summary = split_case_control_train_validation_test(full_df, config)
 
@@ -97,6 +103,134 @@ def run() -> None:
         full_df[full_df["split"].eq("validation")].to_csv(validation_path, index=False)
         full_df[full_df["split"].eq("test")].to_csv(test_path, index=False)
         split_summary.to_csv(dataset_dir / "split_summary.csv", index=False)
+
+        # ------------------------------------------------------------------
+        # As-of-date population validation/test evaluation datasets.
+        # ------------------------------------------------------------------
+        # These files preserve the original matched case-control train/validation/test
+        # files while adding realistic production-like evaluation datasets.  An
+        # as-of evaluation row is a machine window ending at a historical scoring
+        # date; future-claim horizon columns decide whether it is positive for
+        # 30/60/90/120/etc. day evaluation.
+        population_paths = {}
+        population_summary_rows = []
+        population_audit_rows = []
+
+        asof_split_specs = [
+            ("validation", "ADD_ASOF_POPULATION_EVALUATION_TO_VALIDATION"),
+        ]
+        # Test as-of evaluation is only created when explicitly enabled, normally
+        # by 07_final_test_evaluation.py after parameters are locked.
+        if bool(getattr(config, "ADD_ASOF_POPULATION_EVALUATION_TO_TEST", False)):
+            asof_split_specs.append(("test", "ADD_ASOF_POPULATION_EVALUATION_TO_TEST"))
+
+        for split_name, add_attr in asof_split_specs:
+            if not bool(getattr(config, add_attr, False)):
+                continue
+            reference_split = full_df[full_df["split"].eq(split_name)].copy()
+            asof_base, asof_audit = build_asof_population_evaluation_base_rows(
+                reference_split_df=reference_split,
+                machine_master=machine_master,
+                sources=sources,
+                claim_history_episodes=episodes,
+                window_config=window_config,
+                split_name=split_name,
+                config=config,
+            )
+            asof_base_path = dataset_dir / f"{split_name}_asof_population_base_rows.csv"
+            asof_audit_path = dataset_dir / f"{split_name}_asof_population_audit.csv"
+            asof_base.to_csv(asof_base_path, index=False)
+            asof_audit.to_csv(asof_audit_path, index=False)
+            if not asof_audit.empty:
+                population_audit_rows.extend(asof_audit.to_dict(orient="records"))
+
+            if not asof_base.empty:
+                asof_df = build_window_features(asof_base, sources=sources, episodes=episodes)
+                asof_df = annotate_future_claim_outcomes(asof_df, claim_history_episodes=episodes, config=config)
+                # The original `target` column is not used for horizon-sweep metrics,
+                # but setting it to the maximum configured horizon makes the file
+                # easier to inspect and keeps downstream summaries meaningful.
+                eval_horizons = [int(h) for h in getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", [])] if isinstance(getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", []), (list, tuple, set)) else [int(getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", 0) or 0)]
+                eval_horizons = [h for h in eval_horizons if h > 0]
+                if eval_horizons:
+                    primary_eval_col = f"eval_target_claim_within_next_{max(eval_horizons)}d"
+                    if primary_eval_col in asof_df.columns:
+                        asof_df["target"] = asof_df[primary_eval_col].astype(int)
+                validate_dataset_features(asof_df, config)
+                asof_df["split"] = split_name
+            else:
+                asof_df = pd.DataFrame(columns=full_df.columns)
+
+            asof_path = dataset_dir / f"{split_name}_asof_population_evaluation_dataset.csv"
+            asof_df.to_csv(asof_path, index=False)
+            population_paths[f"{split_name}_asof_population_dataset_path"] = str(asof_path)
+            population_paths[f"{split_name}_asof_population_base_rows_path"] = str(asof_base_path)
+            population_paths[f"{split_name}_asof_population_audit_path"] = str(asof_audit_path)
+
+            horizon_cols = [c for c in asof_df.columns if c.startswith("eval_target_claim_within_next_")]
+            summary = {
+                "split": split_name,
+                "matched_split_rows": int(len(reference_split)),
+                "asof_population_rows": int(len(asof_df)),
+                "asof_population_machines": int(asof_df["machine_key"].nunique(dropna=True)) if len(asof_df) and "machine_key" in asof_df.columns else 0,
+                "asof_population_as_of_dates": int(pd.to_datetime(asof_df.get("window_end"), errors="coerce").nunique()) if len(asof_df) and "window_end" in asof_df.columns else 0,
+                "asof_population_path": str(asof_path),
+            }
+            for col in horizon_cols:
+                summary[f"{col}_positive_rows"] = int(pd.to_numeric(asof_df[col], errors="coerce").fillna(0).sum()) if len(asof_df) else 0
+                summary[f"{col}_positive_rate"] = float(pd.to_numeric(asof_df[col], errors="coerce").fillna(0).mean()) if len(asof_df) else None
+            population_summary_rows.append(summary)
+
+        # Optional legacy random-negative evaluation. Kept off by default.
+        legacy_random_specs = []
+        if bool(getattr(config, "ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION", False)):
+            legacy_random_specs.append(("validation", "VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE"))
+        if bool(getattr(config, "ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST", False)):
+            legacy_random_specs.append(("test", "TEST_RANDOM_NEGATIVES_PER_POSITIVE"))
+        for split_name, ratio_attr in legacy_random_specs:
+            reference_split = full_df[full_df["split"].eq(split_name)].copy()
+            neg_ratio = int(getattr(config, ratio_attr, 0))
+            pop_base, pop_audit = build_population_random_negative_base_rows(
+                reference_split_df=reference_split,
+                machine_master=machine_master,
+                sources=sources,
+                claim_history_episodes=episodes,
+                window_config=window_config,
+                split_name=split_name,
+                negatives_per_positive=neg_ratio,
+                config=config,
+            )
+            pop_base_path = dataset_dir / f"{split_name}_population_random_negative_base_rows.csv"
+            pop_audit_path = dataset_dir / f"{split_name}_population_random_negative_audit.csv"
+            pop_base.to_csv(pop_base_path, index=False)
+            pop_audit.to_csv(pop_audit_path, index=False)
+            if not pop_audit.empty:
+                population_audit_rows.extend(pop_audit.to_dict(orient="records"))
+            if not pop_base.empty:
+                pop_df = build_window_features(pop_base, sources=sources, episodes=episodes)
+                pop_df = annotate_future_claim_outcomes(pop_df, claim_history_episodes=episodes, config=config)
+                validate_dataset_features(pop_df, config)
+                pop_df["split"] = split_name
+            else:
+                pop_df = pd.DataFrame(columns=full_df.columns)
+            split_cases = reference_split[reference_split["target"].astype(int).eq(1)].copy()
+            population_like_df = pd.concat([split_cases, pop_df], ignore_index=True, sort=False)
+            with_extra_df = pd.concat([reference_split, pop_df], ignore_index=True, sort=False)
+            population_like_path = dataset_dir / f"{split_name}_population_like_evaluation_dataset.csv"
+            with_extra_path = dataset_dir / f"{split_name}_dataset_with_population_negatives.csv"
+            pop_df_path = dataset_dir / f"{split_name}_population_random_negative_feature_rows.csv"
+            population_like_df.to_csv(population_like_path, index=False)
+            with_extra_df.to_csv(with_extra_path, index=False)
+            pop_df.to_csv(pop_df_path, index=False)
+            population_paths[f"{split_name}_population_like_dataset_path"] = str(population_like_path)
+            population_paths[f"{split_name}_with_population_negatives_path"] = str(with_extra_path)
+            population_paths[f"{split_name}_population_random_negative_feature_rows_path"] = str(pop_df_path)
+            population_paths[f"{split_name}_population_random_negative_audit_path"] = str(pop_audit_path)
+
+        if population_summary_rows:
+            pd.DataFrame(population_summary_rows).to_csv(dataset_dir / "population_evaluation_dataset_summary.csv", index=False)
+        if population_audit_rows:
+            pd.DataFrame(population_audit_rows).to_csv(dataset_dir / "population_evaluation_audit_all_splits.csv", index=False)
 
         group_split = (
             full_df[["case_control_group_id", "split", config.SPLIT_DATE_COL]]
@@ -116,7 +250,7 @@ def run() -> None:
             "window_config": window_config,
             "lead_max_days": int(window_config["lead_max_days"]),
             "lead_min_days": int(window_config["lead_min_days"]),
-            "controls_per_positive_case_requested": int(config.CONTROLS_PER_POSITIVE_CASE),
+            "controls_per_positive_case_requested": int(getattr(config, "CONTROLS_PER_POSITIVE_CASE", 3)),
             "rows": int(len(full_df)),
             "positive_rows": positive_rows,
             "control_rows": control_rows,
@@ -143,7 +277,14 @@ def run() -> None:
             "control_require_source_coverage_overlap_window": bool(config.CONTROL_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW),
             "require_positive_source_coverage_overlap_window": bool(config.REQUIRE_POSITIVE_SOURCE_COVERAGE_OVERLAP_WINDOW),
             "max_positive_cases_per_window": config.MAX_POSITIVE_CASES_PER_WINDOW,
+            "population_evaluation_paths": population_paths,
+            "population_evaluation_summary": population_summary_rows,
+            "evaluation_target_mode": getattr(config, "EVALUATION_TARGET_MODE", "training_target"),
+            "evaluation_claim_horizon_days": getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None),
+            "evaluation_include_claim_on_window_end": bool(getattr(config, "EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END", True)),
             "positive_claim_selection_mode": getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first"),
+            "evaluation_target_mode": getattr(config, "EVALUATION_TARGET_MODE", "training_target"),
+            "evaluation_claim_horizon_days": getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None),
             "claim_events_available_before_selection": int(len(episodes)),
             "claim_events_selected_before_source_coverage_filter": int(len(selected_episodes)),
             "claim_events_excluded_by_selection_rule": int((~claim_selection_audit.get("selected_as_positive_claim", pd.Series(dtype=bool)).astype(bool)).sum()) if not claim_selection_audit.empty else 0,
@@ -175,7 +316,7 @@ def run() -> None:
 
         dataset_index_row = {
             "dataset_id": dataset_id,
-            "window_name": window_config["name"],
+            "window_name": window_name,
             "lead_max_days": int(window_config["lead_max_days"]),
             "lead_min_days": int(window_config["lead_min_days"]),
             "rows": int(len(full_df)),
@@ -186,7 +327,10 @@ def run() -> None:
             "validation_dataset_path": str(validation_path),
             "test_dataset_path": str(test_path),
             "dataset_dir": str(dataset_dir),
+            **population_paths,
             "positive_claim_selection_mode": getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first"),
+            "evaluation_target_mode": getattr(config, "EVALUATION_TARGET_MODE", "training_target"),
+            "evaluation_claim_horizon_days": getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None),
             "claim_events_available_before_selection": int(len(episodes)),
             "claim_events_selected_before_source_coverage_filter": int(len(selected_episodes)),
         }
@@ -207,7 +351,10 @@ def run() -> None:
             "output_dir": str(step_dir),
             "dataset_count": int(len(dataset_index)),
             "window_configs": config.WINDOW_CONFIGS,
-            "controls_per_positive_case": int(config.CONTROLS_PER_POSITIVE_CASE),
+            "controls_per_positive_case": int(getattr(config, "CONTROLS_PER_POSITIVE_CASE", 3)),
+            "validation_random_negatives_per_positive": int(getattr(config, "VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE", 0)),
+            "evaluation_target_mode": getattr(config, "EVALUATION_TARGET_MODE", "training_target"),
+            "evaluation_claim_horizon_days": getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None),
             "positive_claim_selection_mode": getattr(config, "POSITIVE_CLAIM_SELECTION_MODE", "first"),
             "positive_claim_selection_rule": (
                 "first claim event per machine only"

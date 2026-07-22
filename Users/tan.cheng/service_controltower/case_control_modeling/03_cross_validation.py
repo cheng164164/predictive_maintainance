@@ -1,4 +1,4 @@
-"""Step 04: grouped cross validation for window-based case-control datasets."""
+"""Step 03: grouped cross validation for window-based case-control datasets."""
 from __future__ import annotations
 
 import numpy as np
@@ -13,6 +13,8 @@ from cc_utils import (
     metrics_at_threshold,
     predict_score,
     prediction_frame,
+    get_evaluation_target,
+    future_claim_lead_time_summary,
     threshold_free_metrics,
     top_k_metrics,
     validate_dataset_features,
@@ -35,6 +37,8 @@ def _cv_one_dataset(dataset_row: pd.Series, output_dir) -> dict:
 
     X = df[config.NUMERIC_FEATURES + config.CATEGORICAL_FEATURES]
     y = df["target"].astype(int).reset_index(drop=True)
+    y_eval_all, eval_target_col, eval_target_mode, eval_horizon_days = get_evaluation_target(df, config)
+    y_eval_all = y_eval_all.reset_index(drop=True)
     groups = df["case_control_group_id"].astype(str).reset_index(drop=True)
     n_groups = groups.nunique()
     n_splits = min(int(config.CV_N_SPLITS), int(n_groups))
@@ -52,6 +56,7 @@ def _cv_one_dataset(dataset_row: pd.Series, output_dir) -> dict:
             print(f"  CV dataset={dataset_id} algorithm={algorithm} fold={fold_id}/{n_splits}")
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            y_val_eval = y_eval_all.iloc[val_idx].reset_index(drop=True)
             val_df = df.iloc[val_idx].copy()
             fold_rows.append({
                 "dataset_id": dataset_id,
@@ -77,20 +82,29 @@ def _cv_one_dataset(dataset_row: pd.Series, output_dir) -> dict:
             try:
                 fit_metadata = fit_model_pipeline(model, algorithm, X_train, y_train, config)
                 score = predict_score(model, X_val, algorithm)
-                free = threshold_free_metrics(y_val, score)
-                thresh = metrics_at_threshold(y_val, score, threshold=0.5)
+                free = threshold_free_metrics(y_val_eval, score)
+                thresh = metrics_at_threshold(y_val_eval, score, threshold=0.5)
+                lead = future_claim_lead_time_summary(val_df, y_val_eval)
                 row = {
                     "dataset_id": dataset_id,
                     "algorithm": algorithm,
                     "fold_id": fold_id,
                     "status": "used",
+                    "training_target_col": "target",
+                    "evaluation_target_col": eval_target_col,
+                    "evaluation_target_mode": eval_target_mode,
+                    "evaluation_horizon_days": eval_horizon_days,
                 }
                 row.update({f"fit_{k}": v for k, v in fit_metadata.items() if k != "algorithm"})
                 row.update({f"threshold_free_{k}": v for k, v in free.items()})
                 row.update({f"threshold_0p5_{k}": v for k, v in thresh.items()})
+                row.update({f"lead_time_{k}": v for k, v in lead.items()})
                 metric_rows.append(row)
 
-                tk = top_k_metrics(y_val, score, config.CV_TOP_K_RATES)
+                tk = top_k_metrics(y_val_eval, score, config.CV_TOP_K_RATES)
+                tk.insert(0, "evaluation_target_col", eval_target_col)
+                tk.insert(0, "evaluation_target_mode", eval_target_mode)
+                tk.insert(0, "evaluation_horizon_days", eval_horizon_days)
                 tk.insert(0, "fold_id", fold_id)
                 tk.insert(0, "algorithm", algorithm)
                 tk.insert(0, "dataset_id", dataset_id)
@@ -98,6 +112,8 @@ def _cv_one_dataset(dataset_row: pd.Series, output_dir) -> dict:
 
                 if config.SAVE_CV_PREDICTIONS:
                     pred = prediction_frame(val_df, score)
+                    pred.insert(0, "evaluation_target", y_val_eval.to_numpy())
+                    pred.insert(0, "evaluation_target_col", eval_target_col)
                     pred.insert(0, "fold_id", fold_id)
                     pred.insert(0, "algorithm", algorithm)
                     pred.insert(0, "dataset_id", dataset_id)
@@ -163,7 +179,7 @@ def _cv_one_dataset(dataset_row: pd.Series, output_dir) -> dict:
 
 
 def run() -> None:
-    step_dir = config.OUTPUT_DIR / "04_cross_validation"
+    step_dir = config.OUTPUT_DIR / "03_cross_validation"
     ensure_dir(step_dir)
     dataset_index = _load_dataset_index()
 
@@ -209,13 +225,15 @@ def run() -> None:
 
     write_json(
         {
-            "step": "04_cross_validation",
+            "step": "03_cross_validation",
             "output_dir": str(step_dir),
             "summaries": summaries,
             "models_to_run": config.MODELS_TO_RUN,
             "cv_n_splits_requested": config.CV_N_SPLITS,
             "group_column": "case_control_group_id",
             "training_split_used": "train",
+            "evaluation_target_mode": getattr(config, "EVALUATION_TARGET_MODE", "training_target"),
+            "evaluation_claim_horizon_days": getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None),
             "notes": [
                 "GroupKFold is used only within the chronological train split.",
                 "Each positive case and its matched controls stay in the same fold.",
@@ -224,7 +242,7 @@ def run() -> None:
         },
         step_dir / "run_summary.json",
     )
-    print(f"04_cross_validation completed. Outputs: {step_dir}")
+    print(f"03_cross_validation completed. Outputs: {step_dir}")
 
 
 if __name__ == "__main__":

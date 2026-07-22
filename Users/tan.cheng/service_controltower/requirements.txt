@@ -25,3 +25,4 @@ azure-identity>=1.19.0
 azure-storage-blob>=12.24.0
 
 lightgbm>=4.0.0
+joblib

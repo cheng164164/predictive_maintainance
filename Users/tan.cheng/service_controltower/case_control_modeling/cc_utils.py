@@ -559,25 +559,240 @@ def count_claims_before(dates_by_machine: Mapping[str, np.ndarray], machine_key:
 
 
 # -----------------------------------------------------------------------------
+# Evaluation-only future-claim horizon helpers
+# -----------------------------------------------------------------------------
+def _clean_horizon_days(values) -> List[int]:
+    """Normalize one horizon or a nested/list-like horizon config into ints."""
+    out: List[int] = []
+    if values is None:
+        return out
+    if isinstance(values, (str, int, float, np.integer, np.floating)):
+        values = [values]
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set, np.ndarray, pd.Series)):
+            for nested in _clean_horizon_days(value):
+                if nested not in out:
+                    out.append(nested)
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except TypeError:
+            pass
+        h = int(value)
+        if h >= 0 and h not in out:
+            out.append(h)
+    return out
+
+
+def configured_evaluation_horizons(config) -> List[int]:
+    """Return future-claim horizons materialized as eval target columns.
+
+    EVALUATION_CLAIM_HORIZON_DAYS can be a scalar or a list.  This is the single
+    source of truth for horizon sweep columns; the older
+    EVALUATION_ADDITIONAL_CLAIM_HORIZON_DAYS parameter was removed.
+    """
+    horizons = []
+    primary = getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None)
+    horizons.extend(_clean_horizon_days(primary))
+    final_primary = getattr(config, "FINAL_EVALUATION_CLAIM_HORIZON_DAYS", None)
+    horizons.extend(_clean_horizon_days(final_primary))
+    return sorted(set(horizons))
+
+
+def future_claim_target_col(horizon_days: int) -> str:
+    return f"eval_target_claim_within_next_{int(horizon_days)}d"
+
+
+def next_claim_on_or_after(
+    dates_by_machine: Mapping[str, np.ndarray],
+    machine_key: str,
+    cutoff,
+    include_cutoff: bool = True,
+) -> Tuple[pd.Timestamp, float]:
+    """Return the first claim date on/after cutoff and days from cutoff.
+
+    If include_cutoff is True, a claim on window_end counts as 0 days later.
+    This is useful for lead_min_days=0 windows where the claim date equals the
+    end of the observation window. If there is no later claim, returns NaT/NaN.
+    """
+    dates = dates_by_machine.get(machine_key)
+    if dates is None or len(dates) == 0 or pd.isna(cutoff):
+        return pd.NaT, np.nan
+    cutoff_ts = pd.Timestamp(cutoff)
+    cutoff64 = np.datetime64(cutoff_ts.to_datetime64())
+    side = "left" if include_cutoff else "right"
+    idx = int(np.searchsorted(dates, cutoff64, side=side))
+    if idx >= len(dates):
+        return pd.NaT, np.nan
+    claim_date = pd.Timestamp(dates[idx])
+    return claim_date, float((claim_date - cutoff_ts).days)
+
+
+def annotate_future_claim_outcomes(
+    df: pd.DataFrame,
+    claim_history_episodes: pd.DataFrame,
+    config=None,
+    horizons: Optional[Sequence[int]] = None,
+    include_window_end: Optional[bool] = None,
+) -> pd.DataFrame:
+    """Add next-claim lead-time columns and evaluation-only target columns.
+
+    This does not modify the training `target`.  The added columns are used by
+    CV/validation/test metric code when EVALUATION_TARGET_MODE is set to
+    claim_within_horizon, and are also useful for reviewing prediction lead time.
+    """
+    out = df.copy()
+    if out.empty:
+        return out
+    if "window_end" not in out.columns or "machine_key" not in out.columns:
+        return out
+    if horizons is None:
+        if config is not None:
+            horizons = configured_evaluation_horizons(config)
+        else:
+            horizons = [90, 120, 180, 365]
+    horizons = _clean_horizon_days(horizons)
+    if include_window_end is None:
+        include_window_end = True if config is None else bool(getattr(config, "EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END", True))
+
+    dates_by_machine = claim_dates_by_machine(claim_history_episodes)
+    out["window_end"] = pd.to_datetime(out["window_end"], errors="coerce")
+
+    next_dates = []
+    days_to_next = []
+    for m, end in zip(out["machine_key"], out["window_end"]):
+        claim_date, days = next_claim_on_or_after(dates_by_machine, m, end, include_cutoff=include_window_end)
+        next_dates.append(claim_date)
+        days_to_next.append(days)
+    out["next_claim_date_on_or_after_window_end"] = pd.to_datetime(next_dates, errors="coerce")
+    out["days_to_next_claim_on_or_after_window_end"] = pd.to_numeric(pd.Series(days_to_next, index=out.index), errors="coerce")
+    out["has_future_claim_on_or_after_window_end"] = out["next_claim_date_on_or_after_window_end"].notna().astype(int)
+    out["future_claim_lead_time_bucket"] = pd.cut(
+        out["days_to_next_claim_on_or_after_window_end"],
+        bins=[-0.1, 0, 30, 60, 90, 120, 180, 365, np.inf],
+        labels=["0d", "1-30d", "31-60d", "61-90d", "91-120d", "121-180d", "181-365d", "365d+"],
+    ).astype(object)
+    out.loc[out["days_to_next_claim_on_or_after_window_end"].isna(), "future_claim_lead_time_bucket"] = "no_future_claim_observed"
+
+    for horizon in horizons:
+        col = future_claim_target_col(horizon)
+        days = out["days_to_next_claim_on_or_after_window_end"]
+        out[col] = days.notna().astype(int)
+        out.loc[days.isna() | (days > float(horizon)), col] = 0
+        out[col] = out[col].astype(int)
+    return out
+
+
+def evaluation_target_settings(
+    config,
+    prefix: str = "",
+    horizon_days: Optional[int] = None,
+) -> Tuple[str, Optional[int], str]:
+    """Return (mode, horizon_days, target_column_name) for evaluation metrics.
+
+    When EVALUATION_CLAIM_HORIZON_DAYS is a list and no explicit horizon is
+    supplied, the largest configured horizon is used as a safe default for
+    scripts that do not perform a horizon sweep. Step 04 passes explicit horizons
+    and evaluates every configured value.
+    """
+    if prefix:
+        mode = getattr(config, f"{prefix}_EVALUATION_TARGET_MODE", None)
+        horizon = getattr(config, f"{prefix}_EVALUATION_CLAIM_HORIZON_DAYS", None)
+    else:
+        mode = None
+        horizon = None
+    if mode is None:
+        mode = getattr(config, "EVALUATION_TARGET_MODE", "training_target")
+    mode = str(mode).strip().lower()
+    if horizon_days is not None:
+        horizon = horizon_days
+    elif horizon is None:
+        horizon = getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None)
+    if mode in {"training", "train", "target", "training_target", "original", "original_target"}:
+        return "training_target", None, "target"
+    if mode in {"claim_within_horizon", "future_claim_horizon", "relaxed", "relaxed_future_claim"}:
+        horizons = _clean_horizon_days(horizon)
+        if not horizons:
+            raise ValueError("EVALUATION_CLAIM_HORIZON_DAYS must be set when using claim_within_horizon evaluation.")
+        h = int(max(horizons))
+        return "claim_within_horizon", h, future_claim_target_col(h)
+    raise ValueError(f"Unsupported evaluation target mode: {mode!r}")
+
+
+def get_evaluation_target(
+    df: pd.DataFrame,
+    config,
+    prefix: str = "",
+    horizon_days: Optional[int] = None,
+) -> Tuple[pd.Series, str, str, Optional[int]]:
+    """Return the evaluation y vector without changing model training target."""
+    mode, horizon, col = evaluation_target_settings(config, prefix=prefix, horizon_days=horizon_days)
+    if col not in df.columns:
+        if col == "target":
+            raise ValueError("Dataset is missing required target column.")
+        raise ValueError(
+            f"Dataset is missing {col!r}. Re-run 02_build_case_control_dataset.py with the updated scripts "
+            "so future-claim evaluation columns are added."
+        )
+    y = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return y, col, mode, horizon
+
+
+def future_claim_lead_time_summary(df: pd.DataFrame, y_eval: Optional[pd.Series] = None) -> dict:
+    """Small summary of how far in the future claims occur in an evaluation set."""
+    out = {}
+    if "days_to_next_claim_on_or_after_window_end" not in df.columns:
+        return out
+    days = pd.to_numeric(df["days_to_next_claim_on_or_after_window_end"], errors="coerce")
+    out["future_claim_observed_rows"] = int(days.notna().sum())
+    out["future_claim_never_observed_rows"] = int(days.isna().sum())
+    if days.notna().any():
+        out["future_claim_days_min"] = float(days.min())
+        out["future_claim_days_median"] = float(days.median())
+        out["future_claim_days_mean"] = float(days.mean())
+        out["future_claim_days_p90"] = float(days.quantile(0.90))
+    if y_eval is not None:
+        y = pd.Series(y_eval).astype(int).reset_index(drop=True)
+        d = days.reset_index(drop=True)
+        pos_days = d[y.eq(1)]
+        out["evaluation_target_positive_rows"] = int(y.sum())
+        out["evaluation_target_positive_rate"] = float(y.mean()) if len(y) else np.nan
+        if pos_days.notna().any():
+            out["evaluation_positive_days_median"] = float(pos_days.median())
+            out["evaluation_positive_days_max"] = float(pos_days.max())
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Case-control row building
 # -----------------------------------------------------------------------------
-def window_dataset_id(window_config: Mapping, config) -> str:
-    """Return a compact, stable dataset id for one window configuration.
+def window_config_name(window_config: Mapping) -> str:
+    """Return the canonical window name derived from lead-day settings.
 
-    If the user names the window exactly like the derived lead label
-    (for example name="lead_120_to_30" with lead_max_days=120 and
-    lead_min_days=30), do not repeat it in the output file names.
+    WINDOW_CONFIGS no longer needs a redundant name field.  If older configs
+    still provide name, it is ignored for file naming and group IDs so outputs
+    remain compact and consistent.
     """
 
+    return f"lead_{int(window_config['lead_max_days'])}_to_{int(window_config['lead_min_days'])}"
+
+
+def controls_per_positive(config) -> int:
+    """Return the configured matched-control ratio per positive case."""
+
+    return int(getattr(config, "CONTROLS_PER_POSITIVE_CASE", 3))
+
+
+def window_dataset_id(window_config: Mapping, config) -> str:
+    """Return a compact, stable dataset id for one window configuration."""
+
     feature_suffix = "components_on" if bool(getattr(config, "ENABLE_COMPONENT_FEATURES", False)) else "components_off"
-    lead_label = f"lead_{int(window_config['lead_max_days'])}_to_{int(window_config['lead_min_days'])}"
-    configured_name = str(window_config.get("name", "")).strip()
-    if configured_name and configured_name != lead_label:
-        prefix = f"{configured_name}__{lead_label}"
-    else:
-        prefix = lead_label
+    lead_label = window_config_name(window_config)
     base = (
-        f"{prefix}__controls_{int(config.CONTROLS_PER_POSITIVE_CASE)}__"
+        f"{lead_label}__controls_{controls_per_positive(config)}__"
         f"neg_{int(config.CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END)}__{feature_suffix}"
     )
     return re.sub(r"[^A-Za-z0-9_.=-]+", "_", base)
@@ -630,12 +845,12 @@ def build_case_control_base_rows(
         positive_row = {
             "row_role": "case",
             "target": 1,
-            "case_control_group_id": f"{window_config['name']}__{ep['claim_episode_id']}",
+            "case_control_group_id": f"{window_config_name(window_config)}__{ep['claim_episode_id']}",
             "claim_episode_id": ep["claim_episode_id"],
             "machine_key": ep["machine_key"],
             "full_model": ep["full_model"],
             "serial": ep["serial"],
-            "window_name": window_config["name"],
+            "window_name": window_config_name(window_config),
             "lead_max_days": lead_max,
             "lead_min_days": lead_min,
             "window_start": window_start,
@@ -686,7 +901,7 @@ def build_case_control_base_rows(
 
     controls = []
     control_audit_rows = []
-    n_controls = int(config.CONTROLS_PER_POSITIVE_CASE)
+    n_controls = controls_per_positive(config)
     for i, case in positives.iterrows():
         window_start = pd.Timestamp(case["window_start"])
         window_end = pd.Timestamp(case["window_end"])
@@ -777,6 +992,413 @@ def build_case_control_base_rows(
     audit = pd.concat([pd.DataFrame(skipped_rows), pd.DataFrame(control_audit_rows)], ignore_index=True, sort=False)
     return base, audit
 
+
+def _first_existing_timestamp(*values) -> pd.Timestamp:
+    for value in values:
+        if value is None or pd.isna(value):
+            continue
+        return pd.Timestamp(value)
+    return pd.NaT
+
+
+def _max_claim_observation_date(config) -> pd.Timestamp:
+    for attr in ["MAX_CLAIM_DATE", "MAX_VALID_EVENT_DATE"]:
+        value = getattr(config, attr, None)
+        if value is not None:
+            return pd.Timestamp(value)
+    return pd.Timestamp.today().normalize()
+
+
+def build_population_random_negative_base_rows(
+    reference_split_df: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    claim_history_episodes: pd.DataFrame,
+    window_config: Mapping,
+    split_name: str,
+    negatives_per_positive: int,
+    config,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build population-like random negative windows for validation/test.
+
+    These rows are not matched to claim dates.  A row represents a realistic
+    production scoring window:
+
+        window_start = random_as_of_date - (lead_max_days - lead_min_days)
+        window_end   = random_as_of_date
+
+    It is labeled negative only when the machine has no claim in the configured
+    future no-claim horizon after window_end.  By default, rows with a claim
+    inside the observation window are also excluded to avoid labeling an active
+    claim window as a clean negative.
+    """
+
+    split_name = str(split_name)
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = int(lead_max - lead_min)
+    if observation_days <= 0:
+        raise ValueError("lead_max_days must be greater than lead_min_days for population negatives.")
+
+    if reference_split_df is None or reference_split_df.empty or int(negatives_per_positive) <= 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    positives = reference_split_df[pd.to_numeric(reference_split_df.get("target", 0), errors="coerce").fillna(0).astype(int).eq(1)].copy()
+    positive_count = int(len(positives))
+    requested = int(positive_count * int(negatives_per_positive))
+    if requested <= 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    dates_by_machine = claim_dates_by_machine(claim_history_episodes)
+    coverage = build_source_coverage(sources)
+    master = machine_master.copy()
+    if "first_source_date" not in master.columns or "last_source_date" not in master.columns:
+        master = master.merge(coverage, on="machine_key", how="left")
+    master["full_model"] = master.get("full_model", "").map(clean_model)
+    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
+    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
+    master = master.dropna(subset=["machine_key", "first_source_date", "last_source_date"]).copy()
+    master = master[master["machine_key"].astype(str).str.len() > 0].copy()
+
+    if master.empty:
+        return pd.DataFrame(), pd.DataFrame([{
+            "split": split_name,
+            "status": "no_machine_master_candidates",
+            "requested_population_negative_rows": requested,
+            "selected_population_negative_rows": 0,
+        }])
+
+    # Use the chronological validation/test date range from the matched split so
+    # random negatives are sampled from the same historical period as the holdout.
+    date_col = str(getattr(config, "SPLIT_DATE_COL", "window_end"))
+    date_source = positives if not positives.empty else reference_split_df
+    if date_col not in date_source.columns:
+        date_col = "window_end"
+    split_min = pd.to_datetime(date_source[date_col], errors="coerce").min()
+    split_max = pd.to_datetime(date_source[date_col], errors="coerce").max()
+    if pd.isna(split_min) or pd.isna(split_max):
+        split_min = pd.to_datetime(reference_split_df["window_end"], errors="coerce").min()
+        split_max = pd.to_datetime(reference_split_df["window_end"], errors="coerce").max()
+
+    future_horizon = int(getattr(
+        config,
+        "POPULATION_RANDOM_NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END",
+        getattr(config, "CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180),
+    ))
+    require_future_observable = bool(getattr(config, "POPULATION_RANDOM_NEGATIVE_REQUIRE_FUTURE_OBSERVABILITY", True))
+    max_claim_observed_date = _max_claim_observation_date(config)
+    if require_future_observable:
+        split_max = min(pd.Timestamp(split_max), max_claim_observed_date - pd.Timedelta(days=future_horizon))
+
+    exclude_claims_in_window = bool(getattr(config, "POPULATION_RANDOM_NEGATIVE_EXCLUDE_CLAIMS_DURING_OBSERVATION_WINDOW", True))
+    require_coverage = bool(getattr(config, "POPULATION_RANDOM_NEGATIVE_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True))
+    max_attempts = int(getattr(config, "POPULATION_RANDOM_NEGATIVE_MAX_ATTEMPTS_MULTIPLIER", 80)) * max(requested, 1)
+    random_state_offset = 100000 if split_name == "validation" else 200000
+    rng = np.random.default_rng(int(getattr(config, "RANDOM_STATE", 42)) + random_state_offset + lead_max * 10 + lead_min)
+
+    rows = []
+    audit_rows = []
+    seen = set()
+    checked = 0
+    master_records = master.reset_index(drop=True)
+    n_master = len(master_records)
+
+    while len(rows) < requested and checked < max_attempts:
+        checked += 1
+        ctrl = master_records.iloc[int(rng.integers(0, n_master))]
+        m = ctrl["machine_key"]
+
+        earliest_end = max(pd.Timestamp(ctrl["first_source_date"]) + pd.Timedelta(days=observation_days), pd.Timestamp(split_min))
+        latest_end = min(pd.Timestamp(ctrl["last_source_date"]), pd.Timestamp(split_max))
+        if pd.isna(earliest_end) or pd.isna(latest_end) or latest_end < earliest_end:
+            continue
+        span_days = int((latest_end - earliest_end).days)
+        offset = int(rng.integers(0, span_days + 1)) if span_days > 0 else 0
+        window_end = earliest_end + pd.Timedelta(days=offset)
+        window_start = window_end - pd.Timedelta(days=observation_days)
+
+        if require_coverage:
+            if pd.Timestamp(ctrl["first_source_date"]) > window_end or pd.Timestamp(ctrl["last_source_date"]) < window_start:
+                continue
+
+        future_start = window_end + pd.Timedelta(days=1)
+        future_end = window_end + pd.Timedelta(days=future_horizon)
+        if has_claim_between(dates_by_machine, m, future_start, future_end):
+            continue
+        if exclude_claims_in_window and has_claim_between(dates_by_machine, m, window_start, window_end):
+            continue
+
+        key = (str(m), pd.Timestamp(window_end).date().isoformat(), split_name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        idx = len(rows) + 1
+        rows.append({
+            "row_role": "population_negative",
+            "target": 0,
+            "split": split_name,
+            "case_control_group_id": f"{window_config_name(window_config)}__population_negative__{split_name}__{idx:07d}",
+            "claim_episode_id": "",
+            "control_number_within_group": np.nan,
+            "machine_key": m,
+            "full_model": ctrl.get("full_model", ""),
+            "serial": ctrl.get("serial", ""),
+            "window_name": window_config_name(window_config),
+            "lead_max_days": lead_max,
+            "lead_min_days": lead_min,
+            "population_window_length_days": observation_days,
+            "window_start": window_start,
+            "window_end": window_end,
+            "future_claim_date": pd.NaT,
+            "days_from_window_end_to_claim": np.nan,
+            "control_no_claim_start": future_start,
+            "control_no_claim_end": future_end,
+            "control_sampling_reason": "population_random_negative_no_claim_in_future_horizon",
+            "population_negative_split": split_name,
+            "population_negative_requested_ratio": int(negatives_per_positive),
+            "population_negative_future_horizon_days": future_horizon,
+            "population_negative_observation_days": observation_days,
+            "population_negative_excluded_claims_in_window": exclude_claims_in_window,
+        })
+
+    audit_rows.append({
+        "split": split_name,
+        "window_name": window_config_name(window_config),
+        "lead_max_days": lead_max,
+        "lead_min_days": lead_min,
+        "observation_days": observation_days,
+        "positive_rows_in_reference_split": positive_count,
+        "negatives_per_positive_requested": int(negatives_per_positive),
+        "requested_population_negative_rows": requested,
+        "selected_population_negative_rows": int(len(rows)),
+        "candidate_machines": int(len(master_records)),
+        "attempts_checked": int(checked),
+        "max_attempts": int(max_attempts),
+        "split_date_min_used": split_min,
+        "split_date_max_used": split_max,
+        "future_horizon_days": future_horizon,
+        "require_future_observability": require_future_observable,
+        "exclude_claims_during_observation_window": exclude_claims_in_window,
+        "require_source_coverage_overlap_window": require_coverage,
+        "status": "selected_requested_count" if len(rows) >= requested else "selected_fewer_than_requested",
+    })
+    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
+
+
+def _max_evaluation_horizon_days_for_asof(config) -> int:
+    """Return the maximum horizon needed to label as-of population rows safely."""
+    horizons = configured_evaluation_horizons(config)
+    if horizons:
+        return int(max(horizons))
+    return int(getattr(config, "CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
+
+
+def build_asof_population_evaluation_base_rows(
+    reference_split_df: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    claim_history_episodes: pd.DataFrame,
+    window_config: Mapping,
+    split_name: str,
+    config,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build realistic as-of-date population evaluation windows.
+
+    These rows are evaluation-only and are not used for training.  They mimic a
+    production scoring snapshot: for each historical as-of date in the holdout
+    period, build one lookback window per eligible machine, then let future
+    claim-horizon columns decide whether the row is positive for 30/60/90/etc.
+    day evaluation.
+    """
+
+    split_name = str(split_name)
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = int(lead_max - lead_min)
+    if observation_days <= 0:
+        raise ValueError("lead_max_days must be greater than lead_min_days for as-of population evaluation.")
+
+    if reference_split_df is None or reference_split_df.empty:
+        return pd.DataFrame(), pd.DataFrame([{
+            "split": split_name,
+            "status": "empty_reference_split",
+            "selected_asof_rows": 0,
+        }])
+
+    coverage = build_source_coverage(sources)
+    master = machine_master.copy()
+    if "first_source_date" not in master.columns or "last_source_date" not in master.columns:
+        master = master.merge(coverage, on="machine_key", how="left")
+    master["full_model"] = master.get("full_model", "").map(clean_model)
+    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
+    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
+    master = master.dropna(subset=["machine_key", "first_source_date", "last_source_date"]).copy()
+    master = master[master["machine_key"].astype(str).str.len() > 0].copy()
+    if master.empty:
+        return pd.DataFrame(), pd.DataFrame([{
+            "split": split_name,
+            "status": "no_machine_master_candidates",
+            "selected_asof_rows": 0,
+        }])
+
+    date_col = str(getattr(config, "SPLIT_DATE_COL", "window_end"))
+    date_source = reference_split_df.copy()
+    if date_col not in date_source.columns:
+        date_col = "window_end"
+    split_min = pd.to_datetime(date_source[date_col], errors="coerce").min()
+    split_max = pd.to_datetime(date_source[date_col], errors="coerce").max()
+    if pd.isna(split_min) or pd.isna(split_max):
+        return pd.DataFrame(), pd.DataFrame([{
+            "split": split_name,
+            "status": "missing_reference_date_range",
+            "selected_asof_rows": 0,
+        }])
+
+    max_horizon = _max_evaluation_horizon_days_for_asof(config)
+    require_future_observable = bool(getattr(config, "ASOF_EVALUATION_REQUIRE_FUTURE_OBSERVABILITY", True))
+    max_claim_observed_date = _max_claim_observation_date(config)
+    if require_future_observable:
+        split_max = min(pd.Timestamp(split_max), max_claim_observed_date - pd.Timedelta(days=max_horizon))
+    if split_max < split_min:
+        return pd.DataFrame(), pd.DataFrame([{
+            "split": split_name,
+            "status": "no_dates_after_future_observability_filter",
+            "selected_asof_rows": 0,
+            "reference_split_min": split_min,
+            "reference_split_max_after_filter": split_max,
+            "max_evaluation_horizon_days": max_horizon,
+            "max_claim_observed_date": max_claim_observed_date,
+        }])
+
+    frequency_days = int(getattr(config, "ASOF_EVALUATION_SNAPSHOT_FREQUENCY_DAYS", 30) or 30)
+    frequency_days = max(1, frequency_days)
+    snapshot_dates = list(pd.date_range(pd.Timestamp(split_min), pd.Timestamp(split_max), freq=f"{frequency_days}D"))
+    if not snapshot_dates or snapshot_dates[-1] != pd.Timestamp(split_max):
+        snapshot_dates.append(pd.Timestamp(split_max))
+
+    max_machines_per_snapshot = getattr(config, "ASOF_EVALUATION_MAX_MACHINES_PER_SNAPSHOT", None)
+    if max_machines_per_snapshot is not None:
+        max_machines_per_snapshot = int(max_machines_per_snapshot)
+        if max_machines_per_snapshot <= 0:
+            max_machines_per_snapshot = None
+
+    split_max_rows_attr = f"{split_name.upper()}_ASOF_EVALUATION_MAX_ROWS"
+    max_rows = getattr(config, split_max_rows_attr, None)
+    if max_rows is None:
+        max_rows = getattr(config, "ASOF_EVALUATION_MAX_ROWS_PER_SPLIT", None)
+    if max_rows is not None:
+        max_rows = int(max_rows)
+        if max_rows <= 0:
+            max_rows = None
+
+    require_coverage = bool(getattr(config, "ASOF_EVALUATION_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True))
+    exclude_claims_in_window = bool(getattr(config, "ASOF_EVALUATION_EXCLUDE_CLAIMS_DURING_OBSERVATION_WINDOW", False))
+    dates_by_machine = claim_dates_by_machine(claim_history_episodes)
+    random_state_offset = 300000 if split_name == "validation" else 400000
+    rng = np.random.default_rng(int(getattr(config, "RANDOM_STATE", 42)) + random_state_offset + lead_max * 10 + lead_min)
+
+    rows = []
+    audit_rows = []
+    seen = set()
+    for snapshot_idx, as_of in enumerate(snapshot_dates, start=1):
+        window_end = pd.Timestamp(as_of)
+        window_start = window_end - pd.Timedelta(days=observation_days)
+        candidates = master.copy()
+        if require_coverage:
+            candidates = candidates[
+                (candidates["first_source_date"] <= window_end)
+                & (candidates["last_source_date"] >= window_start)
+            ].copy()
+        if exclude_claims_in_window and not candidates.empty:
+            keep_mask = [not has_claim_between(dates_by_machine, m, window_start, window_end) for m in candidates["machine_key"]]
+            candidates = candidates.loc[keep_mask].copy()
+        eligible_count = int(len(candidates))
+        if candidates.empty:
+            audit_rows.append({
+                "split": split_name,
+                "snapshot_index": snapshot_idx,
+                "as_of_date": window_end,
+                "eligible_machines": 0,
+                "selected_rows": 0,
+                "status": "no_eligible_machines",
+            })
+            continue
+        if max_machines_per_snapshot is not None and len(candidates) > max_machines_per_snapshot:
+            seed = int(rng.integers(0, 2**31 - 1))
+            candidates = candidates.sample(n=max_machines_per_snapshot, random_state=seed)
+        selected_count = 0
+        for _, ctrl in candidates.iterrows():
+            if max_rows is not None and len(rows) >= max_rows:
+                break
+            m = ctrl["machine_key"]
+            key = (str(m), window_end.date().isoformat(), split_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            idx = len(rows) + 1
+            rows.append({
+                "row_role": "asof_population_window",
+                "target": 0,
+                "split": split_name,
+                "case_control_group_id": f"{window_config_name(window_config)}__asof_population__{split_name}__{window_end.strftime('%Y%m%d')}__{idx:07d}",
+                "claim_episode_id": "",
+                "control_number_within_group": np.nan,
+                "machine_key": m,
+                "full_model": ctrl.get("full_model", ""),
+                "serial": ctrl.get("serial", ""),
+                "window_name": window_config_name(window_config),
+                "lead_max_days": lead_max,
+                "lead_min_days": lead_min,
+                "population_window_length_days": observation_days,
+                "as_of_date": window_end,
+                "window_start": window_start,
+                "window_end": window_end,
+                "future_claim_date": pd.NaT,
+                "days_from_window_end_to_claim": np.nan,
+                "control_no_claim_start": pd.NaT,
+                "control_no_claim_end": pd.NaT,
+                "control_sampling_reason": "asof_population_snapshot_window",
+                "asof_population_split": split_name,
+                "asof_snapshot_frequency_days": frequency_days,
+                "asof_max_evaluation_horizon_days": max_horizon,
+                "asof_require_future_observability": require_future_observable,
+                "asof_excluded_claims_in_observation_window": exclude_claims_in_window,
+            })
+            selected_count += 1
+        audit_rows.append({
+            "split": split_name,
+            "snapshot_index": snapshot_idx,
+            "as_of_date": window_end,
+            "window_start": window_start,
+            "window_end": window_end,
+            "eligible_machines": eligible_count,
+            "selected_rows": int(selected_count),
+            "max_machines_per_snapshot": max_machines_per_snapshot,
+            "status": "selected",
+        })
+        if max_rows is not None and len(rows) >= max_rows:
+            break
+
+    audit_rows.append({
+        "split": split_name,
+        "snapshot_index": "summary",
+        "as_of_date": pd.NaT,
+        "window_start": pd.NaT,
+        "window_end": pd.NaT,
+        "reference_split_min": split_min,
+        "reference_split_max_used": split_max,
+        "snapshot_count": int(len(snapshot_dates)),
+        "selected_rows": int(len(rows)),
+        "candidate_machines": int(len(master)),
+        "observation_days": observation_days,
+        "max_evaluation_horizon_days": max_horizon,
+        "require_future_observability": require_future_observable,
+        "require_source_coverage_overlap_window": require_coverage,
+        "exclude_claims_during_observation_window": exclude_claims_in_window,
+        "status": "selected_rows" if rows else "no_rows_selected",
+    })
+    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
 
 def latest_operation_smr_before(operation_df: pd.DataFrame, machine_key: str, cutoff) -> float:
     if operation_df.empty:
@@ -1110,19 +1732,159 @@ def resolve_xgboost_scale_pos_weight(y_train, config) -> Tuple[Optional[float], 
     )
 
 
-def fit_model_pipeline(model, algorithm: str, X_train: pd.DataFrame, y_train: pd.Series, config) -> dict:
+def _to_numpy_dense(matrix) -> np.ndarray:
+    """Return a dense numpy array from a numpy/scipy/pandas matrix."""
+    if hasattr(matrix, "toarray"):
+        return matrix.toarray()
+    return np.asarray(matrix)
+
+
+def prepared_feature_names(pipeline) -> List[str]:
+    """Return feature names emitted by a fitted sklearn ColumnTransformer."""
+    if not hasattr(pipeline, "named_steps") or "preprocessor" not in pipeline.named_steps:
+        return []
+    try:
+        return [str(x) for x in pipeline.named_steps["preprocessor"].get_feature_names_out()]
+    except Exception:
+        return []
+
+
+def transform_with_fitted_preprocessor(pipeline, X: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    """Transform X with a fitted pipeline preprocessor and return matrix plus names."""
+    if not hasattr(pipeline, "named_steps") or "preprocessor" not in pipeline.named_steps:
+        raise ValueError("Pipeline does not contain a fitted preprocessor step.")
+    pre = pipeline.named_steps["preprocessor"]
+    matrix = _to_numpy_dense(pre.transform(X))
+    names = prepared_feature_names(pipeline)
+    if not names:
+        names = [f"f{i}" for i in range(matrix.shape[1])]
+    return matrix, names
+
+
+def _fit_xgboost_pipeline_with_eval(
+    model,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_eval: pd.DataFrame,
+    y_eval: pd.Series,
+    config,
+    eval_name: str = "validation",
+) -> dict:
+    """Fit an XGBoost pipeline while recording train/eval learning curves.
+
+    The normal sklearn Pipeline cannot pass a transformed eval_set into XGBoost.
+    This helper fits the preprocessor first, transforms train/eval data, and then
+    fits the XGBClassifier directly with eval_set=[train, eval].  Early stopping
+    is optional and disabled by default in Phase 1 design sweeps.
+    """
+
+    metadata = {"algorithm": "xgboost", "xgboost_fit_mode": "manual_preprocess_with_eval_set"}
+    spw, mode = resolve_xgboost_scale_pos_weight(y_train, config)
+    metadata["xgboost_class_importance_mode"] = mode
+    metadata["xgboost_scale_pos_weight"] = spw
+
+    pre = model.named_steps["preprocessor"]
+    xgb_model = model.named_steps["model"]
+    if spw is not None:
+        xgb_model.set_params(scale_pos_weight=float(spw))
+
+    use_early_stopping = bool(getattr(config, "XGBOOST_USE_EARLY_STOPPING", False))
+    early_rounds = int(getattr(config, "XGBOOST_EARLY_STOPPING_ROUNDS", 0) or 0)
+    if use_early_stopping and early_rounds > 0:
+        xgb_model.set_params(early_stopping_rounds=early_rounds)
+        metadata["xgboost_early_stopping_enabled"] = True
+        metadata["xgboost_early_stopping_rounds"] = early_rounds
+    else:
+        metadata["xgboost_early_stopping_enabled"] = False
+        metadata["xgboost_early_stopping_rounds"] = 0
+
+    X_train_prepared = _to_numpy_dense(pre.fit_transform(X_train))
+    X_eval_prepared = _to_numpy_dense(pre.transform(X_eval))
+    y_train_arr = pd.Series(y_train).astype(int).to_numpy()
+    y_eval_arr = pd.Series(y_eval).astype(int).to_numpy()
+
+    fit_kwargs = {
+        "eval_set": [(X_train_prepared, y_train_arr), (X_eval_prepared, y_eval_arr)],
+        "verbose": bool(getattr(config, "XGBOOST_FIT_VERBOSE", False)),
+    }
+    try:
+        xgb_model.fit(X_train_prepared, y_train_arr, **fit_kwargs)
+    except TypeError:
+        # Compatibility fallback for older xgboost versions that expect
+        # early_stopping_rounds in fit rather than constructor parameters.
+        if use_early_stopping and early_rounds > 0:
+            try:
+                xgb_model.set_params(early_stopping_rounds=None)
+            except Exception:
+                pass
+            fit_kwargs["early_stopping_rounds"] = early_rounds
+            xgb_model.fit(X_train_prepared, y_train_arr, **fit_kwargs)
+        else:
+            raise
+
+    metadata["xgboost_eval_name"] = eval_name
+    try:
+        evals_result = xgb_model.evals_result()
+    except Exception:
+        evals_result = {}
+    metadata["_xgboost_evals_result"] = evals_result
+    metadata["xgboost_learning_curve_available"] = bool(evals_result)
+    if hasattr(xgb_model, "best_iteration"):
+        try:
+            metadata["xgboost_best_iteration"] = int(xgb_model.best_iteration)
+        except Exception:
+            metadata["xgboost_best_iteration"] = np.nan
+    if hasattr(xgb_model, "best_score"):
+        try:
+            metadata["xgboost_best_score"] = float(xgb_model.best_score)
+        except Exception:
+            metadata["xgboost_best_score"] = np.nan
+    return metadata
+
+
+def fit_model_pipeline(
+    model,
+    algorithm: str,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    config,
+    X_eval: Optional[pd.DataFrame] = None,
+    y_eval: Optional[pd.Series] = None,
+    eval_name: str = "validation",
+) -> dict:
     """Fit a model pipeline and return fit metadata.
 
     This helper centralizes per-split configuration such as XGBoost
-    scale_pos_weight, so smoke runs and CV use exactly the same behavior.
+    scale_pos_weight.  For XGBoost, it can also record train/evaluation
+    learning curves through eval_set without enabling early stopping.
     """
 
     metadata = {"algorithm": str(algorithm).lower()}
     algorithm = str(algorithm).lower()
     if algorithm == "xgboost":
+        use_eval_set = (
+            X_eval is not None
+            and y_eval is not None
+            and (
+                bool(getattr(config, "XGBOOST_ENABLE_LEARNING_CURVE", True))
+                or bool(getattr(config, "XGBOOST_USE_EARLY_STOPPING", False))
+            )
+        )
+        if use_eval_set and hasattr(model, "named_steps") and "preprocessor" in model.named_steps:
+            return _fit_xgboost_pipeline_with_eval(
+                model=model,
+                X_train=X_train,
+                y_train=y_train,
+                X_eval=X_eval,
+                y_eval=y_eval,
+                config=config,
+                eval_name=eval_name,
+            )
         spw, mode = resolve_xgboost_scale_pos_weight(y_train, config)
         metadata["xgboost_class_importance_mode"] = mode
         metadata["xgboost_scale_pos_weight"] = spw
+        metadata["xgboost_fit_mode"] = "sklearn_pipeline"
+        metadata["xgboost_learning_curve_available"] = False
         if spw is not None and hasattr(model, "set_params"):
             model.set_params(model__scale_pos_weight=float(spw))
     model.fit(X_train, y_train)
@@ -1336,6 +2098,10 @@ def prediction_frame(df: pd.DataFrame, score: np.ndarray) -> pd.DataFrame:
         "window_start",
         "window_end",
         "future_claim_date",
+        "next_claim_date_on_or_after_window_end",
+        "days_to_next_claim_on_or_after_window_end",
+        "has_future_claim_on_or_after_window_end",
+        "future_claim_lead_time_bucket",
         "claim_episode_id",
     ]
     cols = [c for c in cols if c in df.columns]
@@ -1674,6 +2440,122 @@ def build_window_features(base_rows: pd.DataFrame, sources: Mapping[str, pd.Data
         feature_part = feature_part.drop(columns=overlap)
     out = base_no_id.join(feature_part)
     return out
+
+
+def xgboost_learning_curve_frame(pipeline, fit_metadata: Optional[Mapping] = None) -> pd.DataFrame:
+    """Return XGBoost eval_set learning-curve history as a long dataframe."""
+    result = {}
+    if fit_metadata and isinstance(fit_metadata.get("_xgboost_evals_result"), Mapping):
+        result = fit_metadata.get("_xgboost_evals_result") or {}
+    if not result and hasattr(pipeline, "named_steps") and "model" in pipeline.named_steps:
+        model = pipeline.named_steps["model"]
+        if hasattr(model, "evals_result"):
+            try:
+                result = model.evals_result()
+            except Exception:
+                result = {}
+    rows = []
+    dataset_alias = {"validation_0": "train", "validation_1": str((fit_metadata or {}).get("xgboost_eval_name", "validation"))}
+    for dataset_name, metric_map in (result or {}).items():
+        dataset_label = dataset_alias.get(str(dataset_name), str(dataset_name))
+        if not isinstance(metric_map, Mapping):
+            continue
+        for metric_name, values in metric_map.items():
+            for i, value in enumerate(values):
+                rows.append({
+                    "iteration": int(i),
+                    "dataset_name": str(dataset_name),
+                    "dataset_label": dataset_label,
+                    "metric": str(metric_name),
+                    "value": float(value),
+                })
+    return pd.DataFrame(rows)
+
+
+def summarize_xgboost_learning_curve(curve: pd.DataFrame, eval_label: str = "validation") -> pd.DataFrame:
+    """Summarize train/eval gap and best validation iteration for each metric."""
+    if curve.empty:
+        return pd.DataFrame()
+    rows = []
+    maximize_tokens = ("auc", "aucpr", "map", "ndcg")
+    for metric, g_metric in curve.groupby("metric", dropna=False):
+        eval_rows = g_metric[g_metric["dataset_label"].astype(str).eq(str(eval_label))]
+        if eval_rows.empty:
+            # If the alias does not match, use the last non-train dataset.
+            non_train = g_metric[~g_metric["dataset_label"].astype(str).eq("train")]
+            eval_rows = non_train if not non_train.empty else g_metric
+        train_rows = g_metric[g_metric["dataset_label"].astype(str).eq("train")]
+        maximize = any(tok in str(metric).lower() for tok in maximize_tokens)
+        best_idx = eval_rows["value"].idxmax() if maximize else eval_rows["value"].idxmin()
+        best = eval_rows.loc[best_idx]
+        final_eval = eval_rows.sort_values("iteration").iloc[-1]
+        final_train_value = np.nan
+        if not train_rows.empty:
+            final_train_value = float(train_rows.sort_values("iteration").iloc[-1]["value"])
+        rows.append({
+            "metric": metric,
+            "higher_is_better": bool(maximize),
+            "iteration_count": int(g_metric["iteration"].max() + 1),
+            "best_eval_iteration": int(best["iteration"]),
+            "best_eval_value": float(best["value"]),
+            "final_eval_iteration": int(final_eval["iteration"]),
+            "final_eval_value": float(final_eval["value"]),
+            "final_train_value": final_train_value,
+            "final_train_minus_eval": float(final_train_value - float(final_eval["value"])) if pd.notna(final_train_value) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def xgboost_booster_importance_frame(pipeline, algorithm: str) -> pd.DataFrame:
+    """Return XGBoost booster importance by weight/gain/cover when available."""
+    if str(algorithm).lower() != "xgboost":
+        return pd.DataFrame()
+    if not hasattr(pipeline, "named_steps") or "model" not in pipeline.named_steps:
+        return pd.DataFrame()
+    model = pipeline.named_steps["model"]
+    if not hasattr(model, "get_booster"):
+        return pd.DataFrame()
+    try:
+        booster = model.get_booster()
+    except Exception:
+        return pd.DataFrame()
+    names = prepared_feature_names(pipeline)
+    if not names:
+        try:
+            n = int(booster.num_features())
+            names = [f"f{i}" for i in range(n)]
+        except Exception:
+            names = []
+    def map_feature_name(key: str) -> str:
+        text = str(key)
+        if text.startswith("f") and text[1:].isdigit():
+            idx = int(text[1:])
+            if 0 <= idx < len(names):
+                return names[idx]
+        return text
+    frames = []
+    for importance_type in ["weight", "gain", "cover", "total_gain", "total_cover"]:
+        try:
+            scores = booster.get_score(importance_type=importance_type)
+        except Exception:
+            scores = {}
+        if not scores:
+            continue
+        frame = pd.DataFrame([
+            {
+                "algorithm": "xgboost",
+                "prepared_feature": map_feature_name(k),
+                "booster_feature_key": str(k),
+                "importance_type": importance_type,
+                "importance_value": float(v),
+            }
+            for k, v in scores.items()
+        ])
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    return out.sort_values(["importance_type", "importance_value"], ascending=[True, False], kind="mergesort").reset_index(drop=True)
 
 
 def model_feature_importance_frame(pipeline, algorithm: str) -> pd.DataFrame:
