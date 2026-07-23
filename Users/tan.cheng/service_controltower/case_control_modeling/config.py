@@ -88,7 +88,7 @@ INVALID_CRITICAL_PART_VALUES = {"", "0", "0000", "000000", "nan", "none", "null"
 # is greater than zero, very close warranty rows are first grouped into claim
 # episodes. Set CLAIM_EPISODE_GAP_DAYS = 0 if you want almost one event per raw
 # warranty claim date instead of episode grouping.
-POSITIVE_CLAIM_SELECTION_MODE = "multiple"  # allowed: "first", "multiple"
+POSITIVE_CLAIM_SELECTION_MODE = "first"  # allowed: "first", "multiple"
 
 # -----------------------------------------------------------------------------
 # Window-based case-control design

@@ -21,6 +21,7 @@ from ml_utils import (
     param_set_id,
     predict_probability,
     prediction_frame,
+    prepared_features_for_available_sources,
     read_snapshot,
     select_best_threshold,
     source_features_for_model_variants,
@@ -86,13 +87,16 @@ def _load_and_prepare_snapshot():
         enabled=getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False),
         drop_after_cutoff=getattr(config, "DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW", False),
         cutoff_reference_end_date=getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
         drop_all_zero_rows=getattr(config, "DROP_ALL_ZERO_SNAPSHOT_ROWS", True),
         drop_extreme_sparse_rows=getattr(config, "DROP_EXTREME_SPARSE_SNAPSHOT_ROWS", True),
         min_nonzero_feature_count=getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
         nonzero_epsilon=getattr(config, "SPARSE_ROW_NONZERO_EPSILON", 1e-12),
         numeric_only=getattr(config, "SPARSE_ROW_NUMERIC_ONLY", True),
         add_diagnostic_columns=getattr(config, "SNAPSHOT_FILTER_ADD_DIAGNOSTIC_COLUMNS", False),
+        activity_feature_columns=getattr(config, "SNAPSHOT_ACTIVITY_FEATURE_COLUMNS", []),
+        activity_exclude_columns=getattr(config, "SNAPSHOT_ACTIVITY_EXCLUDE_COLUMNS", []),
+        sentinel_columns=list(getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}).keys()),
     )
     return df, sentinel_report, snapshot_filter_report
 
@@ -192,15 +196,28 @@ def run() -> None:
     for algorithm in algorithms:
         default_params = _default_params_for_algorithm(algorithm)
         for variant in config.MODEL_VARIANTS_TO_RUN:
-            selected_prepared = config.FEATURE_SETS[variant]
+            configured_selected_prepared = list(config.FEATURE_SETS[variant])
             source_features = source_features_for_prepared_features(
-                selected_prepared, config.PREPARED_TO_SOURCE_FEATURE
+                configured_selected_prepared, config.PREPARED_TO_SOURCE_FEATURE
             )
             present_sources, missing_sources = validate_source_features(
-                training_df, source_features, error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES
+                training_df,
+                source_features,
+                error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES,
+            )
+            selected_prepared, skipped_prepared, skipped_sources = (
+                prepared_features_for_available_sources(
+                    prepared_features=configured_selected_prepared,
+                    prepared_to_source=config.PREPARED_TO_SOURCE_FEATURE,
+                    available_source_features=present_sources,
+                )
             )
             if missing_sources:
-                print(f"[WARN] algorithm={algorithm} variant={variant}: missing source features ignored: {missing_sources}")
+                print(
+                    f"[WARN] algorithm={algorithm} variant={variant}: "
+                    f"skipping missing source columns={missing_sources}; "
+                    f"prepared features removed={skipped_prepared}"
+                )
 
             for param_idx, override in enumerate(param_overrides, start=1):
                 pid = param_set_id(override, param_idx)
@@ -270,8 +287,15 @@ def run() -> None:
                         "gap_end_date": fold.gap_end_date,
                         "validation_start_date": fold.validation_start_date,
                         "validation_end_date": fold.validation_end_date,
-                        "selected_prepared_feature_count": len(selected_prepared),
-                        "required_source_feature_count": len(present_sources),
+                        "configured_prepared_feature_count": len(configured_selected_prepared),
+                        "effective_configured_prepared_feature_count": len(selected_prepared),
+                        "selected_prepared_feature_count": len(prepared.selected_prepared_features),
+                        "required_source_feature_count": len(source_features),
+                        "available_source_feature_count": len(present_sources),
+                        "missing_source_feature_count": len(missing_sources),
+                        "missing_source_features": ";".join(missing_sources),
+                        "skipped_prepared_feature_count": len(skipped_prepared),
+                        "skipped_prepared_features": ";".join(skipped_prepared),
                         "missing_selected_prepared_feature_count": len(prepared.missing_selected_prepared_features),
                     }
                     row.update({f"threshold_free_{k}": v for k, v in free.items()})
@@ -496,7 +520,7 @@ def run() -> None:
             "snapshot_training_filter_report_file": "01c_snapshot_training_filter_report.csv" if not snapshot_filter_report.empty else None,
             "snapshot_rows_after_training_filters": int(len(split.train) + len(split.validation) + len(split.test)),
             "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
             "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
             "machine_level_top_k_enabled": config.ENABLE_MACHINE_LEVEL_TOP_K,
             "machine_id_col": config.MACHINE_ID_COL if config.ENABLE_MACHINE_LEVEL_TOP_K else None,
@@ -506,6 +530,7 @@ def run() -> None:
                 "If HYPERPARAMETER_TUNING_ENABLED=True, XGBoost parameter ranges are evaluated and mean average precision selects hyperparameters.",
                 "F2, recall, precision, flagged rate, snapshot top-K, and optional machine top-K are reported per fold for review.",
                 "9999 sentinel values are cleaned before splitting when SENTINEL_CLEANING_ENABLED=True.",
+                "Prepared features mapped to completely missing source columns are skipped and reported instead of added as permanent zero columns.",
                 "Snapshot rows after the configured full target-window cutoff are removed before splitting.",
                 "All-zero and extreme-sparse numeric feature rows are removed before splitting when snapshot filters are enabled.",
             ],

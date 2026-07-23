@@ -17,6 +17,7 @@ from ml_utils import (
     model_feature_importance,
     predict_probability,
     prediction_frame,
+    prepared_features_for_available_sources,
     read_json,
     read_snapshot,
     save_model_artifacts,
@@ -84,13 +85,16 @@ def _load_and_prepare_snapshot():
         enabled=getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False),
         drop_after_cutoff=getattr(config, "DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW", False),
         cutoff_reference_end_date=getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
         drop_all_zero_rows=getattr(config, "DROP_ALL_ZERO_SNAPSHOT_ROWS", True),
         drop_extreme_sparse_rows=getattr(config, "DROP_EXTREME_SPARSE_SNAPSHOT_ROWS", True),
         min_nonzero_feature_count=getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
         nonzero_epsilon=getattr(config, "SPARSE_ROW_NONZERO_EPSILON", 1e-12),
         numeric_only=getattr(config, "SPARSE_ROW_NUMERIC_ONLY", True),
         add_diagnostic_columns=getattr(config, "SNAPSHOT_FILTER_ADD_DIAGNOSTIC_COLUMNS", False),
+        activity_feature_columns=getattr(config, "SNAPSHOT_ACTIVITY_FEATURE_COLUMNS", []),
+        activity_exclude_columns=getattr(config, "SNAPSHOT_ACTIVITY_EXCLUDE_COLUMNS", []),
+        sentinel_columns=list(getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}).keys()),
     )
     return df, sentinel_report, snapshot_filter_report
 
@@ -179,17 +183,28 @@ def run() -> None:
             current_run += 1
             print(f"[Final training {current_run}/{total_runs}] algorithm={algorithm} variant={variant}")
 
-            selected_prepared = config.FEATURE_SETS[variant]
+            configured_selected_prepared = list(config.FEATURE_SETS[variant])
             source_features = source_features_for_prepared_features(
-                selected_prepared, config.PREPARED_TO_SOURCE_FEATURE
+                configured_selected_prepared, config.PREPARED_TO_SOURCE_FEATURE
             )
             present_sources, missing_sources = validate_source_features(
                 split.train,
                 source_features,
                 error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES,
             )
+            selected_prepared, skipped_prepared, skipped_sources = (
+                prepared_features_for_available_sources(
+                    prepared_features=configured_selected_prepared,
+                    prepared_to_source=config.PREPARED_TO_SOURCE_FEATURE,
+                    available_source_features=present_sources,
+                )
+            )
             if missing_sources:
-                print(f"[WARN] algorithm={algorithm} variant={variant}: missing source features ignored: {missing_sources}")
+                print(
+                    f"[WARN] algorithm={algorithm} variant={variant}: "
+                    f"skipping missing source columns={missing_sources}; "
+                    f"prepared features removed={skipped_prepared}"
+                )
 
             prepared = fit_transform_prepared_features(
                 train_df=split.train,
@@ -231,8 +246,15 @@ def run() -> None:
             selected_threshold = select_best_threshold(val_search, beta=config.THRESHOLD_BETA)
 
             val_metrics = {"algorithm": algorithm, "model_variant": variant, "split": "validation", **selected_threshold}
-            val_metrics["selected_prepared_feature_count"] = len(selected_prepared)
-            val_metrics["required_source_feature_count"] = len(present_sources)
+            val_metrics["configured_prepared_feature_count"] = len(configured_selected_prepared)
+            val_metrics["effective_configured_prepared_feature_count"] = len(selected_prepared)
+            val_metrics["selected_prepared_feature_count"] = len(prepared.selected_prepared_features)
+            val_metrics["required_source_feature_count"] = len(source_features)
+            val_metrics["available_source_feature_count"] = len(present_sources)
+            val_metrics["missing_source_feature_count"] = len(missing_sources)
+            val_metrics["missing_source_features"] = ";".join(missing_sources)
+            val_metrics["skipped_prepared_feature_count"] = len(skipped_prepared)
+            val_metrics["skipped_prepared_features"] = ";".join(skipped_prepared)
             val_metrics["missing_selected_prepared_feature_count"] = len(prepared.missing_selected_prepared_features)
             val_metrics["hyperparameter_tuning_enabled"] = bool(getattr(config, "HYPERPARAMETER_TUNING_ENABLED", False))
             val_metrics["cv_selected_param_set_id"] = selected_cv.get(algorithm, {}).get(variant, {}).get("param_set_id", "default_or_cv_not_run")
@@ -291,6 +313,10 @@ def run() -> None:
                 "test_probability": test_prob,
                 "selected_threshold": selected_threshold,
                 "validation_metrics": val_metrics,
+                "configured_selected_prepared": configured_selected_prepared,
+                "effective_selected_prepared": selected_prepared,
+                "missing_source_features": missing_sources,
+                "skipped_prepared_features": skipped_prepared,
             }
 
             print(
@@ -389,15 +415,19 @@ def run() -> None:
         "selected_threshold_from_validation": final_obj["selected_threshold"],
         "model_params_used": final_obj["params"],
         "param_override_from_cv": final_obj["param_override"],
+        "configured_prepared_feature_count": len(final_obj["configured_selected_prepared"]),
+        "effective_configured_prepared_feature_count": len(final_obj["effective_selected_prepared"]),
         "selected_prepared_feature_count": len(final_obj["prepared"].selected_prepared_features),
         "selected_prepared_features": final_obj["prepared"].selected_prepared_features,
+        "missing_source_features_skipped": final_obj["missing_source_features"],
+        "prepared_features_skipped_for_missing_sources": final_obj["skipped_prepared_features"],
         "numeric_input_cols": final_obj["prepared"].numeric_input_cols,
         "categorical_input_cols": final_obj["prepared"].categorical_input_cols,
         "missing_selected_prepared_features_added_as_zero": final_obj["prepared"].missing_selected_prepared_features,
         "sentinel_cleaning_enabled": bool(getattr(config, "SENTINEL_CLEANING_ENABLED", False)),
         "snapshot_training_filters_enabled": bool(getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False)),
         "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-        "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
         "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
     }
     write_json(metadata, step_dir / "10_final_model_selection.json")
@@ -430,7 +460,7 @@ def run() -> None:
             "snapshot_training_filter_report_file": "00c_snapshot_training_filter_report.csv" if not snapshot_filter_report.empty else None,
             "snapshot_rows_after_training_filters": int(len(split.train) + len(split.validation) + len(split.test)),
             "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
             "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
             "machine_level_top_k_enabled": config.ENABLE_MACHINE_LEVEL_TOP_K,
             "machine_id_col": config.MACHINE_ID_COL if config.ENABLE_MACHINE_LEVEL_TOP_K else None,
@@ -441,6 +471,7 @@ def run() -> None:
                 "Probability threshold is selected on validation_holdout using F2 with max flagged-rate constraint.",
                 "Test metrics are evaluated after threshold selection.",
                 "9999 sentinel values are cleaned before splitting when SENTINEL_CLEANING_ENABLED=True.",
+                "Prepared features mapped to completely missing source columns are skipped and reported instead of added as permanent zero columns.",
                 "Snapshot rows after the configured full target-window cutoff are removed before splitting.",
                 "All-zero and extreme-sparse numeric feature rows are removed before splitting when snapshot filters are enabled.",
             ],

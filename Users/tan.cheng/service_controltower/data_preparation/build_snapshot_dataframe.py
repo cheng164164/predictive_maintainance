@@ -2,7 +2,7 @@
 Build leakage-safe source-level and unified snapshot dataframes for predictive maintenance.
 
 Current supported source files:
-    1. machine.csv          canonical model_id + snapshot_date backbone
+    1. machine.csv          eligible model_ids, date bounds, and machine metadata
     2. fault_codes.csv      fault/event history
     3. maintenance.csv      maintenance-monitor / PM history
     4. operation.csv        daily operation / utilization history
@@ -33,14 +33,15 @@ Output grain:
     One row per model_id / snapshot_date.
 
 Important design choice:
-    machine.csv is the canonical snapshot backbone. All source-specific snapshot
-    tables must follow the same model_id + snapshot_date rows from machine.csv.
-    Source tables do not create their own snapshot calendars.
+    machine.csv supplies eligible model_ids, original start/end date bounds, and
+    machine metadata. By default, the builder reconstructs an exact fixed-day
+    modeling calendar from those bounds. All source snapshots then follow the
+    reconstructed model_id + snapshot_date rows.
 
 Core leakage-control rule:
     Features only use source records with event_date < snapshot_date.
-    Target labels from warranty data only use claim/failure dates after
-    snapshot_date and on/before snapshot_date + prediction_horizon.
+    Target labels from warranty data use claim/failure dates on or after
+    snapshot_date and strictly before snapshot_date + prediction_horizon.
 """
 
 from __future__ import annotations
@@ -143,6 +144,81 @@ MACHINE_SNAPSHOT_DATE_CANDIDATE_COLUMNS = tuple(
 
 ALLOW_MODEL_ID_FALLBACK = bool(cfg("ALLOW_MODEL_ID_FALLBACK", True))
 PROGRESS_EVERY_MACHINES = int(cfg("PROGRESS_EVERY_MACHINES", 100))
+
+LOOKBACK_DAYS = int(cfg("LOOKBACK_DAYS", 90))
+HORIZON_DAYS = int(cfg("HORIZON_DAYS", 90))
+SNAPSHOT_FREQ_DAYS = int(cfg("SNAPSHOT_FREQ_DAYS", 45))
+FEATURE_MODE = str(cfg("FEATURE_MODE", "basic")).strip().lower()
+VALID_FEATURE_MODES = {"basic", "frozen"}
+if FEATURE_MODE not in VALID_FEATURE_MODES:
+    raise ValueError(
+        f"Unsupported FEATURE_MODE={FEATURE_MODE!r}. "
+        f"Expected one of {sorted(VALID_FEATURE_MODES)}."
+    )
+TARGET_COLUMN = f"claim_next_{HORIZON_DAYS}d"
+
+BASE_NUMERIC_FEATURES = list(
+    cfg(
+        "BASE_NUMERIC_FEATURES",
+        [
+            "prior_claim_count_before_window",
+            "days_since_prior_claim_before_window",
+            "has_any_source_window",
+            "source_record_count_window",
+            "has_fault_window",
+            "fault_count_window",
+            "fault_unique_code_count_window",
+            "fault_l03plus_count_window",
+            "fault_l04plus_count_window",
+            "fault_max_action_level_window",
+            "fault_max_evidence_score_window",
+            "fault_mean_evidence_score_window",
+            "fault_max_log_occurrence_window",
+            "fault_days_since_latest_in_window",
+            "fault_mechanical_count_window",
+            "fault_electrical_count_window",
+            "has_fluid_window",
+            "fluid_sample_count_window",
+            "fluid_max_severity_window",
+            "fluid_latest_severity_window",
+            "fluid_days_since_latest_sample_window",
+            "fluid_max_cu_ppm_window",
+            "fluid_max_fe_ppm_window",
+            "fluid_max_pb_ppm_window",
+            "fluid_max_soot_percent_window",
+            "fluid_max_water_percent_window",
+            "has_maintenance_window",
+            "maintenance_event_count_window",
+            "maintenance_monitor_reset_count_window",
+            "maintenance_overdue_count_window",
+            "maintenance_due_now_count_window",
+            "maintenance_min_remaining_hours_window",
+            "maintenance_days_since_latest_event_window",
+            "has_operation_window",
+            "operation_day_count_window",
+            "operation_working_hours_sum_window",
+            "operation_working_hours_mean_window",
+            "operation_working_hours_max_window",
+            "operation_engine_running_hours_sum_window",
+            "operation_idle_hours_sum_window",
+            "operation_idle_share_window",
+            "operation_latest_smr_window",
+            "operation_smr_delta_window",
+            "operation_high_throttle_day_count_window",
+        ],
+    )
+)
+
+BASE_CATEGORICAL_FEATURES = list(
+    cfg(
+        "BASE_CATEGORICAL_FEATURES",
+        [
+            "full_model",
+            "fault_dominant_component_window",
+            "maintenance_dominant_component_window",
+        ],
+    )
+)
 
 
 # -----------------------------------------------------------------------------
@@ -809,16 +885,29 @@ def boolean_from_mixed_values(series: pd.Series, default: bool = False) -> pd.Se
     return result.fillna(default).astype(bool)
 
 
+def dominant_component(window: pd.DataFrame, has_records: bool) -> str:
+    """Return the dominant recognized component in a source window."""
+    if not has_records:
+        return "none"
+    counts = {
+        component: int(window.get(f"is_component_{component}", pd.Series(False, index=window.index)).sum())
+        for component in COMPONENT_PATTERNS
+    }
+    max_count = max(counts.values(), default=0)
+    if max_count <= 0:
+        return "other"
+    return next(component for component in COMPONENT_PATTERNS if counts[component] == max_count)
+
+
 # -----------------------------------------------------------------------------
 # Machine backbone standardization
 # -----------------------------------------------------------------------------
 def standardize_machine_backbone(machine: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Standardize machine.csv as the canonical model_id + snapshot_date backbone.
+    """Standardize machine.csv as the candidate model/date backbone.
 
-    Unlike earlier versions, this function does not create snapshot dates from
-    event-source min/max dates. It trusts machine.csv to define the official
-    snapshot calendar. Every source snapshot table must later match this exact
-    backbone.
+    machine.csv supplies the eligible model_ids, original date bounds, full_model,
+    and optional machine metadata. The exact modeling calendar may then be
+    reconstructed from those bounds by apply_snapshot_frequency().
     """
     m = machine.copy()
     m["model_id"], model_id_source = normalize_model_id(m, "machine")
@@ -859,7 +948,7 @@ def standardize_machine_backbone(machine: pd.DataFrame) -> tuple[pd.DataFrame, d
 
     summary = {
         "source": "machine",
-        "source_role": "canonical_snapshot_backbone",
+        "source_role": "candidate_snapshot_backbone",
         "input_rows": total_rows,
         "model_id_source": model_id_source,
         "snapshot_date_source": snapshot_date_col,
@@ -875,8 +964,206 @@ def standardize_machine_backbone(machine: pd.DataFrame) -> tuple[pd.DataFrame, d
     return out, summary
 
 
+def _select_available_dates_by_frequency(
+    available_dates: pd.Series,
+    frequency_days: int,
+    anchor_date: Optional[pd.Timestamp] = None,
+) -> list[pd.Timestamp]:
+    """Legacy helper that selects only dates already present in machine.csv.
+
+    When source dates are every 14 days and frequency_days is 45, this helper
+    selects dates 56 days apart because 45-day dates do not exist in the source
+    calendar. Keep it only for backward-compatible experiments using
+    SNAPSHOT_FREQUENCY_STRATEGY="select_existing".
+    """
+    dates = pd.Series(pd.to_datetime(available_dates, errors="coerce")).dropna().drop_duplicates().sort_values()
+    if dates.empty or frequency_days <= 0:
+        return dates.tolist()
+
+    next_allowed = pd.Timestamp(anchor_date).normalize() if anchor_date is not None else dates.iloc[0]
+    selected: list[pd.Timestamp] = []
+    for current in dates:
+        current = pd.Timestamp(current).normalize()
+        if current < next_allowed:
+            continue
+        selected.append(current)
+        next_allowed = current + pd.Timedelta(days=frequency_days)
+    return selected
+
+
+def _generate_exact_snapshot_dates(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    frequency_days: int,
+    anchor_date: Optional[pd.Timestamp] = None,
+) -> list[pd.Timestamp]:
+    """Generate exact fixed-interval dates bounded by start_date and end_date."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if pd.isna(start) or pd.isna(end) or start > end:
+        return []
+    if frequency_days <= 0:
+        raise ValueError("SNAPSHOT_FREQ_DAYS must be positive when reconstructing dates.")
+
+    if anchor_date is None:
+        first = start
+    else:
+        anchor = pd.Timestamp(anchor_date).normalize()
+        if anchor < start:
+            days_to_start = int((start - anchor).days)
+            steps = (days_to_start + frequency_days - 1) // frequency_days
+            first = anchor + pd.Timedelta(days=steps * frequency_days)
+        else:
+            first = anchor
+
+    if first > end:
+        return []
+    return list(pd.date_range(start=first, end=end, freq=f"{frequency_days}D"))
+
+
+def _asof_machine_metadata_for_dates(
+    model_rows: pd.DataFrame,
+    generated_dates: list[pd.Timestamp],
+) -> pd.DataFrame:
+    """Attach machine columns using the latest original row on/before each date.
+
+    This allows exact reconstructed dates that were not present in machine.csv,
+    while preserving full_model and any machine_* fields without looking into
+    future machine-backbone rows.
+    """
+    if not generated_dates:
+        return model_rows.iloc[0:0].copy()
+
+    model_rows = model_rows.sort_values("snapshot_date").drop_duplicates("snapshot_date", keep="last")
+    model_id = model_rows["model_id"].iloc[0]
+    metadata = model_rows.drop(columns=["model_id"]).copy()
+    calendar = pd.DataFrame({"snapshot_date": pd.to_datetime(generated_dates)})
+    rebuilt = pd.merge_asof(
+        calendar.sort_values("snapshot_date"),
+        metadata.sort_values("snapshot_date"),
+        on="snapshot_date",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    rebuilt.insert(0, "model_id", model_id)
+    return rebuilt
+
+
+def reconstruct_snapshot_backbone(
+    backbone: pd.DataFrame,
+    frequency_days: int,
+    scope: str,
+    anchor_date: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """Rebuild an exact snapshot calendar from machine.csv start/end bounds.
+
+    global:
+        Use one calendar anchored to the global start date. Each model receives
+        dates from that calendar only within its own original min/max bounds.
+
+    per_model:
+        Start an independent exact calendar at each model's first date unless an
+        explicit SNAPSHOT_ANCHOR_DATE is configured.
+    """
+    if backbone.empty:
+        return backbone.copy()
+
+    global_start = pd.Timestamp(backbone["snapshot_date"].min()).normalize()
+    global_end = pd.Timestamp(backbone["snapshot_date"].max()).normalize()
+    global_dates = _generate_exact_snapshot_dates(
+        global_start,
+        global_end,
+        frequency_days,
+        anchor_date,
+    )
+
+    rebuilt_parts: list[pd.DataFrame] = []
+    for _, group in backbone.groupby("model_id", sort=False):
+        model_start = pd.Timestamp(group["snapshot_date"].min()).normalize()
+        model_end = pd.Timestamp(group["snapshot_date"].max()).normalize()
+        if scope == "global":
+            dates = [d for d in global_dates if model_start <= d <= model_end]
+        else:
+            dates = _generate_exact_snapshot_dates(
+                model_start,
+                model_end,
+                frequency_days,
+                anchor_date,
+            )
+        rebuilt_parts.append(_asof_machine_metadata_for_dates(group, dates))
+
+    if not rebuilt_parts:
+        return backbone.iloc[0:0].copy()
+    return pd.concat(rebuilt_parts, ignore_index=True)
+
+
+def apply_snapshot_frequency(backbone: pd.DataFrame) -> pd.DataFrame:
+    """Apply or reconstruct the configured modeling snapshot calendar."""
+    if not bool(cfg("APPLY_SNAPSHOT_FREQUENCY", True)):
+        progress("Snapshot-frequency processing disabled; keeping all machine.csv dates.")
+        return backbone.copy()
+
+    frequency_days = int(cfg("SNAPSHOT_FREQ_DAYS", SNAPSHOT_FREQ_DAYS))
+    if frequency_days <= 0:
+        progress("SNAPSHOT_FREQ_DAYS <= 0; keeping all machine.csv dates.")
+        return backbone.copy()
+
+    scope = str(cfg("SNAPSHOT_FREQUENCY_SCOPE", "global")).strip().lower()
+    if scope not in {"global", "per_model"}:
+        raise ValueError("SNAPSHOT_FREQUENCY_SCOPE must be 'global' or 'per_model'.")
+
+    strategy = str(cfg("SNAPSHOT_FREQUENCY_STRATEGY", "reconstruct")).strip().lower()
+    if strategy not in {"reconstruct", "select_existing"}:
+        raise ValueError(
+            "SNAPSHOT_FREQUENCY_STRATEGY must be 'reconstruct' or 'select_existing'."
+        )
+
+    anchor_raw = cfg("SNAPSHOT_ANCHOR_DATE", None)
+    anchor = pd.to_datetime(anchor_raw).normalize() if anchor_raw else None
+    before_rows = len(backbone)
+    before_dates = backbone["snapshot_date"].nunique()
+    source_start = backbone["snapshot_date"].min()
+    source_end = backbone["snapshot_date"].max()
+
+    if strategy == "reconstruct":
+        out = reconstruct_snapshot_backbone(
+            backbone,
+            frequency_days=frequency_days,
+            scope=scope,
+            anchor_date=anchor,
+        )
+        action = "Reconstructed"
+    elif scope == "global":
+        selected_dates = _select_available_dates_by_frequency(
+            backbone["snapshot_date"], frequency_days, anchor
+        )
+        out = backbone[backbone["snapshot_date"].isin(selected_dates)].copy()
+        action = "Selected existing"
+    else:
+        parts: list[pd.DataFrame] = []
+        for _, group in backbone.groupby("model_id", sort=False):
+            selected_dates = _select_available_dates_by_frequency(
+                group["snapshot_date"], frequency_days, anchor
+            )
+            parts.append(group[group["snapshot_date"].isin(selected_dates)])
+        out = pd.concat(parts, ignore_index=True) if parts else backbone.iloc[0:0].copy()
+        action = "Selected existing"
+
+    out = out.sort_values(["model_id", "snapshot_date"]).reset_index(drop=True)
+    validate_backbone(out)
+    generated_dates = out["snapshot_date"].drop_duplicates().sort_values()
+    gap_values = generated_dates.diff().dt.days.dropna().unique().tolist()
+    progress(
+        f"{action} {frequency_days}-day snapshot cadence ({scope}, strategy={strategy}) "
+        f"within machine.csv bounds {pd.Timestamp(source_start).date()} to "
+        f"{pd.Timestamp(source_end).date()}. Rows: {before_rows:,} -> {len(out):,}; "
+        f"unique dates: {before_dates:,} -> {out['snapshot_date'].nunique():,}; "
+        f"observed global gaps={gap_values}."
+    )
+    return out
+
 def apply_backbone_filters(backbone: pd.DataFrame) -> pd.DataFrame:
-    """Apply date and mini-run filters to the machine-defined backbone."""
+    """Apply date, snapshot-frequency, and mini-run filters."""
     out = backbone.copy()
 
     min_snapshot_date = cfg("MIN_SNAPSHOT_DATE", None)
@@ -885,6 +1172,8 @@ def apply_backbone_filters(backbone: pd.DataFrame) -> pd.DataFrame:
         out = out[out["snapshot_date"] >= pd.to_datetime(min_snapshot_date)]
     if max_snapshot_date:
         out = out[out["snapshot_date"] <= pd.to_datetime(max_snapshot_date)]
+
+    out = apply_snapshot_frequency(out)
 
     mini_enabled = bool(cfg("MINI_RUN_ENABLED", False))
     if mini_enabled:
@@ -909,8 +1198,80 @@ def apply_backbone_filters(backbone: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def resolve_label_observation_end_date(
+    backbone: pd.DataFrame,
+    machine_source_max_date: Optional[pd.Timestamp] = None,
+    fault: Optional[pd.DataFrame] = None,
+    maintenance: Optional[pd.DataFrame] = None,
+    operation: Optional[pd.DataFrame] = None,
+    fluid_samples: Optional[pd.DataFrame] = None,
+    warranty: Optional[pd.DataFrame] = None,
+) -> Optional[pd.Timestamp]:
+    """Resolve the inclusive date through which future labels are observable."""
+    configured = cfg("LABEL_OBSERVATION_END_DATE", None)
+    if configured:
+        resolved = pd.to_datetime(configured, errors="raise").normalize()
+        progress(f"Using configured LABEL_OBSERVATION_END_DATE={resolved.date()}.")
+        return resolved
+
+    candidates: list[pd.Timestamp] = []
+    if machine_source_max_date is not None and pd.notna(machine_source_max_date):
+        candidates.append(pd.Timestamp(machine_source_max_date).normalize())
+    source_date_pairs = [
+        (backbone, "snapshot_date"),
+        (fault, "fault_event_date"),
+        (maintenance, "maintenance_event_date"),
+        (operation, "operation_event_date"),
+        (fluid_samples, "fluid_sample_event_date"),
+        (warranty, "warranty_event_date"),
+    ]
+    for source, date_col in source_date_pairs:
+        if source is not None and not source.empty and date_col in source.columns:
+            value = pd.to_datetime(source[date_col], errors="coerce").max()
+            if pd.notna(value):
+                candidates.append(pd.Timestamp(value).normalize())
+
+    if not candidates:
+        return None
+    resolved = max(candidates)
+    progress(
+        f"LABEL_OBSERVATION_END_DATE not configured; inferred {resolved.date()} "
+        "from the latest standardized input date."
+    )
+    return resolved
+
+
+def apply_complete_label_horizon_filter(
+    backbone: pd.DataFrame,
+    observation_end_date: Optional[pd.Timestamp],
+    horizon_days: int,
+) -> pd.DataFrame:
+    """Keep only snapshots with a fully observable [snapshot, snapshot+horizon) label window."""
+    if not bool(cfg("REQUIRE_COMPLETE_LABEL_HORIZON", True)):
+        progress("Complete-label-horizon filtering disabled.")
+        return backbone.copy()
+    if observation_end_date is None:
+        raise ValueError(
+            "Cannot enforce complete label horizons because no observation end date could be resolved. "
+            "Set LABEL_OBSERVATION_END_DATE in config.py."
+        )
+    if horizon_days <= 0:
+        raise ValueError("HORIZON_DAYS must be positive.")
+
+    # observation_end_date is inclusive; the target window end is exclusive.
+    latest_eligible_snapshot = observation_end_date - pd.Timedelta(days=horizon_days - 1)
+    before_rows = len(backbone)
+    out = backbone[backbone["snapshot_date"] <= latest_eligible_snapshot].copy()
+    progress(
+        f"Applied complete {horizon_days}-day label-horizon filter through "
+        f"{observation_end_date.date()}. Latest eligible snapshot: "
+        f"{latest_eligible_snapshot.date()}. Rows: {before_rows:,} -> {len(out):,}."
+    )
+    validate_backbone(out)
+    return out.sort_values(["model_id", "snapshot_date"]).reset_index(drop=True)
+
 def validate_backbone(backbone: pd.DataFrame) -> None:
-    """Validate that the canonical backbone has one row per model_id/snapshot_date."""
+    """Validate one row per model_id/snapshot_date in the modeling backbone."""
     required = {"model_id", "snapshot_date"}
     missing = required - set(backbone.columns)
     if missing:
@@ -1149,7 +1510,7 @@ def standardize_operation(operation: pd.DataFrame, allowed_model_ids: set[str]) 
 
 
 def standardize_warranty(warranty: pd.DataFrame, allowed_model_ids: set[str]) -> tuple[pd.DataFrame, dict]:
-    """Standardize warranty/claim records used to create claim_next_45d."""
+    """Standardize warranty/claim records used to create dynamic claim target."""
     w = warranty.copy()
     w["model_id"], model_id_source = normalize_model_id(w, "warranty")
     w["model_id"], reconciled_model_id_rows = reconcile_model_id_to_backbone(
@@ -1291,12 +1652,42 @@ def standardize_fluid_samples(fluid_samples: pd.DataFrame, allowed_model_ids: se
 # Fault source feature engineering
 # -----------------------------------------------------------------------------
 def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[dict]:
-    """Create fault-derived features for one model_id across all snapshot dates."""
+    """Create basic or frozen fault-derived features across snapshot dates."""
     out: list[dict] = []
     dates = f_m["fault_event_date"] if "fault_event_date" in f_m.columns else pd.Series(dtype="datetime64[ns]")
+    lookback_days = int(cfg("LOOKBACK_DAYS", LOOKBACK_DAYS))
 
     for snap in snap_m["snapshot_date"]:
         before = f_m[dates < snap]
+        window = before[before["fault_event_date"] >= snap - pd.Timedelta(days=lookback_days)]
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
+
+        if FEATURE_MODE == "basic":
+            action_level = pd.to_numeric(window.get("action_level_num_clean"), errors="coerce")
+            evidence = pd.to_numeric(window.get("failure_code_evidence_score_clean"), errors="coerce")
+            log_occurrence = pd.to_numeric(window.get("log_occurrence_clean"), errors="coerce")
+            row.update(
+                {
+                    "_fault_source_record_count_window": len(window),
+                    "has_fault_window": int(len(window) > 0),
+                    "fault_count_window": len(window),
+                    "fault_unique_code_count_window": window.get("fault_code_clean", pd.Series(dtype="object")).replace("", np.nan).nunique(),
+                    "fault_l03plus_count_window": int((action_level >= 3).sum()),
+                    "fault_l04plus_count_window": int((action_level >= 4).sum()),
+                    "fault_max_action_level_window": action_level.max(),
+                    "fault_max_evidence_score_window": evidence.max(),
+                    "fault_mean_evidence_score_window": evidence.mean(),
+                    "fault_max_log_occurrence_window": log_occurrence.max(),
+                    "fault_days_since_latest_in_window": days_between(snap, window["fault_event_date"].max()),
+                    "fault_mechanical_count_window": int((window.get("is_mechanical_failure_code_clean", 0) == 1).sum()),
+                    "fault_electrical_count_window": int((window.get("is_electrical_failure_code_clean", 0) == 1).sum()),
+                    "fault_dominant_component_window": dominant_component(window, len(window) > 0),
+                }
+            )
+            out.append(row)
+            continue
+
+        # Existing frozen engineered features.
         w90 = before[before["fault_event_date"] >= snap - pd.Timedelta(days=90)]
         w30 = before[before["fault_event_date"] >= snap - pd.Timedelta(days=30)]
         w7 = before[before["fault_event_date"] >= snap - pd.Timedelta(days=7)]
@@ -1306,7 +1697,6 @@ def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[di
         ]
         severe_before = before[before["event_action_level_clean"].isin(["L03", "L04", "L05"])]
 
-        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
         row["fault_count_7d"] = len(w7)
         row["fault_count_30d"] = len(w30)
         row["fault_count_90d"] = len(w90)
@@ -1330,7 +1720,6 @@ def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[di
         row["unique_fault_code_count_90d"] = w90["fault_code_clean"].replace("", np.nan).nunique()
         row["repeat_fault_ratio_90d"] = ratio(row["fault_count_90d"], max(row["unique_fault_code_count_90d"], 1))
         row["unique_component_count_90d"] = w90["applicable_component_clean"].replace("", np.nan).nunique()
-
         row["mechanical_fault_count_90d"] = int((w90["is_mechanical_failure_code_clean"] == 1).sum())
         row["mechanical_fault_count_30d"] = int((w30["is_mechanical_failure_code_clean"] == 1).sum())
         row["electrical_fault_count_90d"] = int((w90["is_electrical_failure_code_clean"] == 1).sum())
@@ -1342,7 +1731,6 @@ def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[di
         row["sum_log_occurrence_90d"] = w90["log_occurrence_clean"].sum()
         row["max_log_occurrence_90d"] = w90["log_occurrence_clean"].max()
         row["occurrence_severity_score_90d"] = w90["occurrence_class_clean"].sum()
-
         row["strong_fault_count_90d"] = int((w90["evidence_strength_clean"] == "STRONG").sum())
         row["moderate_fault_count_90d"] = int(w90["evidence_strength_clean"].isin(["MEDIUM", "MODERATE"]).sum())
         event_w90 = w90[w90["is_event_evidence"]]
@@ -1365,14 +1753,12 @@ def fault_features_for_model(snap_m: pd.DataFrame, f_m: pd.DataFrame) -> list[di
             row[feature] = cnt
             component_counts[feature] = cnt
         row["top_component_fault_ratio_90d"] = ratio(max(component_counts.values()) if component_counts else 0, row["fault_count_90d"])
-
         row["has_fault_90d"] = int(row["fault_count_90d"] > 0)
         row["smr_latest_before_snapshot"] = smr_latest
         row["fault_smr_delta_90d"] = smr_delta_90d
         out.append(row)
 
     return out
-
 
 def build_fault_snapshot(backbone: pd.DataFrame, fault: pd.DataFrame) -> pd.DataFrame:
     """Build the source-specific fault snapshot dataframe on the machine backbone."""
@@ -1405,12 +1791,33 @@ def build_fault_snapshot(backbone: pd.DataFrame, fault: pd.DataFrame) -> pd.Data
 # Maintenance source feature engineering
 # -----------------------------------------------------------------------------
 def maintenance_features_for_model(snap_m: pd.DataFrame, m_m: pd.DataFrame) -> list[dict]:
-    """Create maintenance-derived features for one model_id across snapshots."""
+    """Create basic or frozen maintenance-derived features across snapshots."""
     out: list[dict] = []
     dates = m_m["maintenance_event_date"] if "maintenance_event_date" in m_m.columns else pd.Series(dtype="datetime64[ns]")
+    lookback_days = int(cfg("LOOKBACK_DAYS", LOOKBACK_DAYS))
 
     for snap in snap_m["snapshot_date"]:
         before = m_m[dates < snap]
+        window = before[before["maintenance_event_date"] >= snap - pd.Timedelta(days=lookback_days)]
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
+
+        if FEATURE_MODE == "basic":
+            row.update(
+                {
+                    "_maintenance_source_record_count_window": len(window),
+                    "has_maintenance_window": int(len(window) > 0),
+                    "maintenance_event_count_window": len(window),
+                    "maintenance_monitor_reset_count_window": int(window.get("is_monitor_reset_clean", pd.Series(False, index=window.index)).sum()),
+                    "maintenance_overdue_count_window": int(window.get("is_overdue_clean", pd.Series(False, index=window.index)).sum()),
+                    "maintenance_due_now_count_window": int(window.get("is_due_now_clean", pd.Series(False, index=window.index)).sum()),
+                    "maintenance_min_remaining_hours_window": pd.to_numeric(window.get("remaining_hours_clean"), errors="coerce").min(),
+                    "maintenance_days_since_latest_event_window": days_between(snap, window["maintenance_event_date"].max()),
+                    "maintenance_dominant_component_window": dominant_component(window, len(window) > 0),
+                }
+            )
+            out.append(row)
+            continue
+
         w180 = before[before["maintenance_event_date"] >= snap - pd.Timedelta(days=180)]
         w90 = before[before["maintenance_event_date"] >= snap - pd.Timedelta(days=90)]
         reset180 = w180[w180["is_monitor_reset_clean"]]
@@ -1423,7 +1830,6 @@ def maintenance_features_for_model(snap_m: pd.DataFrame, m_m: pd.DataFrame) -> l
         else:
             current = before.tail(0)
 
-        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
         row["maintenance_events_180d"] = len(w180)
         row["monitor_reset_count_180d"] = len(reset180)
         row["maintenance_reset_ratio_180d"] = ratio(row["monitor_reset_count_180d"], row["maintenance_events_180d"])
@@ -1432,13 +1838,11 @@ def maintenance_features_for_model(snap_m: pd.DataFrame, m_m: pd.DataFrame) -> l
         row["active_maintenance_items"] = len(current)
         row["overdue_item_count"] = int(current["is_overdue_clean"].sum()) if len(current) else 0
         row["due_now_item_count"] = int(current["is_due_now_clean"].sum()) if len(current) else 0
-
         if len(current) and "remaining_hours_clean" in current.columns:
             row["overdue_item_count"] = max(row["overdue_item_count"], int((current["remaining_hours_clean"] < 0).sum()))
             row["due_now_item_count"] = max(row["due_now_item_count"], int((current["remaining_hours_clean"] == 0).sum()))
         row["maintenance_due_or_overdue_ratio"] = ratio(
-            row["due_now_item_count"] + row["overdue_item_count"],
-            row["active_maintenance_items"],
+            row["due_now_item_count"] + row["overdue_item_count"], row["active_maintenance_items"]
         )
         row["avg_remaining_hours"] = current["remaining_hours_clean"].mean() if len(current) else np.nan
         row["min_remaining_hours"] = current["remaining_hours_clean"].min() if len(current) else np.nan
@@ -1464,32 +1868,23 @@ def maintenance_features_for_model(snap_m: pd.DataFrame, m_m: pd.DataFrame) -> l
                 row[feature] = int(current[current["is_overdue_clean"]][f"is_component_{comp}"].sum())
             else:
                 row[feature] = 0
-
         for mtype in MAINTENANCE_TYPE_PATTERNS:
             col = f"is_maintenance_type_{mtype}"
             row[f"{mtype}_reset_count_180d"] = int(reset180[col].sum()) if col in reset180.columns else 0
-
         row["unique_maintenance_type_count_180d"] = reset180["maintenance_type_clean"].replace("", np.nan).nunique()
         row["days_since_last_reset"] = days_between(snap, reset180["maintenance_event_date"].max())
-
         oil_reset = reset180[reset180.get("is_maintenance_type_oil", pd.Series(False, index=reset180.index))]
         filter_reset = reset180[reset180.get("is_maintenance_type_filter", pd.Series(False, index=reset180.index))]
         row["days_since_last_oil_reset"] = days_between(snap, oil_reset["maintenance_event_date"].max())
         row["days_since_last_filter_reset"] = days_between(snap, filter_reset["maintenance_event_date"].max())
-
         latest_smr = before["smr_hours_clean"].dropna().max()
         last_reset = reset180.sort_values("maintenance_event_date").tail(1)
         last_reset_smr = last_reset["smr_hours_clean"].iloc[0] if len(last_reset) else np.nan
-        row["smr_since_last_reset"] = (
-            float(latest_smr - last_reset_smr)
-            if pd.notna(latest_smr) and pd.notna(last_reset_smr)
-            else np.nan
-        )
+        row["smr_since_last_reset"] = float(latest_smr - last_reset_smr) if pd.notna(latest_smr) and pd.notna(last_reset_smr) else np.nan
         row["has_maintenance_180d"] = int(row["maintenance_events_180d"] > 0)
         out.append(row)
 
     return out
-
 
 def build_maintenance_snapshot(backbone: pd.DataFrame, pm: pd.DataFrame) -> pd.DataFrame:
     """Build the source-specific maintenance snapshot dataframe on the machine backbone."""
@@ -1522,9 +1917,10 @@ def build_maintenance_snapshot(backbone: pd.DataFrame, pm: pd.DataFrame) -> pd.D
 # Operation source feature engineering
 # -----------------------------------------------------------------------------
 def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> list[dict]:
-    """Create operation/utilization features for one model_id across snapshots."""
+    """Create basic or frozen operation/utilization features across snapshots."""
     out: list[dict] = []
     dates = o_m["operation_event_date"] if "operation_event_date" in o_m.columns else pd.Series(dtype="datetime64[ns]")
+    lookback_days = int(cfg("LOOKBACK_DAYS", LOOKBACK_DAYS))
 
     def sum_col(df: pd.DataFrame, col: str) -> float:
         return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum()) if col in df.columns else 0.0
@@ -1546,13 +1942,50 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
 
     for snap in snap_m["snapshot_date"]:
         before = o_m[dates < snap]
+        window = before[before["operation_event_date"] >= snap - pd.Timedelta(days=lookback_days)]
+        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
+
+        if FEATURE_MODE == "basic":
+            working_col = "actual_working_hours_clean_clean"
+            engine_col = "engine_running_hours_clean_clean"
+            idle_col = "engine_idling_hours_clean_clean"
+            valid_smr = window[
+                (window.get("smr_valid_for_utilization_flag_clean", pd.Series(0, index=window.index)) == 1)
+                & window.get("smr_hours_clean", pd.Series(np.nan, index=window.index)).notna()
+            ].sort_values("operation_event_date")
+            if valid_smr.empty:
+                latest_smr = np.nan
+                smr_delta = np.nan
+            else:
+                smr_values = pd.to_numeric(valid_smr["smr_hours_clean"], errors="coerce").dropna()
+                latest_smr = smr_values.iloc[-1] if len(smr_values) else np.nan
+                smr_delta = max(float(smr_values.iloc[-1] - smr_values.iloc[0]), 0.0) if len(smr_values) >= 2 else 0.0
+
+            engine_sum = sum_col(window, engine_col)
+            idle_sum = sum_col(window, idle_col)
+            row.update(
+                {
+                    "_operation_source_record_count_window": len(window),
+                    "has_operation_window": int(len(window) > 0),
+                    "operation_day_count_window": int(window["operation_event_date"].nunique()),
+                    "operation_working_hours_sum_window": sum_col(window, working_col),
+                    "operation_working_hours_mean_window": mean_col(window, working_col),
+                    "operation_working_hours_max_window": max_col(window, working_col),
+                    "operation_engine_running_hours_sum_window": engine_sum,
+                    "operation_idle_hours_sum_window": idle_sum,
+                    "operation_idle_share_window": ratio(idle_sum, engine_sum),
+                    "operation_latest_smr_window": latest_smr,
+                    "operation_smr_delta_window": smr_delta,
+                    "operation_high_throttle_day_count_window": sum_col(window, "high_throttle_day_flag_clean"),
+                }
+            )
+            out.append(row)
+            continue
+
         w90 = before[before["operation_event_date"] >= snap - pd.Timedelta(days=90)]
         w30 = before[before["operation_event_date"] >= snap - pd.Timedelta(days=30)]
         w7 = before[before["operation_event_date"] >= snap - pd.Timedelta(days=7)]
 
-        row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
-
-        # SMR / utilization features.
         valid_smr_before = before[(before["smr_valid_for_utilization_flag_clean"] == 1) & before["smr_hours_clean"].notna()]
         latest_valid_smr = valid_smr_before.sort_values("operation_event_date").tail(1)
         if len(latest_valid_smr):
@@ -1565,7 +1998,6 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         row["smr_delta_30d"] = sum_col(w30, "smr_delta_clean_since_prev_obs_hours_clean")
         row["smr_delta_90d"] = sum_col(w90, "smr_delta_clean_since_prev_obs_hours_clean")
 
-        # Actual work / activity features.
         work_sum_7 = sum_col(w7, "actual_working_hours_clean_clean")
         work_sum_30 = sum_col(w30, "actual_working_hours_clean_clean")
         work_sum_90 = sum_col(w90, "actual_working_hours_clean_clean")
@@ -1574,7 +2006,6 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         work_day_90 = sum_col(w90, "actual_work_day_flag_clean")
         work_valid_30 = sum_col(w30, "actual_work_valid_flag_clean")
         work_valid_90 = sum_col(w90, "actual_work_valid_flag_clean")
-
         row["working_hours_sum_7d"] = work_sum_7
         row["working_hours_sum_30d"] = work_sum_30
         row["working_hours_sum_90d"] = work_sum_90
@@ -1599,16 +2030,11 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
             latest_op_date = latest_before["operation_event_date"].iloc[0]
             latest_last_work_date = latest_before["last_actual_work_date_clean"].iloc[0]
             row["days_since_last_actual_work_day"] = days_between(snap, latest_last_work_date)
-            row["current_actual_work_streak_days"] = (
-                latest_before["actual_work_streak_through_current_day_clean"].iloc[0]
-                if days_between(snap, latest_op_date) == 1
-                else 0
-            )
+            row["current_actual_work_streak_days"] = latest_before["actual_work_streak_through_current_day_clean"].iloc[0] if days_between(snap, latest_op_date) == 1 else 0
         else:
             row["days_since_last_actual_work_day"] = np.nan
             row["current_actual_work_streak_days"] = 0
 
-        # Engine and throttle features.
         engine_sum_7 = sum_col(w7, "engine_running_hours_clean_clean")
         engine_sum_30 = sum_col(w30, "engine_running_hours_clean_clean")
         engine_sum_90 = sum_col(w90, "engine_running_hours_clean_clean")
@@ -1618,7 +2044,6 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         engine_valid_90 = sum_col(w90, "engine_seconds_valid_flag_clean")
         throttle_full_30 = sum_col(w30, "throttle_full_hours_clean_clean")
         throttle_full_90 = sum_col(w90, "throttle_full_hours_clean_clean")
-
         row["engine_running_hours_sum_7d"] = engine_sum_7
         row["engine_running_hours_sum_30d"] = engine_sum_30
         row["engine_running_hours_sum_90d"] = engine_sum_90
@@ -1632,10 +2057,7 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         engine_active_w30 = w30[w30["engine_running_day_flag_clean"] == 1]
         row["avg_throttle_dial_position_active_30d"] = mean_col(engine_active_w30, "throttle_average_dial_position_clean_clean")
         row["avg_throttle_dial_position_active_90d"] = mean_col(engine_active_w90, "throttle_average_dial_position_clean_clean")
-        row["days_since_last_engine_running_day"] = days_between(
-            snap,
-            before.loc[before["engine_running_day_flag_clean"] == 1, "operation_event_date"].max(),
-        )
+        row["days_since_last_engine_running_day"] = days_between(snap, before.loc[before["engine_running_day_flag_clean"] == 1, "operation_event_date"].max())
         row["engine_idling_share_90d"] = ratio(sum_col(w90, "engine_idling_hours_clean_clean"), engine_sum_90)
         row["throttle_full_hours_sum_90d"] = throttle_full_90
         row["throttle_full_engine_share_30d"] = ratio(throttle_full_30, engine_sum_30)
@@ -1649,7 +2071,6 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         row["high_throttle_day_count_90d"] = sum_col(w90, "high_throttle_day_flag_clean")
         row["long_engine_day_count_90d"] = sum_col(w90, "long_engine_day_flag_clean")
 
-        # Travel / movement features.
         travel_sum_30 = sum_col(w30, "traveling_hours_clean_clean")
         travel_sum_90 = sum_col(w90, "traveling_hours_clean_clean")
         travel_day_30 = sum_col(w30, "travel_day_flag_clean")
@@ -1658,17 +2079,13 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         travel_observed_90 = sum_col(w90, "travel_usable_flag_clean") or len(w90)
         moving_sum_90 = sum_col(w90, "moving_back_forth_hours_clean_clean")
         steering_sum_90 = sum_col(w90, "steering_hours_clean_clean")
-
         row["travel_hours_sum_30d"] = travel_sum_30
         row["travel_hours_sum_90d"] = travel_sum_90
         row["travel_day_count_30d"] = travel_day_30
         row["travel_day_count_90d"] = travel_day_90
         row["avg_travel_hours_per_travel_day_30d"] = ratio(travel_sum_30, travel_day_30)
         row["avg_travel_hours_per_travel_day_90d"] = ratio(travel_sum_90, travel_day_90)
-        row["days_since_last_travel_day"] = days_between(
-            snap,
-            before.loc[before["travel_day_flag_clean"] == 1, "operation_event_date"].max(),
-        )
+        row["days_since_last_travel_day"] = days_between(snap, before.loc[before["travel_day_flag_clean"] == 1, "operation_event_date"].max())
         row["moving_back_forth_hours_sum_90d"] = moving_sum_90
         row["steering_hours_sum_90d"] = steering_sum_90
         row["moving_back_forth_to_travel_ratio_90d"] = ratio(moving_sum_90, travel_sum_90)
@@ -1680,12 +2097,10 @@ def operation_features_for_model(snap_m: pd.DataFrame, o_m: pd.DataFrame) -> lis
         row["steering_to_travel_ratio_90d"] = ratio(steering_sum_90, travel_sum_90)
         row["auto_quick_shift_hours_sum_90d"] = sum_col(w90, "auto_quick_shift_hours_clean_clean")
         row["manual_variable_shift_hours_sum_90d"] = sum_col(w90, "manual_variable_shift_hours_clean_clean")
-
         row["has_operation_90d"] = int(len(w90) > 0)
         out.append(row)
 
     return out
-
 
 def build_operation_snapshot(backbone: pd.DataFrame, operation: pd.DataFrame) -> pd.DataFrame:
     """Build the source-specific operation snapshot dataframe on the machine backbone."""
@@ -1730,41 +2145,56 @@ def latest_non_null_by_sample_date(window: pd.DataFrame, feature: str) -> float:
 
 
 def fluid_sample_features_for_model(snap_m: pd.DataFrame, fs_m: pd.DataFrame) -> list[dict]:
-    """Create fluid-sample lab features for one model_id across snapshots.
-
-    The frozen fluid feature names are the lab result names themselves. For each
-    snapshot, the value is the latest non-null same-machine sample result within
-    FLUID_SAMPLE_LOOKBACK_DAYS before snapshot_date. This follows the existing
-    leakage rule because only sample_drawn_date < snapshot_date is used.
-    """
+    """Create basic or frozen fluid-sample features across snapshots."""
     out: list[dict] = []
     dates = fs_m["fluid_sample_event_date"] if "fluid_sample_event_date" in fs_m.columns else pd.Series(dtype="datetime64[ns]")
-    lookback_days = int(cfg("FLUID_SAMPLE_LOOKBACK_DAYS", FLUID_SAMPLE_LOOKBACK_DAYS))
+    frozen_lookback_days = int(cfg("FLUID_SAMPLE_LOOKBACK_DAYS", FLUID_SAMPLE_LOOKBACK_DAYS))
+    basic_lookback_days = int(cfg("LOOKBACK_DAYS", LOOKBACK_DAYS))
 
     for snap in snap_m["snapshot_date"]:
         before = fs_m[dates < snap]
+        lookback_days = basic_lookback_days if FEATURE_MODE == "basic" else frozen_lookback_days
         window = before[before["fluid_sample_event_date"] >= snap - pd.Timedelta(days=lookback_days)]
-
         row: dict = {"model_id": snap_m["model_id"].iloc[0], "snapshot_date": snap}
+
+        if FEATURE_MODE == "basic":
+            severity = pd.to_numeric(window.get("fluid_sample_severity_order_clean"), errors="coerce")
+            severity_non_null = window.loc[severity.notna(), ["fluid_sample_event_date"]].copy()
+            if not severity_non_null.empty:
+                severity_non_null["severity"] = severity.loc[severity_non_null.index]
+                latest_date = severity_non_null["fluid_sample_event_date"].max()
+                latest_severity = severity_non_null.loc[
+                    severity_non_null["fluid_sample_event_date"] == latest_date, "severity"
+                ].max()
+            else:
+                latest_severity = np.nan
+            row.update(
+                {
+                    "_fluid_source_record_count_window": len(window),
+                    "has_fluid_window": int(len(window) > 0),
+                    "fluid_sample_count_window": len(window),
+                    "fluid_max_severity_window": severity.max(),
+                    "fluid_latest_severity_window": latest_severity,
+                    "fluid_days_since_latest_sample_window": days_between(snap, window["fluid_sample_event_date"].max()),
+                    "fluid_max_cu_ppm_window": pd.to_numeric(window.get("Cu_Copper_PPM"), errors="coerce").max(),
+                    "fluid_max_fe_ppm_window": pd.to_numeric(window.get("Fe_Iron_PPM"), errors="coerce").max(),
+                    "fluid_max_pb_ppm_window": pd.to_numeric(window.get("Pb_Lead_PPM"), errors="coerce").max(),
+                    "fluid_max_soot_percent_window": pd.to_numeric(window.get("Soot_Soot_PERCENT"), errors="coerce").max(),
+                    "fluid_max_water_percent_window": pd.to_numeric(window.get("Water_Water_PERCENT"), errors="coerce").max(),
+                }
+            )
+            out.append(row)
+            continue
+
         for feature in FLUID_SAMPLE_FEATURES:
             row[feature] = latest_non_null_by_sample_date(window, feature)
-
         row[f"fluid_sample_count_{lookback_days}d"] = len(window)
         row["days_since_last_fluid_sample"] = days_between(snap, before["fluid_sample_event_date"].max())
-        row[f"fluid_sample_severity_max_{lookback_days}d"] = (
-            window["fluid_sample_severity_order_clean"].max()
-            if "fluid_sample_severity_order_clean" in window.columns and len(window)
-            else np.nan
-        )
-        row["fluid_sample_latest_smr"] = (
-            before["fluid_sample_smr_clean"].dropna().max()
-            if "fluid_sample_smr_clean" in before.columns and len(before)
-            else np.nan
-        )
+        row[f"fluid_sample_severity_max_{lookback_days}d"] = window["fluid_sample_severity_order_clean"].max() if "fluid_sample_severity_order_clean" in window.columns and len(window) else np.nan
+        row["fluid_sample_latest_smr"] = before["fluid_sample_smr_clean"].dropna().max() if "fluid_sample_smr_clean" in before.columns and len(before) else np.nan
         out.append(row)
 
     return out
-
 
 def build_fluid_sample_snapshot(backbone: pd.DataFrame, fluid_samples: pd.DataFrame) -> pd.DataFrame:
     """Build the source-specific fluid sample snapshot dataframe on the backbone."""
@@ -1797,39 +2227,68 @@ def build_fluid_sample_snapshot(backbone: pd.DataFrame, fluid_samples: pd.DataFr
 # -----------------------------------------------------------------------------
 # Warranty target engineering
 # -----------------------------------------------------------------------------
-def warranty_target_for_model(snap_m: pd.DataFrame, w_m: pd.DataFrame, horizon_days: int) -> list[dict]:
-    """Create prior-claim features and future claim labels for one model_id."""
+def warranty_target_for_model(
+    snap_m: pd.DataFrame,
+    w_m: pd.DataFrame,
+    horizon_days: int,
+    lookback_days: int,
+) -> list[dict]:
+    """Create prior-claim features and a leakage-safe future claim label."""
     out: list[dict] = []
     dates = w_m["warranty_event_date"] if "warranty_event_date" in w_m.columns else pd.Series(dtype="datetime64[ns]")
 
     for snap in snap_m["snapshot_date"]:
+        window_start = snap - pd.Timedelta(days=lookback_days)
         before = w_m[dates < snap]
+        before_window = w_m[dates < window_start]
+        # Features exclude snapshot_date; target includes snapshot_date and uses
+        # an exclusive end boundary, so the same claim cannot be in both.
+        future = w_m[(dates >= snap) & (dates < snap + pd.Timedelta(days=horizon_days))]
+
+        row: dict = {
+            "model_id": snap_m["model_id"].iloc[0],
+            "snapshot_date": snap,
+            f"claim_next_{horizon_days}d": int(len(future) > 0),
+        }
+
+        if FEATURE_MODE == "basic":
+            row.update(
+                {
+                    "prior_claim_count_before_window": len(before_window),
+                    "days_since_prior_claim_before_window": days_between(
+                        snap, before_window["warranty_event_date"].max()
+                    ),
+                }
+            )
+            out.append(row)
+            continue
+
         w365 = before[before["warranty_event_date"] >= snap - pd.Timedelta(days=365)]
         w180 = before[before["warranty_event_date"] >= snap - pd.Timedelta(days=180)]
         w90 = before[before["warranty_event_date"] >= snap - pd.Timedelta(days=90)]
-        future = w_m[(dates > snap) & (dates <= snap + pd.Timedelta(days=horizon_days))]
-
-        row = {
-            "model_id": snap_m["model_id"].iloc[0],
-            "snapshot_date": snap,
-            "prior_claim_count_365d": len(w365),
-            "prior_claim_count_180d": len(w180),
-            "prior_claim_count_90d": len(w90),
-            "days_since_last_claim": days_between(snap, before["warranty_event_date"].max()),
-            "prior_claim_amount_sum_365d": w365["claim_amount_clean"].sum() if "claim_amount_clean" in w365.columns else 0.0,
-            "prior_claim_amount_max_365d": w365["claim_amount_clean"].max() if "claim_amount_clean" in w365.columns else np.nan,
-            "unique_claim_type_count_365d": w365["claim_type_description_clean"].replace("", np.nan).nunique()
-            if "claim_type_description_clean" in w365.columns
-            else 0,
-            "has_prior_claim_365d": int(len(w365) > 0),
-            f"claim_next_{horizon_days}d": int(len(future) > 0),
-        }
+        row.update(
+            {
+                "prior_claim_count_365d": len(w365),
+                "prior_claim_count_180d": len(w180),
+                "prior_claim_count_90d": len(w90),
+                "days_since_last_claim": days_between(snap, before["warranty_event_date"].max()),
+                "prior_claim_amount_sum_365d": w365["claim_amount_clean"].sum() if "claim_amount_clean" in w365.columns else 0.0,
+                "prior_claim_amount_max_365d": w365["claim_amount_clean"].max() if "claim_amount_clean" in w365.columns else np.nan,
+                "unique_claim_type_count_365d": w365["claim_type_description_clean"].replace("", np.nan).nunique() if "claim_type_description_clean" in w365.columns else 0,
+                "has_prior_claim_365d": int(len(w365) > 0),
+            }
+        )
         out.append(row)
     return out
 
 
-def build_warranty_target_snapshot(backbone: pd.DataFrame, warranty: pd.DataFrame, horizon_days: int = 45) -> pd.DataFrame:
-    """Build the warranty target/prior-feature dataframe on the machine backbone."""
+def build_warranty_target_snapshot(
+    backbone: pd.DataFrame,
+    warranty: pd.DataFrame,
+    horizon_days: int = 90,
+    lookback_days: int = 90,
+) -> pd.DataFrame:
+    """Build the dynamic warranty target/prior-feature snapshot."""
     start = time.perf_counter()
     rows: list[pd.DataFrame] = []
     warranty_groups = {k: v for k, v in warranty.groupby("model_id", sort=False)}
@@ -1841,21 +2300,23 @@ def build_warranty_target_snapshot(backbone: pd.DataFrame, warranty: pd.DataFram
 
     for idx, (model_id, snap_m) in enumerate(backbone.groupby("model_id", sort=False), start=1):
         w_m = warranty_groups.get(model_id, warranty.iloc[0:0])
-        rows.append(pd.DataFrame(warranty_target_for_model(snap_m, w_m, horizon_days)))
+        rows.append(pd.DataFrame(warranty_target_for_model(snap_m, w_m, horizon_days, lookback_days)))
         processed_snapshot_rows += len(snap_m)
-
         if idx == 1 or idx % PROGRESS_EVERY_MACHINES == 0 or idx == total_models:
             progress(
                 f"Warranty snapshot progress: {idx:,}/{total_models:,} model_ids; "
                 f"{processed_snapshot_rows:,}/{total_snapshot_rows:,} snapshot rows"
             )
 
-    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date", f"claim_next_{horizon_days}d"])
-    if horizon_days == 45 and "claim_next_45d" not in result.columns and f"claim_next_{horizon_days}d" in result.columns:
-        result = result.rename(columns={f"claim_next_{horizon_days}d": "claim_next_45d"})
+    target_col = f"claim_next_{horizon_days}d"
+    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["model_id", "snapshot_date", target_col])
     progress(f"Warranty target/prior snapshot complete in {(time.perf_counter() - start) / 60:.2f} minutes. Rows: {len(result):,}")
     return result
 
+
+# -----------------------------------------------------------------------------
+# Joining, validation, and saving
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Joining, validation, and saving
@@ -1865,7 +2326,7 @@ def key_count(df: pd.DataFrame) -> int:
 
 
 def validate_source_snapshot_alignment(source_name: str, backbone: pd.DataFrame, source_snapshot: pd.DataFrame) -> None:
-    """Make sure a source snapshot exactly follows the machine.csv backbone."""
+    """Make sure a source snapshot exactly follows the reconstructed backbone."""
     required = {"model_id", "snapshot_date"}
     missing_cols = required - set(source_snapshot.columns)
     if missing_cols:
@@ -1896,95 +2357,93 @@ def validate_source_snapshot_alignment(source_name: str, backbone: pd.DataFrame,
 
 
 def finalize_snapshot_df(df: pd.DataFrame, feature_freeze_path: Optional[str | Path] = None) -> pd.DataFrame:
-    """Fill feature missing values and order columns for model training.
-
-    The three fluid-sample metadata columns below are useful for QA while
-    building the source snapshot, but they are intentionally removed from the
-    unified modeling dataframe for now. They are sparse in the current data and
-    are not part of the frozen model feature list, so dropping them here prevents
-    them from flowing into downstream feature-selection runs.
-    """
+    """Fill missing values and return only the selected modeling feature set."""
     out = df.copy()
+    target_col = f"claim_next_{int(cfg('HORIZON_DAYS', HORIZON_DAYS))}d"
+    include_qa = bool(cfg("INCLUDE_QA_HELPER_COLUMNS", False))
 
-    fluid_metadata_cols_to_drop = [
-        "days_since_last_fluid_sample",
-        "fluid_sample_severity_max_365d",
-        "fluid_sample_latest_smr",
-    ]
-    out = out.drop(columns=[c for c in fluid_metadata_cols_to_drop if c in out.columns])
+    if FEATURE_MODE == "basic":
+        active_numeric = list(BASE_NUMERIC_FEATURES)
+        active_categorical = list(BASE_CATEGORICAL_FEATURES)
+        basic_recency = {
+            "days_since_prior_claim_before_window",
+            "fault_days_since_latest_in_window",
+            "fluid_days_since_latest_sample_window",
+            "maintenance_days_since_latest_event_window",
+        }
+        for col in active_numeric:
+            if col not in out.columns:
+                out[col] = np.nan
+            values = pd.to_numeric(out[col], errors="coerce")
+            out[col] = values.fillna(9999.0 if col in basic_recency else 0.0).astype(float)
+        for col in active_categorical:
+            if col not in out.columns:
+                out[col] = pd.NA
+            default = "unknown" if col == "full_model" else "none"
+            out[col] = out[col].astype("string").fillna(default).replace("", default)
+        active_features = active_numeric + active_categorical
+    else:
+        active_features = list(FROZEN_FEATURES)
+        fluid_metadata_cols_to_drop = [
+            "days_since_last_fluid_sample",
+            "fluid_sample_severity_max_365d",
+            "fluid_sample_latest_smr",
+        ]
+        out = out.drop(columns=[c for c in fluid_metadata_cols_to_drop if c in out.columns])
+        for col in FROZEN_FEATURES:
+            if col not in out.columns:
+                out[col] = np.nan
+        for col in COUNT_FEATURES:
+            if col in out.columns:
+                out[col] = out[col].fillna(0).astype(float)
+        for col in RECENCY_FEATURES:
+            if col in out.columns:
+                out[col] = out[col].fillna(9999).astype(float)
+        ratio_cols = [c for c in FROZEN_FEATURES if c.endswith("ratio_90d") or c.endswith("ratio_180d") or c.endswith("rate")]
+        for col in ratio_cols:
+            if col in out.columns:
+                out[col] = out[col].fillna(0).astype(float)
+        for col in FROZEN_FEATURES:
+            if col in out.columns and col not in RECENCY_FEATURES:
+                out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(float)
 
-    for col in FROZEN_FEATURES:
-        if col not in out.columns:
-            out[col] = np.nan
+        if feature_freeze_path is not None and Path(feature_freeze_path).exists():
+            feature_freeze_path = Path(feature_freeze_path)
+            if feature_freeze_path.suffix.lower() in {".xlsx", ".xls"}:
+                freeze = pd.read_excel(feature_freeze_path, sheet_name="all")
+            else:
+                try:
+                    freeze = pd.read_csv(feature_freeze_path, encoding="utf-8")
+                except UnicodeDecodeError:
+                    freeze = pd.read_csv(feature_freeze_path, encoding="cp1252")
+            if "Feature" in freeze.columns:
+                frozen_from_file = (
+                    freeze["Feature"].astype(str)
+                    .str.replace(r"\s*\([a-z]\)$", "", regex=True)
+                    .str.strip()
+                    .tolist()
+                )
+                missing = sorted(set(frozen_from_file) - set(out.columns))
+                if missing:
+                    raise ValueError(f"Missing frozen features from output: {missing}")
 
-    for col in COUNT_FEATURES:
-        if col in out.columns:
-            out[col] = out[col].fillna(0).astype(float)
+    if target_col not in out.columns:
+        out[target_col] = np.nan
 
-    for col in RECENCY_FEATURES:
-        if col in out.columns:
-            out[col] = out[col].fillna(9999).astype(float)
+    ordered_cols = ["model_id", "snapshot_date", target_col]
+    if FEATURE_MODE == "frozen":
+        if "full_model" not in out.columns:
+            out["full_model"] = pd.NA
+        out["full_model"] = out["full_model"].astype("string").fillna("unknown").replace("", "unknown")
+        ordered_cols.append("full_model")
+    for col in active_features:
+        if col not in ordered_cols:
+            ordered_cols.append(col)
 
-    ratio_cols = [c for c in FROZEN_FEATURES if c.endswith("ratio_90d") or c.endswith("ratio_180d") or c.endswith("rate")]
-    for col in ratio_cols:
-        if col in out.columns:
-            out[col] = out[col].fillna(0).astype(float)
-
-    amount_or_score_cols = [
-        "faults_per_100_hours",
-        "max_action_level_90d",
-        "sum_log_occurrence_90d",
-        "max_log_occurrence_90d",
-        "occurrence_severity_score_90d",
-        "max_event_evidence_score_90d",
-        "avg_event_evidence_score_90d",
-        "max_context_evidence_score_90d",
-        "avg_remaining_hours",
-        "min_remaining_hours",
-        "smr_since_last_reset",
-        "smr_latest_before_snapshot",
-        "fault_smr_delta_90d",
-    ]
-    for col in amount_or_score_cols:
-        if col in out.columns:
-            out[col] = out[col].fillna(0).astype(float)
-
-    # For all remaining model features, missing usually means the source had no
-    # usable records in the lookback window. Keep recency sentinels above; fill
-    # all other numeric features to 0 so downstream XGBoost input is stable.
-    for col in FROZEN_FEATURES:
-        if col in out.columns and col not in RECENCY_FEATURES:
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(float)
-
-    if feature_freeze_path is not None and Path(feature_freeze_path).exists():
-        feature_freeze_path = Path(feature_freeze_path)
-        if feature_freeze_path.suffix.lower() in {".xlsx", ".xls"}:
-            freeze = pd.read_excel(feature_freeze_path, sheet_name="all")
-        else:
-            try:
-                freeze = pd.read_csv(feature_freeze_path, encoding="utf-8")
-            except UnicodeDecodeError:
-                freeze = pd.read_csv(feature_freeze_path, encoding="cp1252")
-        if "Feature" in freeze.columns:
-            frozen_from_file = (
-                freeze["Feature"].astype(str)
-                .str.replace(r"\s*\([a-z]\)$", "", regex=True)
-                .str.strip()
-                .tolist()
-            )
-            missing = sorted(set(frozen_from_file) - set(out.columns))
-            if missing:
-                raise ValueError(f"Missing frozen features from output: {missing}")
-
-    ordered_cols = ["model_id", "snapshot_date", "full_model"]
-    if "claim_next_45d" in out.columns:
-        ordered_cols.append("claim_next_45d")
-    ordered_cols += FROZEN_FEATURES
-    extra_cols = [c for c in out.columns if c not in ordered_cols]
-
-    for col in ordered_cols:
-        if col not in out.columns:
-            out[col] = pd.Series(dtype="float64")
+    if include_qa:
+        extra_cols = [c for c in out.columns if c not in ordered_cols]
+    else:
+        extra_cols = []
 
     return out[ordered_cols + extra_cols].sort_values(["model_id", "snapshot_date"]).reset_index(drop=True)
 
@@ -2052,7 +2511,7 @@ def write_source_alignment_summary(output_dir: str | Path, backbone: pd.DataFram
 
 
 def write_mini_validation_outputs(df: pd.DataFrame, output_dir: str | Path) -> None:
-    """Write small QA outputs for mini validation runs."""
+    """Write small QA outputs for mini validation runs in either feature mode."""
     if not bool(cfg("MINI_RUN_ENABLED", False)):
         return
 
@@ -2060,17 +2519,22 @@ def write_mini_validation_outputs(df: pd.DataFrame, output_dir: str | Path) -> N
     output_dir.mkdir(parents=True, exist_ok=True)
     df.head(200).to_csv(output_dir / "mini_snapshot_validation_sample_rows.csv", index=False)
 
-    summary = (
-        df.groupby("model_id")
-        .agg(
-            snapshot_rows=("snapshot_date", "count"),
-            first_snapshot_date=("snapshot_date", "min"),
-            last_snapshot_date=("snapshot_date", "max"),
-            total_faults_90d=("fault_count_90d", "sum"),
-            total_maintenance_events_180d=("maintenance_events_180d", "sum"),
-        )
-        .reset_index()
-    )
+    agg_spec: dict[str, tuple[str, str]] = {
+        "snapshot_rows": ("snapshot_date", "count"),
+        "first_snapshot_date": ("snapshot_date", "min"),
+        "last_snapshot_date": ("snapshot_date", "max"),
+    }
+    candidate_totals = {
+        "total_fault_records_window": "fault_count_window",
+        "total_maintenance_records_window": "maintenance_event_count_window",
+        "total_faults_90d": "fault_count_90d",
+        "total_maintenance_events_180d": "maintenance_events_180d",
+    }
+    for output_name, source_col in candidate_totals.items():
+        if source_col in df.columns:
+            agg_spec[output_name] = (source_col, "sum")
+
+    summary = df.groupby("model_id").agg(**agg_spec).reset_index()
     summary.to_csv(output_dir / "mini_snapshot_validation_by_model_id.csv", index=False)
 
 
@@ -2105,8 +2569,12 @@ def build_snapshot_dataframe(
     progress(f"Project root: {PROJECT_ROOT}")
     progress(f"Input folder: {INPUT_DIR}")
     progress(f"Output folder: {output_dir}")
-    progress("Canonical backbone: machine.csv model_id + snapshot_date")
+    progress("Candidate backbone: machine.csv model_ids, date bounds, and machine metadata")
     progress("Join key: model_id + snapshot_date")
+    progress(f"Feature mode: {FEATURE_MODE}")
+    progress(f"Observation lookback: {int(cfg('LOOKBACK_DAYS', LOOKBACK_DAYS))} days")
+    progress(f"Prediction horizon: {int(cfg('HORIZON_DAYS', HORIZON_DAYS))} days")
+    progress(f"Snapshot cadence: {int(cfg('SNAPSHOT_FREQ_DAYS', SNAPSHOT_FREQ_DAYS))} days")
 
     all_profiles: list[pd.DataFrame] = []
     cleaning_summaries: list[dict] = []
@@ -2153,13 +2621,13 @@ def build_snapshot_dataframe(
         cleaning_summaries.append(summary)
         progress(f"warranty loaded: {len(raw_warranty):,} rows, {len(raw_warranty.columns):,} columns")
     else:
-        progress("warranty.csv not found/configured. claim_next_45d will be left blank.")
+        progress(f"warranty.csv not found/configured. {TARGET_COLUMN} will be left blank.")
 
     if bool(cfg("WRITE_CLEANING_REPORTS", True)):
         write_combined_cleaning_reports(output_dir, all_profiles, cleaning_summaries)
         progress("Missing-value and light-cleaning reports written.")
 
-    progress("Step 2/11: Standardizing machine.csv as canonical snapshot backbone...")
+    progress("Step 2/11: Standardizing machine.csv and reconstructing the modeling backbone...")
     backbone, summary = standardize_machine_backbone(raw_machine)
     standardization_summaries.append(summary)
     progress(
@@ -2169,13 +2637,13 @@ def build_snapshot_dataframe(
         f"rows after standardization={summary['rows_after_standardization']:,}"
     )
 
+    machine_source_max_date = backbone["snapshot_date"].max() if not backbone.empty else None
     backbone = apply_backbone_filters(backbone)
     allowed_model_ids = set(backbone["model_id"].astype("string"))
     progress(
-        f"Canonical backbone after filters: {len(backbone):,} rows across "
+        f"Reconstructed candidate backbone after date/cadence processing: {len(backbone):,} rows across "
         f"{backbone['model_id'].nunique() if not backbone.empty else 0:,} model_ids"
     )
-    save_source_snapshot(backbone, "machine_backbone.csv")
 
     progress("Step 3/11: Standardizing event sources and forcing them to machine backbone model_ids...")
     fault, summary = standardize_faults(raw_fault, allowed_model_ids=allowed_model_ids)
@@ -2232,6 +2700,28 @@ def build_snapshot_dataframe(
     write_source_standardization_summary(output_dir, standardization_summaries)
     progress("Source standardization summary written.")
 
+    if warranty is not None:
+        observation_end_date = resolve_label_observation_end_date(
+            backbone=backbone,
+            machine_source_max_date=machine_source_max_date,
+            fault=fault,
+            maintenance=pm,
+            operation=operation,
+            fluid_samples=fluid_samples,
+            warranty=warranty,
+        )
+        backbone = apply_complete_label_horizon_filter(
+            backbone,
+            observation_end_date=observation_end_date,
+            horizon_days=int(cfg("HORIZON_DAYS", HORIZON_DAYS)),
+        )
+    validate_backbone(backbone)
+    save_source_snapshot(backbone, "machine_backbone.csv")
+    progress(
+        f"Final modeling backbone: {len(backbone):,} rows across "
+        f"{backbone['model_id'].nunique() if not backbone.empty else 0:,} model_ids"
+    )
+
     source_snapshots: dict[str, pd.DataFrame] = {}
 
     progress("Step 4/11: Building fault source snapshot dataframe on machine backbone...")
@@ -2272,7 +2762,8 @@ def build_snapshot_dataframe(
         warranty_target_snapshot = build_warranty_target_snapshot(
             backbone,
             warranty,
-            horizon_days=int(cfg("HORIZON_DAYS", 45)),
+            horizon_days=int(cfg("HORIZON_DAYS", HORIZON_DAYS)),
+            lookback_days=int(cfg("LOOKBACK_DAYS", LOOKBACK_DAYS)),
         )
         validate_source_snapshot_alignment("warranty_target_snapshot", backbone, warranty_target_snapshot)
         save_source_snapshot(warranty_target_snapshot, "warranty_target_snapshot.csv")
@@ -2293,11 +2784,28 @@ def build_snapshot_dataframe(
         unified = unified.merge(fluid_sample_snapshot, on=["model_id", "snapshot_date"], how="left")
     if warranty_target_snapshot is not None:
         unified = unified.merge(warranty_target_snapshot, on=["model_id", "snapshot_date"], how="left")
-    elif "claim_next_45d" not in unified.columns:
-        unified["claim_next_45d"] = np.nan
+    elif TARGET_COLUMN not in unified.columns:
+        unified[TARGET_COLUMN] = np.nan
+
+    if FEATURE_MODE == "basic":
+        source_count_cols = [
+            "_fault_source_record_count_window",
+            "_fluid_source_record_count_window",
+            "_maintenance_source_record_count_window",
+            "_operation_source_record_count_window",
+        ]
+        available_count_cols = [c for c in source_count_cols if c in unified.columns]
+        if available_count_cols:
+            unified["source_record_count_window"] = (
+                unified[available_count_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+            )
+        else:
+            unified["source_record_count_window"] = 0.0
+        unified["has_any_source_window"] = (unified["source_record_count_window"] > 0).astype(int)
+
     progress(f"Unified snapshot shape before finalization: {unified.shape[0]:,} rows x {unified.shape[1]:,} columns")
 
-    progress("Step 11/11: Finalizing missing values and validating frozen features...")
+    progress(f"Step 11/11: Finalizing selected {FEATURE_MODE} feature set...")
     unified = finalize_snapshot_df(unified, feature_freeze_path=feature_freeze_path)
     write_mini_validation_outputs(unified, output_dir)
 
@@ -2319,7 +2827,7 @@ def build_snapshot_dataframe(
 #   5. unified = unified.merge(oil_snapshot, on=["model_id", "snapshot_date"], how="left")
 #
 # The key rule stays the same: oil/service/warranty source snapshots must use the
-# machine.csv backbone dates. They should never generate independent calendars.
+# reconstructed modeling-backbone dates. They should never generate independent calendars.
 # Warranty target should look after snapshot_date, not before it.
 
 
@@ -2345,6 +2853,11 @@ def main() -> None:
     print(f"Output path: {output_path}")
     print(f"Target model families used for filtering: {', '.join(TARGET_MODEL_FAMILIES)}")
     print(f"Mini run enabled: {bool(cfg('MINI_RUN_ENABLED', False))}")
+    print(f"Feature mode: {FEATURE_MODE}")
+    print(f"Lookback days: {int(cfg('LOOKBACK_DAYS', LOOKBACK_DAYS))}")
+    print(f"Horizon days: {int(cfg('HORIZON_DAYS', HORIZON_DAYS))}")
+    print(f"Snapshot frequency days: {int(cfg('SNAPSHOT_FREQ_DAYS', SNAPSHOT_FREQ_DAYS))}")
+    print(f"Target column: {TARGET_COLUMN}")
     print(f"Operation path: {operation_path if operation_path else 'not found'}")
     print(f"Fluid samples path: {fluid_samples_path if fluid_samples_path else 'not found'}")
     print(f"Warranty path: {warranty_path if warranty_path else 'not found'}")
@@ -2371,7 +2884,12 @@ def main() -> None:
         "min_snapshot_date": str(df["snapshot_date"].min()) if "snapshot_date" in df.columns and len(df) else None,
         "max_snapshot_date": str(df["snapshot_date"].max()) if "snapshot_date" in df.columns and len(df) else None,
         "source_snapshot_dir": str(SOURCE_SNAPSHOT_DIR),
-        "canonical_backbone": "machine.csv model_id + snapshot_date",
+        "canonical_backbone": "exact configured calendar reconstructed from machine.csv model_ids and date bounds",
+        "feature_mode": FEATURE_MODE,
+        "lookback_days": int(cfg("LOOKBACK_DAYS", LOOKBACK_DAYS)),
+        "horizon_days": int(cfg("HORIZON_DAYS", HORIZON_DAYS)),
+        "snapshot_frequency_days": int(cfg("SNAPSHOT_FREQ_DAYS", SNAPSHOT_FREQ_DAYS)),
+        "target_column": TARGET_COLUMN,
         "operation_path": str(operation_path) if operation_path else None,
         "fluid_samples_path": str(fluid_samples_path) if fluid_samples_path else None,
         "warranty_path": str(warranty_path) if warranty_path else None,

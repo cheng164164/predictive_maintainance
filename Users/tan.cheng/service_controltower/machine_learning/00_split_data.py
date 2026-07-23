@@ -10,6 +10,7 @@ from ml_utils import (
     chronological_split,
     ensure_dir,
     make_split_summary,
+    prepared_features_for_available_sources,
     read_snapshot,
     resolve_input_path,
     source_features_for_model_variants,
@@ -74,13 +75,16 @@ def _load_and_prepare_snapshot():
         enabled=getattr(config, "SNAPSHOT_TRAINING_FILTERS_ENABLED", False),
         drop_after_cutoff=getattr(config, "DROP_SNAPSHOTS_AFTER_FULL_TARGET_WINDOW", False),
         cutoff_reference_end_date=getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+        prediction_horizon_days=getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
         drop_all_zero_rows=getattr(config, "DROP_ALL_ZERO_SNAPSHOT_ROWS", True),
         drop_extreme_sparse_rows=getattr(config, "DROP_EXTREME_SPARSE_SNAPSHOT_ROWS", True),
         min_nonzero_feature_count=getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
         nonzero_epsilon=getattr(config, "SPARSE_ROW_NONZERO_EPSILON", 1e-12),
         numeric_only=getattr(config, "SPARSE_ROW_NUMERIC_ONLY", True),
         add_diagnostic_columns=getattr(config, "SNAPSHOT_FILTER_ADD_DIAGNOSTIC_COLUMNS", False),
+        activity_feature_columns=getattr(config, "SNAPSHOT_ACTIVITY_FEATURE_COLUMNS", []),
+        activity_exclude_columns=getattr(config, "SNAPSHOT_ACTIVITY_EXCLUDE_COLUMNS", []),
+        sentinel_columns=list(getattr(config, "SENTINEL_COLUMNS_TO_CLEAN", {}).keys()),
     )
     return df, source_cols_to_drop, sentinel_report, snapshot_filter_report
 
@@ -112,6 +116,18 @@ def _export_reduced_snapshot_dataframe(df, step_dir):
         source_features=required_source_features,
         error_on_missing=config.ERROR_ON_MISSING_SOURCE_FEATURES,
     )
+    effective_prepared_features, skipped_prepared_features, skipped_source_features = (
+        prepared_features_for_available_sources(
+            prepared_features=selected_prepared,
+            prepared_to_source=config.PREPARED_TO_SOURCE_FEATURE,
+            available_source_features=present_source_features,
+        )
+    )
+    if missing_source_features:
+        print(
+            f"[WARN] reduced snapshot Model {variant}: skipping missing source columns="
+            f"{missing_source_features}; prepared features removed={skipped_prepared_features}"
+        )
 
     required_context_cols = _ordered_unique(
         list(getattr(config, "ID_COLS", []) or [])
@@ -144,7 +160,10 @@ def _export_reduced_snapshot_dataframe(df, step_dir):
         "columns": int(len(reduced_df.columns)),
         "context_columns": required_context_cols,
         "feature_columns": present_source_features,
-        "selected_prepared_feature_count": int(len(selected_prepared)),
+        "configured_prepared_feature_count": int(len(selected_prepared)),
+        "effective_configured_prepared_feature_count": int(len(effective_prepared_features)),
+        "skipped_prepared_feature_count": int(len(skipped_prepared_features)),
+        "skipped_prepared_features": skipped_prepared_features,
         "required_source_feature_count": int(len(required_source_features)),
         "present_source_feature_count": int(len(present_source_features)),
         "missing_source_feature_count": int(len(missing_source_features)),
@@ -215,6 +234,8 @@ def run() -> None:
                     "feature_index": feature_idx,
                     "prepared_feature": feature,
                     "source_feature": source,
+                    "source_feature_present": bool(source in df.columns),
+                    "included_after_missing_source_check": bool(source in df.columns),
                     "is_machine_context_feature": bool(
                         feature in set(getattr(config, "PROTECTED_MACHINE_CONTEXT_PREPARED_FEATURES", []))
                     ),
@@ -225,13 +246,25 @@ def run() -> None:
                     "included_in_model_B": feature in set(config.FEATURE_SETS.get("B", [])),
                     "included_in_model_C": feature in set(config.FEATURE_SETS.get("C", [])),
                     "included_in_model_D": feature in set(config.FEATURE_SETS.get("D", [])),
+                    "included_in_model_E": feature in set(config.FEATURE_SETS.get("E", [])),
+                    "is_dynamic_categorical_pattern": any(ch in feature for ch in "*?["),
                 }
             )
 
         missing_sources = [c for c in sources if c not in df.columns]
+        effective_features, skipped_features, skipped_sources = prepared_features_for_available_sources(
+            prepared_features=features,
+            prepared_to_source=config.PREPARED_TO_SOURCE_FEATURE,
+            available_source_features=[c for c in sources if c in df.columns],
+            require_at_least_one=False,
+        )
         feature_set_summary.append(
             {
                 "model_variant": variant,
+                "configured_prepared_feature_count": len(features),
+                "effective_configured_prepared_feature_count": len(effective_features),
+                "skipped_prepared_feature_count": len(skipped_features),
+                "skipped_prepared_features": ";".join(skipped_features),
                 "selected_prepared_feature_count": len(features),
                 "required_source_feature_count": len(sources),
                 "missing_required_source_feature_count": len(missing_sources),
@@ -244,7 +277,7 @@ def run() -> None:
     feature_set_detail_df = pd.DataFrame(feature_set_detail_rows)
     feature_set_detail_df.to_csv(step_dir / "04_feature_sets_prepared_features.csv", index=False)
 
-    for variant in ["C", "D"]:
+    for variant in ["C", "D", "E"]:
         if variant in config.FEATURE_SETS:
             model_features_df = feature_set_detail_df[
                 feature_set_detail_df["model_variant"] == variant
@@ -291,7 +324,7 @@ def run() -> None:
             "snapshot_training_filter_report_file": "01c_snapshot_training_filter_report.csv" if not snapshot_filter_report.empty else None,
             "snapshot_rows_after_training_filters": int(len(df)),
             "snapshot_cutoff_reference_end_date": getattr(config, "SNAPSHOT_CUTOFF_REFERENCE_END_DATE", None),
-            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 45),
+            "snapshot_target_horizon_days": getattr(config, "SNAPSHOT_TARGET_HORIZON_DAYS", 90),
             "sparse_row_min_nonzero_feature_count": getattr(config, "SPARSE_ROW_MIN_NONZERO_FEATURE_COUNT", 3),
             "reduced_snapshot_export_enabled": bool(getattr(config, "SAVE_REDUCED_SNAPSHOT_DATAFRAME", False)),
             "reduced_snapshot_export": reduced_snapshot_metadata,

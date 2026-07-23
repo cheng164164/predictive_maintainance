@@ -55,7 +55,8 @@ ARTIFACT_MANIFEST_PATH = Path(
 # -----------------------------------------------------------------------------
 # Input files
 # -----------------------------------------------------------------------------
-# machine.csv is the canonical model_id + snapshot_date backbone.
+# machine.csv supplies eligible model_ids, original date bounds, and metadata.
+# The builder reconstructs an exact configurable calendar from those bounds.
 MACHINE_PATH = INPUT_DIR / "machine.csv"
 FAULT_CODES_PATH = INPUT_DIR / "fault_codes.csv"
 MAINTENANCE_PATH = INPUT_DIR / "maintenance.csv"
@@ -98,15 +99,113 @@ ALLOW_MODEL_ID_FALLBACK = True
 TARGET_MODEL_FAMILIES = ("D51", "D61", "D71")
 MIN_SNAPSHOT_DATE = None
 MAX_SNAPSHOT_DATE = None
+
+# Snapshot modeling design.
+# Features use [snapshot_date - LOOKBACK_DAYS, snapshot_date).
+# Labels use [snapshot_date, snapshot_date + HORIZON_DAYS).
+LOOKBACK_DAYS = 90
 HORIZON_DAYS = 90
 SNAPSHOT_FREQ_DAYS = 45
+APPLY_SNAPSHOT_FREQUENCY = True
+
+# How to convert the dates supplied by machine.csv into the modeling calendar.
+#   reconstruct    -> generate an exact N-day calendar between the original
+#                     backbone start and end dates; recommended when machine.csv
+#                     was built with a different cadence such as every 14 days.
+#   select_existing -> legacy behavior that keeps only dates already present in
+#                      machine.csv. This cannot produce an exact 45-day cadence
+#                      when the source dates occur every 14 days.
+SNAPSHOT_FREQUENCY_STRATEGY = "reconstruct"
+SNAPSHOT_FREQUENCY_SCOPE = "global"  # options: "global", "per_model"
+
+# None anchors the reconstructed calendar at the first eligible machine.csv
+# date. Set an explicit date only when all experiments must share a fixed anchor.
+SNAPSHOT_ANCHOR_DATE = None
+
+# Drop snapshots whose complete future label window is not observable.
+# When LABEL_OBSERVATION_END_DATE is None, the builder infers the latest date
+# available across the standardized input sources and machine backbone.
+REQUIRE_COMPLETE_LABEL_HORIZON = True
+LABEL_OBSERVATION_END_DATE = None
+
+# Select which feature set is returned by the unified modeling dataframe.
+#   basic  -> simple 90-day window aggregations below
+#   frozen -> the existing engineered FROZEN_FEATURES list
+FEATURE_MODE = "frozen"
+
+BASE_NUMERIC_FEATURES = [
+    # Prior warranty context before the observation window
+    "prior_claim_count_before_window",
+    "days_since_prior_claim_before_window",
+
+    # Source availability / coverage flags
+    "has_any_source_window",
+    "source_record_count_window",
+
+    # Fault-code signals inside the observation window
+    "has_fault_window",
+    "fault_count_window",
+    "fault_unique_code_count_window",
+    "fault_l03plus_count_window",
+    "fault_l04plus_count_window",
+    "fault_max_action_level_window",
+    "fault_max_evidence_score_window",
+    "fault_mean_evidence_score_window",
+    "fault_max_log_occurrence_window",
+    "fault_days_since_latest_in_window",
+    "fault_mechanical_count_window",
+    "fault_electrical_count_window",
+
+    # Fluid-sample signals inside the observation window
+    "has_fluid_window",
+    "fluid_sample_count_window",
+    "fluid_max_severity_window",
+    "fluid_latest_severity_window",
+    "fluid_days_since_latest_sample_window",
+    "fluid_max_cu_ppm_window",
+    "fluid_max_fe_ppm_window",
+    "fluid_max_pb_ppm_window",
+    "fluid_max_soot_percent_window",
+    "fluid_max_water_percent_window",
+
+    # Maintenance signals inside the observation window
+    "has_maintenance_window",
+    "maintenance_event_count_window",
+    "maintenance_monitor_reset_count_window",
+    "maintenance_overdue_count_window",
+    "maintenance_due_now_count_window",
+    "maintenance_min_remaining_hours_window",
+    "maintenance_days_since_latest_event_window",
+
+    # Operation / usage signals inside the observation window
+    "has_operation_window",
+    "operation_day_count_window",
+    "operation_working_hours_sum_window",
+    "operation_working_hours_mean_window",
+    "operation_working_hours_max_window",
+    "operation_engine_running_hours_sum_window",
+    "operation_idle_hours_sum_window",
+    "operation_idle_share_window",
+    "operation_latest_smr_window",
+    "operation_smr_delta_window",
+    "operation_high_throttle_day_count_window",
+]
+
+BASE_CATEGORICAL_FEATURES = [
+    "full_model",
+    "fault_dominant_component_window",
+    "maintenance_dominant_component_window",
+]
+
+# Frozen mode keeps the existing 365-day fluid feature behavior.
 FLUID_SAMPLE_LOOKBACK_DAYS = 365
 WRITE_CLEANING_REPORTS = True
 PROGRESS_EVERY_MACHINES = 100
 
-# Optional helper/debug columns. The training step can exclude helper columns if
-# you only want the frozen feature list plus identifiers and claim_next_45d.
-INCLUDE_QA_HELPER_COLUMNS = True
+# When False, the unified output contains only identifiers, the dynamic target,
+# and the selected basic/frozen modeling features. Source snapshot CSVs still
+# retain their source-level QA columns.
+INCLUDE_QA_HELPER_COLUMNS = False
 
 
 # -----------------------------------------------------------------------------

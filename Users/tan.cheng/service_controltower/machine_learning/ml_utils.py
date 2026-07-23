@@ -7,6 +7,7 @@ workflow can be run directly when new snapshot data arrives.
 """
 from __future__ import annotations
 
+import fnmatch
 import itertools
 import json
 import re
@@ -216,29 +217,32 @@ def apply_snapshot_training_filters(
     enabled: bool = True,
     drop_after_cutoff: bool = True,
     cutoff_reference_end_date: Any = None,
-    prediction_horizon_days: int = 45,
+    prediction_horizon_days: int = 90,
     drop_all_zero_rows: bool = True,
     drop_extreme_sparse_rows: bool = True,
     min_nonzero_feature_count: int = 3,
     nonzero_epsilon: float = 1e-12,
     numeric_only: bool = True,
     add_diagnostic_columns: bool = False,
+    activity_feature_columns: Optional[Sequence[str]] = None,
+    activity_exclude_columns: Optional[Sequence[str]] = None,
+    sentinel_columns: Optional[Sequence[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Filter snapshot rows that are not valid training examples.
+    """Filter snapshots before chronological splitting.
 
-    This function applies two types of safeguards before chronological splitting:
+    The function deliberately separates two concepts:
 
-    1. Target-window clipping. For a label such as claim_next_45d, snapshots
-       after reference_end_date - 45 days are removed because their full future
-       target window is not observable.
-    2. Active-row filtering. Rows with no non-zero model feature values, or only
-       an extremely small number of non-zero model feature values, are removed.
-       This prevents a full machine-date grid from creating artificial inactive
-       negative examples.
+    1. Empty-row detection: determine whether the snapshot contains any usable
+       source evidence in the observation window. Explicit activity columns such
+       as ``source_record_count_window`` are preferred when available.
+    2. Model-feature sparsity: optionally count non-zero values across the
+       selected numeric model source features.
 
-    Sparsity is calculated only from existing numeric model source features by
-    default. Categorical context fields such as full_model are intentionally not
-    counted as activity evidence.
+    This separation is important for the base feature set. Historical context
+    such as ``prior_claim_count_before_window`` can be non-zero even when the
+    current 90-day observation window contains no source records; such a row is
+    still an empty current-window snapshot and should not be retained merely
+    because older claim history exists.
     """
 
     out = df.copy()
@@ -292,8 +296,8 @@ def apply_snapshot_training_filters(
             )
         else:
             max_valid_snapshot_date = reference_end_date - pd.Timedelta(days=int(prediction_horizon_days))
-            keep_mask = out[date_col] <= max_valid_snapshot_date
-            out = out.loc[keep_mask].copy()
+            removed_dates = out.loc[out[date_col] > max_valid_snapshot_date, date_col]
+            out = out.loc[out[date_col] <= max_valid_snapshot_date].copy()
             report_rows.append(
                 _report_row(
                     step="target_window_cutoff",
@@ -304,12 +308,8 @@ def apply_snapshot_training_filters(
                     reference_end_date=reference_end_date.date().isoformat(),
                     prediction_horizon_days=int(prediction_horizon_days),
                     max_valid_snapshot_date=max_valid_snapshot_date.date().isoformat(),
-                    removed_snapshot_date_min=(
-                        df.loc[~keep_mask, date_col].min() if (~keep_mask).any() else pd.NaT
-                    ),
-                    removed_snapshot_date_max=(
-                        df.loc[~keep_mask, date_col].max() if (~keep_mask).any() else pd.NaT
-                    ),
+                    removed_snapshot_date_min=removed_dates.min() if len(removed_dates) else pd.NaT,
+                    removed_snapshot_date_max=removed_dates.max() if len(removed_dates) else pd.NaT,
                 )
             )
     else:
@@ -324,13 +324,12 @@ def apply_snapshot_training_filters(
             )
         )
 
-    excluded_cols = set([date_col])
+    excluded_cols = {date_col}
     if target_col:
         excluded_cols.add(target_col)
-    for col in id_cols or []:
-        excluded_cols.add(col)
+    excluded_cols.update(id_cols or [])
 
-    configured_features = list(feature_columns or [])
+    configured_features = list(dict.fromkeys(feature_columns or []))
     if configured_features:
         candidate_cols = [c for c in configured_features if c in out.columns and c not in excluded_cols]
         missing_feature_cols = [c for c in configured_features if c not in out.columns]
@@ -338,9 +337,9 @@ def apply_snapshot_training_filters(
         candidate_cols = [c for c in out.columns if c not in excluded_cols]
         missing_feature_cols = []
 
+    numeric_feature_cols: List[str] = []
+    non_numeric_excluded: List[str] = []
     if numeric_only:
-        numeric_feature_cols = []
-        non_numeric_excluded = []
         for col in candidate_cols:
             converted = pd.to_numeric(out[col], errors="coerce")
             if converted.notna().any():
@@ -349,39 +348,54 @@ def apply_snapshot_training_filters(
                 non_numeric_excluded.append(col)
     else:
         numeric_feature_cols = candidate_cols
-        non_numeric_excluded = []
 
-    if not numeric_feature_cols:
-        before = len(out)
-        report_rows.append(
-            _report_row(
-                step="row_activity_sparsity",
-                enabled=True,
-                status="skipped_no_numeric_feature_columns",
-                rows_before=before,
-                rows_after=before,
-                configured_feature_column_count=len(configured_features),
-                candidate_feature_column_count=len(candidate_cols),
-                numeric_feature_column_count=0,
-                missing_configured_feature_column_count=len(missing_feature_cols),
-            )
-        )
-        return out, pd.DataFrame(report_rows)
-
-    nonzero_count = pd.Series(0, index=out.index, dtype=np.int32)
     eps = float(nonzero_epsilon)
-    for col in numeric_feature_cols:
+
+    # Resolve the columns that define whether a snapshot has current-window
+    # source evidence. Explicit configured columns win. If they are absent, use
+    # standard base-snapshot activity columns. Finally, fall back to cleaned
+    # numeric model features after excluding recency/sentinel columns.
+    requested_activity_cols = list(dict.fromkeys(activity_feature_columns or []))
+    present_requested_activity = [
+        c for c in requested_activity_cols if c in out.columns and c not in excluded_cols
+    ]
+    missing_requested_activity = [c for c in requested_activity_cols if c not in out.columns]
+
+    if present_requested_activity:
+        resolved_activity_cols = present_requested_activity
+        activity_strategy = "configured_activity_columns"
+    else:
+        preferred = [
+            c
+            for c in ["source_record_count_window", "has_any_source_window"]
+            if c in out.columns and c not in excluded_cols
+        ]
+        if preferred:
+            resolved_activity_cols = preferred
+            activity_strategy = "auto_preferred_window_activity_columns"
+        else:
+            activity_excluded = set(activity_exclude_columns or []) | set(sentinel_columns or [])
+            resolved_activity_cols = []
+            for col in numeric_feature_cols:
+                lower = col.lower()
+                is_recency = lower.startswith("days_since") or "_days_since_" in lower
+                if col in activity_excluded or is_recency:
+                    continue
+                resolved_activity_cols.append(col)
+            activity_strategy = "fallback_cleaned_numeric_model_features"
+
+    activity_nonzero_count = pd.Series(0, index=out.index, dtype=np.int32)
+    for col in resolved_activity_cols:
         values = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
-        nonzero_count += values.abs().gt(eps).astype(np.int32)
+        activity_nonzero_count += values.abs().gt(eps).astype(np.int32)
 
     if add_diagnostic_columns:
-        out["snapshot_filter_nonzero_feature_count"] = nonzero_count
+        out["snapshot_filter_activity_nonzero_count"] = activity_nonzero_count
 
     before_zero = len(out)
-    if drop_all_zero_rows:
-        all_zero_mask = nonzero_count.eq(0)
+    if drop_all_zero_rows and resolved_activity_cols:
+        all_zero_mask = activity_nonzero_count.eq(0)
         out = out.loc[~all_zero_mask].copy()
-        nonzero_count = nonzero_count.loc[out.index]
         report_rows.append(
             _report_row(
                 step="all_zero_feature_rows",
@@ -389,13 +403,25 @@ def apply_snapshot_training_filters(
                 status="applied",
                 rows_before=before_zero,
                 rows_after=len(out),
-                numeric_feature_column_count=len(numeric_feature_cols),
-                configured_feature_column_count=len(configured_features),
-                candidate_feature_column_count=len(candidate_cols),
-                non_numeric_feature_columns_excluded=";".join(non_numeric_excluded[:50]),
-                missing_configured_feature_column_count=len(missing_feature_cols),
-                missing_configured_feature_columns=";".join(missing_feature_cols[:50]),
+                activity_strategy=activity_strategy,
+                activity_feature_column_count=len(resolved_activity_cols),
+                activity_feature_columns=";".join(resolved_activity_cols),
+                requested_activity_feature_columns=";".join(requested_activity_cols),
+                missing_requested_activity_feature_columns=";".join(missing_requested_activity),
                 nonzero_epsilon=eps,
+            )
+        )
+    elif drop_all_zero_rows:
+        report_rows.append(
+            _report_row(
+                step="all_zero_feature_rows",
+                enabled=True,
+                status="skipped_no_activity_feature_columns",
+                rows_before=before_zero,
+                rows_after=before_zero,
+                activity_strategy=activity_strategy,
+                requested_activity_feature_columns=";".join(requested_activity_cols),
+                missing_requested_activity_feature_columns=";".join(missing_requested_activity),
             )
         )
     else:
@@ -406,16 +432,26 @@ def apply_snapshot_training_filters(
                 status="disabled",
                 rows_before=before_zero,
                 rows_after=before_zero,
-                numeric_feature_column_count=len(numeric_feature_cols),
+                activity_strategy=activity_strategy,
+                activity_feature_columns=";".join(resolved_activity_cols),
             )
         )
 
+    # Model-feature sparsity is calculated independently from empty-row activity.
+    model_nonzero_count = pd.Series(0, index=out.index, dtype=np.int32)
+    for col in numeric_feature_cols:
+        values = pd.to_numeric(out.loc[out.index, col], errors="coerce").fillna(0.0)
+        model_nonzero_count += values.abs().gt(eps).astype(np.int32)
+
+    if add_diagnostic_columns:
+        out["snapshot_filter_nonzero_feature_count"] = model_nonzero_count
+
     before_sparse = len(out)
-    if drop_extreme_sparse_rows:
+    if drop_extreme_sparse_rows and numeric_feature_cols:
         min_count = int(min_nonzero_feature_count)
         if min_count < 1:
             raise ValueError("min_nonzero_feature_count must be at least 1.")
-        sparse_mask = nonzero_count.lt(min_count)
+        sparse_mask = model_nonzero_count.lt(min_count)
         out = out.loc[~sparse_mask].copy()
         report_rows.append(
             _report_row(
@@ -426,7 +462,25 @@ def apply_snapshot_training_filters(
                 rows_after=len(out),
                 min_nonzero_feature_count=min_count,
                 numeric_feature_column_count=len(numeric_feature_cols),
+                configured_feature_column_count=len(configured_features),
+                candidate_feature_column_count=len(candidate_cols),
+                non_numeric_feature_columns_excluded=";".join(non_numeric_excluded[:50]),
+                missing_configured_feature_column_count=len(missing_feature_cols),
+                missing_configured_feature_columns=";".join(missing_feature_cols[:50]),
                 nonzero_epsilon=eps,
+            )
+        )
+    elif drop_extreme_sparse_rows:
+        report_rows.append(
+            _report_row(
+                step="extreme_sparse_feature_rows",
+                enabled=True,
+                status="skipped_no_numeric_feature_columns",
+                rows_before=before_sparse,
+                rows_after=before_sparse,
+                configured_feature_column_count=len(configured_features),
+                candidate_feature_column_count=len(candidate_cols),
+                missing_configured_feature_column_count=len(missing_feature_cols),
             )
         )
     else:
@@ -437,6 +491,7 @@ def apply_snapshot_training_filters(
                 status="disabled",
                 rows_before=before_sparse,
                 rows_after=before_sparse,
+                numeric_feature_column_count=len(numeric_feature_cols),
             )
         )
 
@@ -452,6 +507,8 @@ def apply_snapshot_training_filters(
             total_rows_dropped_rate=float((initial_rows - final_rows) / initial_rows) if initial_rows else np.nan,
             final_snapshot_date_min=out[date_col].min() if final_rows else pd.NaT,
             final_snapshot_date_max=out[date_col].max() if final_rows else pd.NaT,
+            activity_strategy=activity_strategy,
+            activity_feature_columns=";".join(resolved_activity_cols),
         )
     )
     return out, pd.DataFrame(report_rows)
@@ -465,14 +522,14 @@ def apply_sentinel_cleaning(
     columns_to_clean: Mapping[str, str],
     replace_with: Any = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Clean sentinel days-since values and add has_prior indicators.
+    """Replace configured sentinel recency values and preserve event indicators.
 
-    For each configured source column:
-        indicator = 1 when a real prior event exists
-        indicator = 0 when the sentinel value is present
-        source column sentinel values are replaced with missing/replace_with
-
-    Returns the cleaned dataframe and a report dataframe.
+    If an indicator already exists in the snapshot (for example
+    ``has_fault_window``), it is retained and checked against the indicator
+    implied by the sentinel value. Missing/invalid indicator entries are filled
+    from the derived value. This avoids silently overwriting source-provided
+    flags while still supporting older frozen-feature snapshots where the
+    indicator must be created by this function.
     """
 
     out = df.copy()
@@ -496,12 +553,27 @@ def apply_sentinel_cleaning(
 
         numeric = pd.to_numeric(out[source_col], errors="coerce")
         sentinel_mask = numeric.eq(float(sentinel_value))
-        out[indicator_col] = (~sentinel_mask & numeric.notna()).astype(int)
+        derived_indicator = (~sentinel_mask & numeric.notna()).astype(int)
 
-        if replace_with is None:
-            out.loc[sentinel_mask, source_col] = np.nan
-        else:
-            out.loc[sentinel_mask, source_col] = replace_with
+        indicator_preexisting = bool(indicator_col and indicator_col in out.columns)
+        indicator_mismatch_count = 0
+        if indicator_col:
+            if indicator_preexisting:
+                existing = pd.to_numeric(out[indicator_col], errors="coerce")
+                valid_existing = existing.isin([0, 1])
+                indicator_mismatch_count = int(
+                    (
+                        existing.loc[valid_existing].astype(int)
+                        != derived_indicator.loc[valid_existing].astype(int)
+                    ).sum()
+                )
+                combined = existing.where(valid_existing, derived_indicator).fillna(derived_indicator)
+                out[indicator_col] = combined.astype(int)
+            else:
+                out[indicator_col] = derived_indicator
+
+        replacement = np.nan if replace_with is None else replace_with
+        out.loc[sentinel_mask, source_col] = replacement
 
         rows.append(
             {
@@ -512,12 +584,15 @@ def apply_sentinel_cleaning(
                 "sentinel_value": sentinel_value,
                 "sentinel_count": int(sentinel_mask.sum()),
                 "sentinel_rate": float(sentinel_mask.mean()) if len(out) else np.nan,
-                "indicator_positive_count": int(out[indicator_col].sum()),
-                "indicator_positive_rate": float(out[indicator_col].mean()) if len(out) else np.nan,
+                "indicator_preexisting": indicator_preexisting,
+                "indicator_mismatch_count": indicator_mismatch_count,
+                "indicator_positive_count": int(out[indicator_col].sum()) if indicator_col else np.nan,
+                "indicator_positive_rate": float(out[indicator_col].mean()) if indicator_col and len(out) else np.nan,
             }
         )
 
     return out, pd.DataFrame(rows)
+
 
 
 def chronological_split(
@@ -528,7 +603,14 @@ def chronological_split(
     test_ratio: float,
     secondary_sort_cols: Optional[Sequence[str]] = None,
 ) -> Tuple[SplitResult, Dict[str, float]]:
-    """Split rows chronologically into train, validation, and test."""
+    """Split chronologically while keeping each snapshot date in one partition.
+
+    A machine-date panel contains many rows for the same as-of date. Splitting by
+    raw row position can place part of one date in training and the remainder in
+    validation, which creates temporal leakage and undersized date-based CV
+    folds. Boundaries are therefore selected from complete date groups, using
+    cumulative row counts to stay close to the configured ratios.
+    """
 
     ratio_sum = train_ratio + validation_ratio + test_ratio
     if ratio_sum <= 0:
@@ -539,6 +621,9 @@ def chronological_split(
         "test_holdout": test_ratio / ratio_sum,
     }
 
+    if date_col not in df.columns:
+        raise ValueError(f"DATE_COL='{date_col}' was not found for chronological splitting.")
+
     sort_cols = [date_col]
     for col in secondary_sort_cols or []:
         if col in df.columns and col not in sort_cols:
@@ -546,23 +631,87 @@ def chronological_split(
 
     sorted_df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     n_rows = len(sorted_df)
-    train_end = int(np.floor(n_rows * effective["training_main"]))
-    validation_end = int(np.floor(n_rows * (effective["training_main"] + effective["validation_holdout"])))
+    if n_rows == 0:
+        empty = sorted_df.copy()
+        assignments = sorted_df[[c for c in sort_cols if c in sorted_df.columns]].copy()
+        assignments["row_position_chronological"] = pd.Series(dtype=int)
+        assignments["split"] = pd.Series(dtype=str)
+        return SplitResult(empty, empty.copy(), empty.copy(), assignments), effective
 
-    train = sorted_df.iloc[:train_end].copy()
-    validation = sorted_df.iloc[train_end:validation_end].copy()
-    test = sorted_df.iloc[validation_end:].copy()
+    date_values = pd.to_datetime(sorted_df[date_col], errors="coerce")
+    if date_values.isna().any():
+        raise ValueError(f"DATE_COL='{date_col}' contains missing dates during chronological splitting.")
+
+    date_counts = (
+        pd.DataFrame({date_col: date_values})
+        .groupby(date_col, sort=True)
+        .size()
+        .rename("row_count")
+        .reset_index()
+    )
+    unique_date_count = len(date_counts)
+    if unique_date_count < 3:
+        raise ValueError(
+            "Chronological train/validation/test split requires at least three unique snapshot dates. "
+            f"Found {unique_date_count}."
+        )
+
+    cumulative = date_counts["row_count"].cumsum().to_numpy()
+
+    def choose_boundary(target_rows: float, min_groups: int, max_groups: int) -> int:
+        """Return number of complete date groups assigned before a boundary."""
+        candidates = range(min_groups, max_groups + 1)
+        return min(candidates, key=lambda group_count: abs(cumulative[group_count - 1] - target_rows))
+
+    train_group_count = choose_boundary(
+        target_rows=n_rows * effective["training_main"],
+        min_groups=1,
+        max_groups=unique_date_count - 2,
+    )
+    validation_end_group_count = choose_boundary(
+        target_rows=n_rows * (effective["training_main"] + effective["validation_holdout"]),
+        min_groups=train_group_count + 1,
+        max_groups=unique_date_count - 1,
+    )
+
+    train_end_date = pd.Timestamp(date_counts.iloc[train_group_count - 1][date_col])
+    validation_end_date = pd.Timestamp(date_counts.iloc[validation_end_group_count - 1][date_col])
+
+    train_mask = date_values <= train_end_date
+    validation_mask = (date_values > train_end_date) & (date_values <= validation_end_date)
+    test_mask = date_values > validation_end_date
+
+    train = sorted_df.loc[train_mask].copy()
+    validation = sorted_df.loc[validation_mask].copy()
+    test = sorted_df.loc[test_mask].copy()
 
     audit_cols = [c for c in [date_col] + list(secondary_sort_cols or []) if c in sorted_df.columns]
     assignments = sorted_df[audit_cols].copy()
     assignments["row_position_chronological"] = np.arange(n_rows)
     assignments["split"] = "test_holdout"
-    if train_end > 0:
-        assignments.loc[: train_end - 1, "split"] = "training_main"
-    if validation_end > train_end:
-        assignments.loc[train_end: validation_end - 1, "split"] = "validation_holdout"
+    assignments.loc[train_mask.to_numpy(), "split"] = "training_main"
+    assignments.loc[validation_mask.to_numpy(), "split"] = "validation_holdout"
 
-    return SplitResult(train=train, validation=validation, test=test, split_assignments=assignments), effective
+    # Defensive validation: no date may appear in more than one split.
+    split_date_sets = {
+        "training_main": set(train[date_col].dropna().unique()),
+        "validation_holdout": set(validation[date_col].dropna().unique()),
+        "test_holdout": set(test[date_col].dropna().unique()),
+    }
+    if split_date_sets["training_main"] & split_date_sets["validation_holdout"]:
+        raise RuntimeError("A snapshot date was assigned to both training and validation.")
+    if split_date_sets["training_main"] & split_date_sets["test_holdout"]:
+        raise RuntimeError("A snapshot date was assigned to both training and test.")
+    if split_date_sets["validation_holdout"] & split_date_sets["test_holdout"]:
+        raise RuntimeError("A snapshot date was assigned to both validation and test.")
+
+    return SplitResult(
+        train=train.reset_index(drop=True),
+        validation=validation.reset_index(drop=True),
+        test=test.reset_index(drop=True),
+        split_assignments=assignments.reset_index(drop=True),
+    ), effective
+
 
 
 def target_series(df: pd.DataFrame, target_col: str) -> pd.Series:
@@ -636,6 +785,58 @@ def validate_source_features(
     return present, missing
 
 
+def prepared_features_for_available_sources(
+    prepared_features: Sequence[str],
+    prepared_to_source: Mapping[str, str],
+    available_source_features: Sequence[str],
+    require_at_least_one: bool = True,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Remove prepared features whose complete source column is unavailable.
+
+    This is intentionally different from adding a missing prepared column as
+    zero. Zero-filling is appropriate when the source exists but a one-hot
+    category is absent from one training period. When the complete source column
+    is absent from the snapshot dataframe, the mapped prepared feature should be
+    excluded from the model instead of becoming a permanently-zero input.
+
+    Returns:
+        effective_prepared_features: configured features whose sources exist
+        skipped_prepared_features: configured features whose sources are missing
+        skipped_source_features: ordered unique missing source column names
+    """
+
+    available = set(available_source_features)
+    effective: List[str] = []
+    skipped_prepared: List[str] = []
+    skipped_sources: List[str] = []
+    missing_mapping: List[str] = []
+
+    for prepared_feature in prepared_features:
+        source_feature = prepared_to_source.get(prepared_feature)
+        if source_feature is None:
+            missing_mapping.append(str(prepared_feature))
+            continue
+        if source_feature in available:
+            effective.append(str(prepared_feature))
+        else:
+            skipped_prepared.append(str(prepared_feature))
+            if source_feature not in skipped_sources:
+                skipped_sources.append(str(source_feature))
+
+    if missing_mapping:
+        raise ValueError(
+            "Prepared features are missing from PREPARED_TO_SOURCE_FEATURE mapping: "
+            + ", ".join(missing_mapping[:20])
+        )
+    if not effective and require_at_least_one:
+        raise ValueError(
+            "No prepared features remain after excluding missing source columns. "
+            f"Missing source columns: {skipped_sources}"
+        )
+
+    return effective, skipped_prepared, skipped_sources
+
+
 def _safe_feature_name(name: str, existing: set) -> str:
     safe = re.sub(r"[^0-9A-Za-z_]+", "_", str(name)).strip("_")
     if not safe:
@@ -658,6 +859,33 @@ def _make_one_hot_encoder():
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
+def _expand_prepared_feature_patterns(
+    selected_features: Sequence[str],
+    available_features: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    """Expand glob-style prepared-feature patterns in configured order.
+
+    Model E uses patterns such as ``cat__full_model_*`` so every category
+    produced by the fitted OneHotEncoder is retained without hardcoding category
+    values. Exact feature names continue to work unchanged for Models A-D.
+    """
+
+    available = list(available_features)
+    out: List[str] = []
+    unmatched_patterns: List[str] = []
+    for configured in selected_features:
+        if any(ch in configured for ch in "*?["):
+            matches = [name for name in available if fnmatch.fnmatchcase(name, configured)]
+            if not matches:
+                unmatched_patterns.append(configured)
+            for match in matches:
+                if match not in out:
+                    out.append(match)
+        elif configured not in out:
+            out.append(configured)
+    return out, unmatched_patterns
+
+
 def fit_transform_prepared_features(
     train_df: pd.DataFrame,
     validation_df: pd.DataFrame,
@@ -669,15 +897,16 @@ def fit_transform_prepared_features(
     one_hot_encode_categorical: bool,
     add_missing_prepared_features_as_zero: bool = True,
 ) -> PreparedData:
-    """
-    Fit preprocessing on train_df and transform validation/test consistently.
+    """Fit preprocessing on training data and transform all splits consistently.
 
-    The final returned matrices contain exactly selected_prepared_features in the
-    configured order. Missing one-hot columns can be added as all-zero columns.
+    Configured prepared-feature names may be exact names or glob patterns. Glob
+    patterns are expanded only after the training preprocessor is fit, which
+    allows Model E to retain all one-hot categories generated for its base
+    categorical source features.
     """
 
     source_features = list(source_features)
-    selected_prepared_features = list(selected_prepared_features)
+    configured_selected = list(selected_prepared_features)
     X_train_raw = train_df[source_features].copy()
 
     numeric_cols = [c for c in source_features if pd.api.types.is_numeric_dtype(X_train_raw[c])]
@@ -716,42 +945,67 @@ def fit_transform_prepared_features(
     X_val_all = as_df(val_arr, validation_df.index)
     X_test_all = as_df(test_arr, test_df.index) if test_arr is not None and test_df is not None else None
 
-    missing_selected = [f for f in selected_prepared_features if f not in X_train_all.columns]
-    if missing_selected and not add_missing_prepared_features_as_zero:
+    expanded_selected, unmatched_patterns = _expand_prepared_feature_patterns(
+        configured_selected, safe_names
+    )
+    exact_selected = [
+        feature for feature in configured_selected if not any(ch in feature for ch in "*?[")
+    ]
+    missing_exact = [feature for feature in exact_selected if feature not in X_train_all.columns]
+    if missing_exact and not add_missing_prepared_features_as_zero:
         raise ValueError(
             "Selected prepared features were not generated by the preprocessor: "
-            + ", ".join(missing_selected)
+            + ", ".join(missing_exact)
         )
 
-    for feature in missing_selected:
+    for feature in missing_exact:
         X_train_all[feature] = 0.0
         X_val_all[feature] = 0.0
         if X_test_all is not None:
             X_test_all[feature] = 0.0
+        if feature not in expanded_selected:
+            expanded_selected.append(feature)
 
-    extra_dropped = [f for f in X_train_all.columns if f not in set(selected_prepared_features)]
+    if not expanded_selected:
+        raise ValueError(
+            "No prepared features were selected after preprocessing. "
+            f"Unmatched configured patterns: {unmatched_patterns}"
+        )
 
-    X_train = X_train_all[selected_prepared_features].copy()
-    X_val = X_val_all[selected_prepared_features].copy()
-    X_test = X_test_all[selected_prepared_features].copy() if X_test_all is not None else None
+    selected_set = set(expanded_selected)
+    extra_dropped = [f for f in X_train_all.columns if f not in selected_set]
+
+    X_train = X_train_all[expanded_selected].copy()
+    X_val = X_val_all[expanded_selected].copy()
+    X_test = X_test_all[expanded_selected].copy() if X_test_all is not None else None
 
     feature_map = pd.DataFrame(
         {
             "prepared_feature": safe_names,
             "preprocessor_feature_name": original_names,
-            "selected_for_model": [name in set(selected_prepared_features) for name in safe_names],
+            "selected_for_model": [name in selected_set for name in safe_names],
         }
     )
-    if missing_selected:
+    if missing_exact:
         extra_rows = pd.DataFrame(
             {
-                "prepared_feature": missing_selected,
-                "preprocessor_feature_name": missing_selected,
+                "prepared_feature": missing_exact,
+                "preprocessor_feature_name": missing_exact,
                 "selected_for_model": True,
-                "note": "selected prepared feature was missing from this fit and added as zero",
+                "note": "selected exact prepared feature was missing from this fit and added as zero",
             }
         )
         feature_map = pd.concat([feature_map, extra_rows], ignore_index=True)
+    if unmatched_patterns:
+        pattern_rows = pd.DataFrame(
+            {
+                "prepared_feature": unmatched_patterns,
+                "preprocessor_feature_name": unmatched_patterns,
+                "selected_for_model": False,
+                "note": "configured wildcard pattern matched no generated prepared features",
+            }
+        )
+        feature_map = pd.concat([feature_map, pattern_rows], ignore_index=True)
 
     return PreparedData(
         X_train=X_train,
@@ -761,10 +1015,11 @@ def fit_transform_prepared_features(
         numeric_input_cols=list(numeric_cols),
         categorical_input_cols=list(categorical_cols),
         preprocessor=preprocessor,
-        selected_prepared_features=selected_prepared_features,
-        missing_selected_prepared_features=missing_selected,
+        selected_prepared_features=expanded_selected,
+        missing_selected_prepared_features=missing_exact + unmatched_patterns,
         extra_prepared_features_dropped=extra_dropped,
     )
+
 
 
 def build_expanding_window_folds(
