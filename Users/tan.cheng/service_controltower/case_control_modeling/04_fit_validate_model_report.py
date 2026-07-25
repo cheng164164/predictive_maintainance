@@ -1,19 +1,11 @@
-"""Step 04: fit models on training split and evaluate validation views only.
-
-This step runs after 03_cross_validation.py. It fits configured models on the
-full chronological training split and evaluates only the validation views:
-matched validation, matched validation plus population negatives, and
-population-like validation when available.
+"""Step 04: fit on the fixed training split and score the fixed validation split.
 
 The test split is intentionally not loaded or scored here. Test evaluation is
-reserved for 07_final_test_evaluation.py after data-design choices and model
+reserved for 07_final_test_evaluation.py after the data design and model
 hyperparameters are locked.
 
-For XGBoost, this step can save:
-- train vs validation learning curves from eval_set,
-- model feature importance,
-- booster gain/weight/cover importance,
-- SHAP contribution values from XGBoost pred_contribs.
+For XGBoost, this step can save learning curves, model/booster feature
+importance, and SHAP contribution values.
 """
 from __future__ import annotations
 
@@ -85,36 +77,20 @@ def _existing_path(value) -> Optional[str]:
 
 
 def _evaluation_views(dataset_row: pd.Series) -> list[tuple[str, str]]:
-    candidates = [
-        ("matched_validation", dataset_row.get("validation_dataset_path")),
-        # Recommended production-like validation view: rows are sampled from
-        # realistic machine/as-of-date snapshots and labeled by future horizons.
-        ("asof_population_validation", dataset_row.get("validation_asof_population_dataset_path")),
-        # Legacy views retained only if older files are present.
-        ("validation_with_population_negatives", dataset_row.get("validation_with_population_negatives_path")),
-        ("population_like_validation", dataset_row.get("validation_population_like_dataset_path")),
-    ]
-    out: list[tuple[str, str]] = []
-    seen = set()
-    for name, path_value in candidates:
-        path = _existing_path(path_value)
-        if path and path not in seen:
-            out.append((name, path))
-            seen.add(path)
-    return out
-
-
-def _find_fit_eval_view(eval_views: list[tuple[str, str]]) -> tuple[str, str]:
-    preferred = str(getattr(config, "XGBOOST_LEARNING_CURVE_EVAL_VIEW", "matched_validation"))
-    for name, path in eval_views:
-        if name == preferred:
-            return name, path
-    for name, path in eval_views:
-        if "validation" in name:
-            return name, path
-    if not eval_views:
-        raise ValueError("No evaluation views available for learning-curve monitoring.")
-    return eval_views[0]
+    mode = str(getattr(config, "EVALUATION_TARGET_MODE", "training_target")).strip().lower()
+    if mode == "claim_within_horizon":
+        path = _existing_path(
+            dataset_row.get("validation_horizon_evaluation_dataset_path")
+        )
+        if path:
+            return [("validation_horizon", path)]
+        raise ValueError(
+            "Dataset index is missing a fixed validation horizon-evaluation dataset. "
+            "Re-run 02_build_case_control_dataset.py with "
+            "EVALUATION_TARGET_MODE='claim_within_horizon'."
+        )
+    path = _existing_path(dataset_row.get("validation_dataset_path"))
+    return [("validation", path)] if path else []
 
 
 def _configured_threshold() -> float:
@@ -235,7 +211,6 @@ def _summarize_machine_predictions(pred: pd.DataFrame) -> pd.DataFrame:
             "positive_window_rows": int(pd.to_numeric(g.get("evaluation_target", g.get("target", 0)), errors="coerce").fillna(0).sum()),
             "case_rows": int(g.get("row_role", pd.Series(dtype=str)).astype(str).eq("case").sum()),
             "control_rows": int(g.get("row_role", pd.Series(dtype=str)).astype(str).eq("control").sum()),
-            "population_random_negative_rows": int(g.get("row_role", pd.Series(dtype=str)).astype(str).str.contains("population", case=False, na=False).sum()),
             "max_score": float(g["score"].max()),
             "mean_score": float(g["score"].mean()),
             "min_score": float(g["score"].min()),
@@ -423,7 +398,7 @@ def _save_feature_importance_outputs(model, algorithm: str, dataset_id: str, out
 
 
 def _configured_shap_views() -> set[str]:
-    views = getattr(config, "SHAP_EVALUATION_VIEWS", ["matched_validation", "population_like_validation"])
+    views = getattr(config, "SHAP_EVALUATION_VIEWS", ["validation"])
     if views is None:
         return set()
     return {str(v) for v in views}
@@ -666,12 +641,7 @@ def _build_horizon_trend_summary(metrics: pd.DataFrame, topk: pd.DataFrame) -> p
                 wide = wide.merge(extra, on=available_keys, how="outer")
             base = base.merge(wide, on=available_keys, how="left")
 
-    eval_priority = {
-        "asof_population_validation": 0,
-        "population_like_validation": 1,
-        "validation_with_population_negatives": 2,
-        "matched_validation": 3,
-    }
+    eval_priority = {"validation": 0}
     if "evaluation_view" in base.columns:
         base["evaluation_view_priority"] = base["evaluation_view"].map(eval_priority).fillna(9).astype(int)
     else:
@@ -693,7 +663,13 @@ def _train_score_one_dataset(dataset_row: pd.Series, output_dir: Path) -> dict:
     y_train = train_df["target"].astype(int)
 
     eval_views = _evaluation_views(dataset_row)
-    fit_eval_name, fit_eval_path = _find_fit_eval_view(eval_views)
+    # Model fitting and early stopping always monitor the original matched
+    # validation target. Horizon metrics are scored on the separate fixed,
+    # outcome-independent validation windows returned by _evaluation_views().
+    fit_eval_name = "validation_training_target"
+    fit_eval_path = _existing_path(dataset_row.get("validation_dataset_path"))
+    if not fit_eval_path:
+        raise ValueError("Matched validation dataset is missing from the dataset index.")
     fit_eval_df = _read_dataset(fit_eval_path)
     validate_dataset_features(fit_eval_df, config)
     X_fit_eval = fit_eval_df[list(config.NUMERIC_FEATURES) + list(config.CATEGORICAL_FEATURES)]
@@ -819,7 +795,14 @@ def _train_score_one_dataset(dataset_row: pd.Series, output_dir: Path) -> dict:
                     group_summary = pd.DataFrame()
                     group_metrics = {}
                     group_file = ""
-                    if "matched" in view_name or "with_population" in view_name:
+                    is_matched_case_control_view = not (
+                        "row_role" in pred_base.columns
+                        and pred_base["row_role"]
+                        .astype(str)
+                        .eq("fixed_horizon_evaluation_window")
+                        .all()
+                    )
+                    if "case_control_group_id" in pred_base.columns and is_matched_case_control_view:
                         pred_for_group = pred_base.copy()
                         pred_for_group["evaluation_target"] = y_eval.to_numpy()
                         pred_for_group["evaluation_target_col"] = eval_target_col
@@ -932,6 +915,7 @@ def run(
     dataset_index_path: str | Path | None = None,
     step_dir: str | Path | None = None,
 ) -> None:
+    config.refresh_derived_config()
     step_dir = Path(step_dir) if step_dir is not None else config.OUTPUT_DIR / "04_fit_validate_model_report"
     ensure_dir(step_dir)
     dataset_index = _load_dataset_index(dataset_index_path)
@@ -990,10 +974,9 @@ def run(
             "save_shap_values": bool(getattr(config, "SAVE_SHAP_VALUES", True)),
             "save_detailed_outputs": bool(getattr(config, "VALIDATION_SAVE_DETAILED_OUTPUTS", True)),
             "notes": [
-                "Each configured model is fitted on the chronological training split and scored on validation views only.",
-                "Training still uses the original case-control target; metrics can use the evaluation-only future-claim horizon target.",
-                "When EVALUATION_CLAIM_HORIZON_DAYS is a list, validation metrics are computed once per horizon using the same trained model scores.",
-                "validation_horizon_trend_summary_for_review.csv summarizes the trend across horizons for quick review.",
+                "Each configured model is fitted on the fixed machine-level training split and scored on the fixed validation split only.",
+                "Training and evaluation use the configured target; the default is the original case-control target.",
+                "The validation split is fixed and reused across experiment runs.",
                 "The test split is intentionally not loaded or scored in this step.",
                 "For XGBoost, learning curves are saved from eval_set using the configured validation view.",
                 "Feature importance and SHAP contribution files are saved for model interpretation.",

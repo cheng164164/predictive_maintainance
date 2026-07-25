@@ -1,11 +1,8 @@
-"""Step 07: final locked-parameter test evaluation and model save.
+"""Step 07: final locked-parameter evaluation on the fixed test split.
 
-Run this only after Phase 1 data-design selection and Phase 3 hyperparameter
-tuning are complete. This is the first script that evaluates the test split.
-
-It applies the FINAL_* settings from config.py, rebuilds the dataset in a final
-output folder, fits the final XGBoost model, evaluates test views, and saves the
-fitted model artifact.
+Run this only after data-design selection and hyperparameter tuning are complete.
+It applies the FINAL_* settings, rebuilds the deterministic fixed split, fits the
+final XGBoost model, evaluates the test split once, and saves the model artifact.
 """
 from __future__ import annotations
 
@@ -65,22 +62,18 @@ def _safe_name(text: str) -> str:
 
 
 def _test_views(dataset_row: pd.Series) -> list[tuple[str, str]]:
-    candidates = [
-        ("matched_test", dataset_row.get("test_dataset_path")),
-        # Recommended final production-like test view.
-        ("asof_population_test", dataset_row.get("test_asof_population_dataset_path")),
-        # Legacy views retained only if older files are present.
-        ("test_with_population_negatives", dataset_row.get("test_with_population_negatives_path")),
-        ("population_like_test", dataset_row.get("test_population_like_dataset_path")),
-    ]
-    out = []
-    seen = set()
-    for name, value in candidates:
-        path = _existing_path(value)
-        if path and path not in seen:
-            out.append((name, path))
-            seen.add(path)
-    return out
+    mode = str(getattr(config, "EVALUATION_TARGET_MODE", "training_target")).strip().lower()
+    if mode == "claim_within_horizon":
+        path = _existing_path(dataset_row.get("test_horizon_evaluation_dataset_path"))
+        if path:
+            return [("test_horizon", path)]
+        raise ValueError(
+            "Dataset index is missing a fixed test horizon-evaluation dataset. "
+            "Re-run 02_build_case_control_dataset.py with "
+            "EVALUATION_TARGET_MODE='claim_within_horizon'."
+        )
+    path = _existing_path(dataset_row.get("test_dataset_path"))
+    return [("test", path)] if path else []
 
 
 def _add_prediction_columns(pred: pd.DataFrame, score: np.ndarray, threshold: float, top_k_rates: list[float]) -> pd.DataFrame:
@@ -152,19 +145,15 @@ def _snapshot(keys: set[str]) -> dict:
 def _restore(values: dict) -> None:
     for key, value in values.items():
         setattr(config, key, value)
+    config.refresh_derived_config()
 
 
 def _apply_final_config(final_dataset_output_dir: Path) -> dict:
     config.OUTPUT_DIR = final_dataset_output_dir
-    config.CONTROLS_PER_POSITIVE_CASE = int(config.FINAL_CONTROLS_PER_POSITIVE_CASE)
-    config.ADD_ASOF_POPULATION_EVALUATION_TO_VALIDATION = False
-    config.ADD_ASOF_POPULATION_EVALUATION_TO_TEST = bool(getattr(config, "FINAL_ADD_ASOF_POPULATION_EVALUATION_TO_TEST", True))
-    config.TEST_ASOF_EVALUATION_MAX_ROWS = getattr(config, "FINAL_TEST_ASOF_EVALUATION_MAX_ROWS", None)
-    config.ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION = False
-    config.VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE = int(config.FINAL_VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE)
-    config.ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST = bool(config.FINAL_ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST)
-    # 02_build_case_control_dataset.py reads this only when ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST is true.
-    config.TEST_RANDOM_NEGATIVES_PER_POSITIVE = int(config.FINAL_TEST_RANDOM_NEGATIVES_PER_POSITIVE)
+    config.NEGATIVE_SAMPLING_MODE = str(config.FINAL_NEGATIVE_SAMPLING_MODE)
+    config.NEGATIVES_PER_POSITIVE_CASE = int(config.FINAL_NEGATIVES_PER_POSITIVE_CASE)
+    config.FEATURE_SET = str(config.FINAL_FEATURE_SET)
+    config.refresh_derived_config()
     config.XGBOOST_CLASS_IMPORTANCE_MODE = str(config.FINAL_XGBOOST_CLASS_IMPORTANCE_MODE)
     config.XGBOOST_FIXED_SCALE_POS_WEIGHT = float(config.FINAL_XGBOOST_FIXED_SCALE_POS_WEIGHT)
     config.XGBOOST_PARAMS = dict(config.FINAL_XGBOOST_PARAMS)
@@ -172,19 +161,21 @@ def _apply_final_config(final_dataset_output_dir: Path) -> dict:
     config.XGBOOST_EARLY_STOPPING_ROUNDS = int(config.FINAL_XGBOOST_EARLY_STOPPING_ROUNDS)
     return {
         "OUTPUT_DIR": str(final_dataset_output_dir),
-        "CONTROLS_PER_POSITIVE_CASE": config.CONTROLS_PER_POSITIVE_CASE,
+        "NEGATIVE_SAMPLING_MODE": config.NEGATIVE_SAMPLING_MODE,
+        "NEGATIVES_PER_POSITIVE_CASE": config.NEGATIVES_PER_POSITIVE_CASE,
+        "FEATURE_SET": config.FEATURE_SET,
         "FINAL_FIT_ON": config.FINAL_FIT_ON,
-        "ADD_ASOF_POPULATION_EVALUATION_TO_TEST": getattr(config, "ADD_ASOF_POPULATION_EVALUATION_TO_TEST", False),
-        "TEST_ASOF_EVALUATION_MAX_ROWS": getattr(config, "TEST_ASOF_EVALUATION_MAX_ROWS", None),
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST": config.ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST,
-        "TEST_RANDOM_NEGATIVES_PER_POSITIVE": config.TEST_RANDOM_NEGATIVES_PER_POSITIVE,
         "XGBOOST_CLASS_IMPORTANCE_MODE": config.XGBOOST_CLASS_IMPORTANCE_MODE,
         "XGBOOST_FIXED_SCALE_POS_WEIGHT": config.XGBOOST_FIXED_SCALE_POS_WEIGHT,
         "XGBOOST_USE_EARLY_STOPPING": config.XGBOOST_USE_EARLY_STOPPING,
         "XGBOOST_EARLY_STOPPING_ROUNDS": config.XGBOOST_EARLY_STOPPING_ROUNDS,
         "XGBOOST_PARAMS": config.XGBOOST_PARAMS,
-        "FINAL_EVALUATION_TARGET_MODE": getattr(config, "FINAL_EVALUATION_TARGET_MODE", getattr(config, "EVALUATION_TARGET_MODE", "training_target")),
-        "FINAL_EVALUATION_CLAIM_HORIZON_DAYS": getattr(config, "FINAL_EVALUATION_CLAIM_HORIZON_DAYS", getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", None)),
+        "EVALUATION_TARGET_MODE": getattr(
+            config, "EVALUATION_TARGET_MODE", "training_target"
+        ),
+        "EVALUATION_CLAIM_HORIZON_DAYS": list(
+            getattr(config, "EVALUATION_CLAIM_HORIZON_DAYS", [])
+        ),
     }
 
 
@@ -202,7 +193,7 @@ def _score_test_views(dataset_row: pd.Series, model, algorithm: str, output_dir:
         validate_dataset_features(test_df, config)
         X_test = test_df[list(config.NUMERIC_FEATURES) + list(config.CATEGORICAL_FEATURES)]
         y_test_training = test_df["target"].astype(int)
-        y_test, eval_target_col, eval_target_mode, eval_horizon_days = get_evaluation_target(test_df, config, prefix="FINAL")
+        y_test, eval_target_col, eval_target_mode, eval_horizon_days = get_evaluation_target(test_df, config)
         score = predict_score(model, X_test, algorithm)
 
         free = threshold_free_metrics(y_test, score)
@@ -260,6 +251,7 @@ def _score_test_views(dataset_row: pd.Series, model, algorithm: str, output_dir:
 
 
 def run() -> None:
+    config.refresh_derived_config()
     original_output_dir = config.OUTPUT_DIR
     final_root = original_output_dir / "07_final_test_evaluation"
     final_dataset_output_dir = final_root / "_final_dataset"
@@ -269,14 +261,9 @@ def run() -> None:
 
     restore_keys = {
         "OUTPUT_DIR",
-        "CONTROLS_PER_POSITIVE_CASE",
-        "ADD_ASOF_POPULATION_EVALUATION_TO_VALIDATION",
-        "ADD_ASOF_POPULATION_EVALUATION_TO_TEST",
-        "TEST_ASOF_EVALUATION_MAX_ROWS",
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION",
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST",
-        "VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE",
-        "TEST_RANDOM_NEGATIVES_PER_POSITIVE",
+        "NEGATIVE_SAMPLING_MODE",
+        "NEGATIVES_PER_POSITIVE_CASE",
+        "FEATURE_SET",
         "XGBOOST_CLASS_IMPORTANCE_MODE",
         "XGBOOST_FIXED_SCALE_POS_WEIGHT",
         "XGBOOST_PARAMS",
@@ -380,6 +367,7 @@ def run() -> None:
     finally:
         _restore(original_values)
         config.OUTPUT_DIR = original_output_dir
+        config.refresh_derived_config()
 
     if all_metrics:
         pd.DataFrame(all_metrics).to_csv(model_output_dir / "final_test_metrics_all_datasets.csv", index=False)
@@ -397,7 +385,8 @@ def run() -> None:
             "notes": [
                 "This is the only script intended to evaluate the test split.",
                 "Final parameters are read from FINAL_* values in config.py.",
-                "Final model fitting still uses the original case-control target; test metrics can use the evaluation-only future-claim horizon target.",
+                "The default final evaluation target is the original case-control target.",
+                "The deterministic machine assignment keeps the final test machines identical for the same source population and random seed.",
                 "If final early stopping is enabled, the model fits on train and monitors validation; otherwise FINAL_FIT_ON controls whether train+validation are used.",
             ],
         },

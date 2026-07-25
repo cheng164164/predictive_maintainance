@@ -140,20 +140,20 @@ def _filter_event_dates(
 def load_warranty(config) -> pd.DataFrame:
     path = resolve_source_file(config.SOURCE_DIR, config.WARRANTY_FILE_CANDIDATES)
     cols = [
-        "machine_id",
-        "claim_number",
-        "local_date",
-        "claim_type_description",
-        "warranty_claim_data_source",
-        "full_model",
-        "serial",
-        "failure_smr",
-        "critical_fail_part_number",
+        "machine_id", "claim_number", "local_date", "claim_type_description",
+        "warranty_claim_data_source", "full_model", "serial", "failure_smr",
+        "critical_fail_part_number", "claim_amount", "CLAIM_AMOUNT",
+        "total_claim_amount", "total_amount", "net_claim_amount", "paid_amount",
+        "claim_type", "claim_category",
     ]
     df = read_csv_selected(path, cols)
     df = add_machine_key(df, "full_model", "serial", "machine_id")
     df = _filter_event_dates(df, "local_date", config.MIN_CLAIM_DATE, config.MAX_CLAIM_DATE)
     df["claim_date"] = df["local_date"]
+    df["failure_smr"] = pd.to_numeric(df.get("failure_smr"), errors="coerce")
+    for col in ["claim_amount", "CLAIM_AMOUNT", "total_claim_amount", "total_amount", "net_claim_amount", "paid_amount"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df["critical_fail_part_number_clean"] = (
         df.get("critical_fail_part_number", "").astype(str).str.strip().str.lower()
     )
@@ -167,34 +167,20 @@ def load_warranty(config) -> pd.DataFrame:
 def load_fault_codes(config) -> pd.DataFrame:
     path = resolve_source_file(config.SOURCE_DIR, config.FAULT_CODES_FILE_CANDIDATES)
     cols = [
-        "serial_number",
-        "full_model",
-        "machine_id",
-        "event_date",
-        "fault_code",
-        "event_error_name_en",
-        "event_action_level",
-        "occurrence_count",
-        "log_occurrence_count",
-        "smr_hours",
-        "applicable_component",
-        "related_component",
-        "is_mechanical_failure_code",
-        "is_electrical_failure_code",
-        "action_level_num",
-        "failure_code_evidence_score",
-        "failure_code_evidence_strength_class",
+        "serial_number", "full_model", "machine_id", "event_date", "event_time",
+        "UPDATE_DATETIME", "fault_code", "event_error_name_en", "event_action_level",
+        "occurrence_count", "log_occurrence_count", "occurrence_class", "smr_hours",
+        "applicable_component", "related_component", "related_component_1",
+        "is_mechanical_failure_code", "is_electrical_failure_code", "action_level_num",
+        "failure_code_evidence_score", "failure_code_evidence_strength_class",
+        "failure_code_evidence_group", "history_category",
     ]
     df = read_csv_selected(path, cols)
     df = add_machine_key(df, "full_model", "serial_number", "machine_id")
     df = _filter_event_dates(df, "event_date", config.MIN_VALID_EVENT_DATE, config.MAX_VALID_EVENT_DATE)
     numeric_cols = [
-        "occurrence_count",
-        "log_occurrence_count",
-        "smr_hours",
-        "is_mechanical_failure_code",
-        "is_electrical_failure_code",
-        "action_level_num",
+        "occurrence_count", "log_occurrence_count", "occurrence_class", "smr_hours",
+        "is_mechanical_failure_code", "is_electrical_failure_code", "action_level_num",
         "failure_code_evidence_score",
     ]
     for col in numeric_cols:
@@ -206,29 +192,23 @@ def load_fault_codes(config) -> pd.DataFrame:
 def load_fluid_samples(config) -> pd.DataFrame:
     path = resolve_source_file(config.SOURCE_DIR, config.FLUID_SAMPLES_FILE_CANDIDATES)
     cols = [
-        "FULL_MODEL",
-        "SERIAL",
-        "machine_id",
-        "TELEMETRY_SMR_NUMERIC",
-        "LAB_NAME",
-        "LABS_SAMPLE_NUMBER",
-        "sample_drawn_date",
-        "sample_result_severity_order",
-        "Ag_Silver_PPM",
-        "Cu_Copper_PPM",
-        "Fe_Iron_PPM",
-        "K_Potassium_PPM",
-        "Ni_Nickel_PPM",
-        "Pb_Lead_PPM",
-        "Sn_Tin_PPM",
-        "Soot_Soot_Abs_cm",
-        "Soot_Soot_PERCENT",
+        "FULL_MODEL", "SERIAL", "machine_id", "TELEMETRY_SMR_NUMERIC", "LAB_NAME",
+        "LABS_SAMPLE_NUMBER", "sample_drawn_date", "sample_result_severity_order",
+        "Ag_Silver_PPM", "Al_Aluminum_PPM", "Cr_Chromium_PPM", "Cu_Copper_PPM",
+        "Fe_Iron_PPM", "Ni_Nickel_PPM", "Pb_Lead_PPM", "Sn_Tin_PPM",
+        "Ti_Titanium_PPM", "V_Vanadium_PPM",
+        "EthyleneGlycol_Ethylene_Glycol_PERCENT", "Fuel_Fuel_PERCENT",
+        "Gly_Glycol_PERCENT", "K_Potassium_PPM", "Li_Lithium_PPM", "Na_Sodium_PPM",
+        "PolypropyleneGlycol_Polypropylene_Glycol_PERCENT", "Sediment_Sediment_MG_PER_L",
+        "Si_Silicon_PPM", "Solids_Solids_PERCENT", "Soot_Soot_Abs",
+        "Soot_Soot_Abs_cm", "Soot_Soot_METHOD_DEPENDENT", "Soot_Soot_PERCENT",
         "Water_Water_PERCENT",
     ]
     df = read_csv_selected(path, cols)
     df = add_machine_key(df, "FULL_MODEL", "SERIAL", "machine_id")
     df = _filter_event_dates(df, "sample_drawn_date", config.MIN_VALID_EVENT_DATE, config.MAX_VALID_EVENT_DATE)
-    for col in [c for c in cols if c not in {"FULL_MODEL", "SERIAL", "machine_id", "LAB_NAME", "LABS_SAMPLE_NUMBER", "sample_drawn_date"}]:
+    non_numeric = {"FULL_MODEL", "SERIAL", "machine_id", "LAB_NAME", "LABS_SAMPLE_NUMBER", "sample_drawn_date"}
+    for col in [c for c in cols if c not in non_numeric]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df.reset_index(drop=True)
@@ -237,23 +217,11 @@ def load_fluid_samples(config) -> pd.DataFrame:
 def load_maintenance(config) -> pd.DataFrame:
     path = resolve_source_file(config.SOURCE_DIR, config.MAINTENANCE_FILE_CANDIDATES)
     cols = [
-        "full_model",
-        "machine_id",
-        "SERIAL",
-        "EVENT_NAME_EN",
-        "event_date",
-        "smr_hours",
-        "remaining_hours",
-        "INTERVAL_HOURS",
-        "is_monitor_reset",
-        "is_overdue",
-        "is_due_now",
-        "is_notice_or_status",
-        "AVAILABLE",
-        "related_component",
-        "related_component_1",
-        "related_component_2",
-        "maintenance_type",
+        "full_model", "machine_id", "SERIAL", "EVENT_NAME_EN", "event_date",
+        "event_time", "UPDATE_DATETIME", "smr_hours", "remaining_hours", "INTERVAL_HOURS",
+        "is_monitor_reset", "is_overdue", "is_due_now", "is_notice_or_status", "AVAILABLE",
+        "related_component", "related_component_1", "related_component_2",
+        "maintenance_type", "service_types", "SERVICE_TYPES",
     ]
     df = read_csv_selected(path, cols)
     df = add_machine_key(df, "full_model", "SERIAL", "machine_id")
@@ -270,41 +238,39 @@ def load_maintenance(config) -> pd.DataFrame:
 def load_operation(config) -> pd.DataFrame:
     path = resolve_source_file(config.SOURCE_DIR, config.OPERATION_FILE_CANDIDATES)
     cols = [
-        "machine_id",
-        "LOCAL_DATE",
-        "full_model",
-        "SERIAL",
-        "smr_hours",
-        "smr_delta_clean_since_prev_obs_hours",
-        "actual_working_hours_clean",
-        "working_hours_clean",
-        "engine_running_hours_clean",
-        "engine_idling_hours_clean",
-        "engine_idle_share_daily",
-        "throttle_full_share_clean",
-        "high_throttle_day_flag",
-        "long_engine_day_flag",
-        "traveling_hours_clean",
-        "moving_back_forth_hours_clean",
-        "auto_quick_shift_hours_clean",
-        "manual_variable_shift_hours_clean",
-        "actual_work_day_flag",
-        "engine_running_day_flag",
-        "travel_day_flag",
+        "machine_id", "LOCAL_DATE", "full_model", "SERIAL", "smr_hours",
+        "smr_delta_clean_since_prev_obs_hours", "smr_valid_for_utilization_flag",
+        "smr_present_flag", "actual_working_hours_clean", "working_hours_clean",
+        "actual_work_streak_through_current_day", "actual_work_day_flag",
+        "actual_work_valid_flag", "actual_work_seconds_invalid_flag",
+        "fuel_actual_work_conflict_flag", "last_actual_work_date_through_current_day",
+        "engine_running_hours_clean", "engine_idling_hours_clean", "engine_idle_share_daily",
+        "engine_running_day_flag", "engine_seconds_valid_flag", "engine_seconds_observed_flag",
+        "throttle_full_hours_clean", "throttle_full_share_clean",
+        "throttle_average_dial_position_clean", "throttle_observed_flag",
+        "work_idle_sum_exceeds_engine_flag", "high_throttle_day_flag", "long_engine_day_flag",
+        "traveling_hours_clean", "moving_back_forth_hours_clean", "steering_hours_clean",
+        "travel_day_flag", "travel_usable_flag", "movement_observed_count",
+        "auto_quick_shift_hours_clean", "manual_variable_shift_hours_clean",
     ]
     df = read_csv_selected(path, cols)
-    # Drop blank exported rows.
     df = df.dropna(subset=["machine_id", "LOCAL_DATE"])
     df = add_machine_key(df, "full_model", "SERIAL", "machine_id")
     df = _filter_event_dates(df, "LOCAL_DATE", config.MIN_VALID_EVENT_DATE, config.MAX_VALID_EVENT_DATE)
-    for col in [c for c in cols if c not in {"machine_id", "LOCAL_DATE", "full_model", "SERIAL"}]:
+    non_numeric = {"machine_id", "LOCAL_DATE", "full_model", "SERIAL", "last_actual_work_date_through_current_day"}
+    for col in [c for c in cols if c not in non_numeric]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "last_actual_work_date_through_current_day" in df.columns:
+        df["last_actual_work_date_through_current_day"] = pd.to_datetime(
+            df["last_actual_work_date_through_current_day"], errors="coerce"
+        )
     return df.reset_index(drop=True)
 
 
 def load_sources(config, include_operation: bool = True) -> Dict[str, pd.DataFrame]:
-    sources = {
+    """Load date-filtered source tables without additional SMR eligibility censoring."""
+    sources: Dict[str, pd.DataFrame] = {
         "warranty": load_warranty(config),
         "fault": load_fault_codes(config),
         "fluid": load_fluid_samples(config),
@@ -403,19 +369,38 @@ def build_source_coverage(sources: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
 def build_machine_master(sources: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     frames = []
     for name, df in sources.items():
-        if df.empty or "machine_key" not in df.columns:
+        if str(name).startswith("_") or df is None or df.empty or "machine_key" not in df.columns:
             continue
-        model_col = "full_model_norm" if "full_model_norm" in df.columns else None
-        serial_col = "serial_norm" if "serial_norm" in df.columns else None
-        cols = ["machine_key"]
-        if model_col:
-            cols.append(model_col)
-        if serial_col:
-            cols.append(serial_col)
-        tmp = df[cols].drop_duplicates("machine_key").copy()
-        tmp = tmp.rename(columns={model_col: "full_model", serial_col: "serial"})
+        model_col = next(
+            (c for c in ["full_model_norm", "full_model", "FULL_MODEL"] if c in df.columns),
+            None,
+        )
+        serial_col = next(
+            (c for c in ["serial_norm", "serial", "SERIAL", "serial_number"] if c in df.columns),
+            None,
+        )
+        tmp = df[["machine_key"]].copy()
+        tmp["full_model"] = df[model_col].map(clean_model) if model_col else ""
+        tmp["serial"] = df[serial_col].map(clean_serial) if serial_col else ""
+        tmp = tmp.drop_duplicates(["machine_key", "full_model", "serial"])
         frames.append(tmp)
-    master = pd.concat(frames, ignore_index=True).drop_duplicates("machine_key", keep="first")
+    if not frames:
+        return pd.DataFrame(columns=["machine_key", "full_model", "serial"])
+
+    def first_nonblank(values: pd.Series) -> str:
+        cleaned = values.astype("string").fillna("").str.strip()
+        cleaned = cleaned[cleaned.ne("")]
+        return str(cleaned.iloc[0]) if len(cleaned) else ""
+
+    # Metadata can be absent from one source but present in another. Consolidate
+    # all sources per machine instead of keeping whichever source happened to be
+    # encountered first.
+    stacked = pd.concat(frames, ignore_index=True)
+    master = (
+        stacked.groupby("machine_key", dropna=False, sort=False)
+        .agg(full_model=("full_model", first_nonblank), serial=("serial", first_nonblank))
+        .reset_index()
+    )
     coverage = build_source_coverage(sources)
     master = master.merge(coverage, on="machine_key", how="left")
     return master
@@ -728,14 +713,35 @@ def get_evaluation_target(
     prefix: str = "",
     horizon_days: Optional[int] = None,
 ) -> Tuple[pd.Series, str, str, Optional[int]]:
-    """Return the evaluation y vector without changing model training target."""
+    """Return the evaluation y vector without changing model training target.
+
+    Future-claim labels are derived from the stored next-claim lead time on every
+    call.  Materialized ``eval_target_claim_within_next_*`` columns are retained
+    for inspection, but they are not trusted as the source of truth.  This keeps
+    validation/test sample identities fixed while allowing the configured horizon
+    list to change without accidentally reusing stale labels.
+    """
     mode, horizon, col = evaluation_target_settings(config, prefix=prefix, horizon_days=horizon_days)
-    if col not in df.columns:
-        if col == "target":
+    if mode == "training_target":
+        if col not in df.columns:
             raise ValueError("Dataset is missing required target column.")
+        y = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        return y, col, mode, horizon
+
+    lead_col = "days_to_next_claim_on_or_after_window_end"
+    if lead_col in df.columns:
+        days = pd.to_numeric(df[lead_col], errors="coerce")
+        include_window_end = bool(
+            getattr(config, "EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END", True)
+        )
+        lower_bound = days.ge(0) if include_window_end else days.gt(0)
+        y = (days.notna() & lower_bound & days.le(float(horizon))).astype(int)
+        return y, col, mode, horizon
+
+    if col not in df.columns:
         raise ValueError(
-            f"Dataset is missing {col!r}. Re-run 02_build_case_control_dataset.py with the updated scripts "
-            "so future-claim evaluation columns are added."
+            f"Dataset is missing both {lead_col!r} and {col!r}. Re-run "
+            "02_build_case_control_dataset.py so future-claim lead times are added."
         )
     y = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return y, col, mode, horizon
@@ -780,22 +786,837 @@ def window_config_name(window_config: Mapping) -> str:
     return f"lead_{int(window_config['lead_max_days'])}_to_{int(window_config['lead_min_days'])}"
 
 
-def controls_per_positive(config) -> int:
-    """Return the configured matched-control ratio per positive case."""
+def normalize_negative_sampling_mode(value, setting_name: str = "NEGATIVE_SAMPLING_MODE") -> str:
+    mode = str(value).strip().lower()
+    aliases = {
+        "controlled": "controlled",
+        "matched": "controlled",
+        "case_control": "controlled",
+        "random": "random",
+        "random_same_model": "random",
+        "mixed": "mixed",
+        "hybrid": "mixed",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"Unsupported {setting_name}={mode!r}. "
+            "Use 'controlled', 'random', or 'mixed'."
+        )
+    return aliases[mode]
 
-    return int(getattr(config, "CONTROLS_PER_POSITIVE_CASE", 3))
+
+def validate_negative_count(value, setting_name: str = "NEGATIVES_PER_POSITIVE_CASE") -> int:
+    count = int(value)
+    if count < 1:
+        raise ValueError(f"{setting_name} must be at least 1; received {value!r}.")
+    return count
+
+
+def negatives_per_positive(config) -> int:
+    return validate_negative_count(getattr(config, "NEGATIVES_PER_POSITIVE_CASE", 3))
+
+
+def negative_sampling_mode(config) -> str:
+    return normalize_negative_sampling_mode(
+        getattr(config, "NEGATIVE_SAMPLING_MODE", "controlled")
+    )
+
+
+def controls_per_positive(config) -> int:
+    """Backward-compatible alias used by older reporting code."""
+    return negatives_per_positive(config)
 
 
 def window_dataset_id(window_config: Mapping, config) -> str:
-    """Return a compact, stable dataset id for one window configuration."""
-
-    feature_suffix = "components_on" if bool(getattr(config, "ENABLE_COMPONENT_FEATURES", False)) else "components_off"
     lead_label = window_config_name(window_config)
     base = (
-        f"{lead_label}__controls_{controls_per_positive(config)}__"
-        f"neg_{int(config.CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END)}__{feature_suffix}"
+        f"{lead_label}__neg_{negative_sampling_mode(config)}_"
+        f"{negatives_per_positive(config)}__features_{str(config.FEATURE_SET).lower()}"
     )
     return re.sub(r"[^A-Za-z0-9_.=-]+", "_", base)
+
+
+def _normalized_split_ratios(config) -> dict:
+    ratios = {
+        "train": max(float(getattr(config, "TRAIN_RATIO", 0.70)), 0.0),
+        "validation": max(float(getattr(config, "VALIDATION_RATIO", 0.15)), 0.0),
+        "test": max(float(getattr(config, "TEST_RATIO", 0.15)), 0.0),
+    }
+    total = sum(ratios.values())
+    if total <= 0:
+        raise ValueError("TRAIN_RATIO + VALIDATION_RATIO + TEST_RATIO must be positive.")
+    return {k: v / total for k, v in ratios.items()}
+
+
+def _stable_hash_int(value: str, random_state: int) -> int:
+    payload = f"{int(random_state)}|{value}".encode("utf-8")
+    return int(hashlib.md5(payload).hexdigest()[:16], 16)
+
+
+def _machine_set_fingerprint(machine_keys: Sequence[str]) -> str:
+    payload = "\n".join(sorted(str(x) for x in machine_keys))
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def _machine_split_design_fingerprint(master: pd.DataFrame) -> str:
+    """Fingerprint fields that determine the fixed stratified assignment."""
+    cols = ["machine_key", "full_model", "has_eligible_claim_history"]
+    work = master.reindex(columns=cols).copy()
+    for col in cols:
+        work[col] = work[col].astype("string").fillna("<NA>")
+    work = work.sort_values(cols, kind="mergesort").reset_index(drop=True)
+    return hashlib.md5(
+        work.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    ).hexdigest()
+
+
+def _allocate_stratum_splits(n: int, ratios: Mapping[str, float], stratum: str, random_state: int) -> List[str]:
+    active = [name for name in ["train", "validation", "test"] if ratios[name] > 0]
+    if n <= 0:
+        return []
+    if n == 1:
+        u = (_stable_hash_int(stratum, random_state) % 10_000_000) / 10_000_000.0
+        cumulative = 0.0
+        for name in ["train", "validation", "test"]:
+            cumulative += ratios[name]
+            if u < cumulative:
+                return [name]
+        return [active[-1]]
+    if n == 2 and len(active) >= 2:
+        holdouts = [name for name in ["validation", "test"] if ratios[name] > 0]
+        second = holdouts[_stable_hash_int(stratum + "|holdout", random_state) % len(holdouts)] if holdouts else active[-1]
+        return ["train" if ratios["train"] > 0 else active[0], second]
+
+    raw = {name: n * ratios[name] for name in active}
+    counts = {name: int(np.floor(raw[name])) for name in active}
+    remainder = n - sum(counts.values())
+    order = sorted(
+        active,
+        key=lambda name: (raw[name] - counts[name], ratios[name], -_stable_hash_int(stratum + name, random_state)),
+        reverse=True,
+    )
+    for i in range(remainder):
+        counts[order[i % len(order)]] += 1
+
+    if n >= len(active):
+        for name in active:
+            if counts[name] == 0:
+                donor = max(active, key=lambda x: counts[x])
+                if counts[donor] > 1:
+                    counts[donor] -= 1
+                    counts[name] += 1
+
+    labels: List[str] = []
+    for name in ["train", "validation", "test"]:
+        labels.extend([name] * counts.get(name, 0))
+    return labels[:n]
+
+
+def build_or_load_fixed_machine_split_assignments(
+    machine_master: pd.DataFrame,
+    claim_history_episodes: pd.DataFrame,
+    config,
+    assignment_path: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Create or reuse deterministic machine-level train/validation/test assignments.
+
+    The split is stratified by full model and whether the machine has eligible
+    claim history. Every machine is assigned exactly once, and the saved file is
+    treated as locked for repeatable experiments.
+    """
+    assignment_path = Path(assignment_path)
+    metadata_path = assignment_path.with_name(assignment_path.stem + "_metadata.json")
+    ensure_dir(assignment_path.parent)
+
+    master = machine_master[[c for c in ["machine_key", "full_model", "serial"] if c in machine_master.columns]].copy()
+    master = master.dropna(subset=["machine_key"]).drop_duplicates("machine_key")
+    master["machine_key"] = master["machine_key"].astype(str)
+    master["full_model"] = master.get("full_model", "UNKNOWN").map(clean_model).replace("", "UNKNOWN")
+    claim_machines = set(claim_history_episodes.get("machine_key", pd.Series(dtype=str)).dropna().astype(str))
+    master["has_eligible_claim_history"] = master["machine_key"].isin(claim_machines).astype(int)
+
+    ratios = _normalized_split_ratios(config)
+    split_random_state = int(getattr(config, "FIXED_SPLIT_RANDOM_STATE", config.RANDOM_STATE))
+    fingerprint = _machine_set_fingerprint(master["machine_key"].tolist())
+    design_fingerprint = _machine_split_design_fingerprint(master)
+    expected_meta = {
+        "machine_fingerprint": fingerprint,
+        "split_design_fingerprint": design_fingerprint,
+        "machine_count": int(len(master)),
+        "random_state": split_random_state,
+        "ratios": ratios,
+        "strategy": "fixed_random_machine_level_stratified_by_full_model_and_claim_history",
+    }
+
+    if assignment_path.exists():
+        if not metadata_path.exists():
+            raise ValueError(
+                "The fixed split assignment file exists without its metadata lock. "
+                f"Delete {assignment_path} only if you intentionally want to create a new split."
+            )
+        existing = pd.read_csv(assignment_path)
+        required = {"machine_key", "split"}
+        if not required.issubset(existing.columns):
+            raise ValueError(f"Existing split assignment file is invalid: {assignment_path}")
+        if existing["machine_key"].astype(str).duplicated().any():
+            raise ValueError(f"Existing split assignment contains duplicate machines: {assignment_path}")
+        invalid_splits = sorted(
+            set(existing["split"].dropna().astype(str)) - {"train", "validation", "test"}
+        )
+        if invalid_splits or existing["split"].isna().any():
+            raise ValueError(
+                f"Existing split assignment contains invalid split labels: {invalid_splits}"
+            )
+        existing_keys = set(existing["machine_key"].astype(str))
+        current_keys = set(master["machine_key"].astype(str))
+        if existing_keys != current_keys:
+            raise ValueError(
+                "The eligible machine population changed after fixed split assignments were created. "
+                f"Delete {assignment_path} only if you intentionally want to create a new holdout split."
+            )
+        meta = read_json(metadata_path)
+        if (
+            meta.get("machine_fingerprint") != fingerprint
+            or meta.get("split_design_fingerprint") != design_fingerprint
+            or int(meta.get("random_state", -1)) != split_random_state
+            or meta.get("ratios") != ratios
+        ):
+            raise ValueError(
+                "Existing fixed split metadata does not match the current eligible machine "
+                "population, full-model/claim strata, or split settings. "
+                f"Delete {assignment_path} and {metadata_path} only for an intentional redesign."
+            )
+        existing["machine_key"] = existing["machine_key"].astype(str)
+        existing = master.merge(existing.drop(columns=[c for c in ["full_model", "serial", "has_eligible_claim_history"] if c in existing.columns]), on="machine_key", how="left")
+        summary = summarize_machine_split_assignments(existing, ratios)
+        return existing, summary
+
+    assigned_parts = []
+    for (full_model, claim_flag), group in master.groupby(["full_model", "has_eligible_claim_history"], dropna=False, sort=True):
+        stratum = f"{full_model}|claim={int(claim_flag)}"
+        g = group.copy()
+        g["_hash"] = g["machine_key"].map(lambda x: _stable_hash_int(str(x), split_random_state))
+        g = g.sort_values(["_hash", "machine_key"], kind="mergesort").reset_index(drop=True)
+        labels = _allocate_stratum_splits(len(g), ratios, stratum, split_random_state)
+        g["split"] = labels
+        g["split_stratum"] = stratum
+        g["split_assignment_hash"] = g["_hash"].map(lambda x: f"{int(x):016x}")
+        assigned_parts.append(g.drop(columns=["_hash"]))
+    assignments = pd.concat(assigned_parts, ignore_index=True) if assigned_parts else master.assign(split=pd.Series(dtype=str))
+
+    # Global safety check: when enough positive machines exist, every active
+    # split must contain at least one. Move one deterministic positive machine
+    # from a donor split if a rare-stratum allocation left a holdout empty.
+    active_splits = [s for s in ["train", "validation", "test"] if ratios[s] > 0]
+    positive_total = int(assignments["has_eligible_claim_history"].sum())
+    if positive_total >= len(active_splits):
+        for missing_split in active_splits:
+            if int(assignments.loc[assignments["split"].eq(missing_split), "has_eligible_claim_history"].sum()) > 0:
+                continue
+            donor_counts = (
+                assignments[assignments["has_eligible_claim_history"].eq(1)]
+                .groupby("split")["machine_key"].count()
+                .sort_values(ascending=False)
+            )
+            donor = next((s for s, count in donor_counts.items() if count > 1 and s != missing_split), None)
+            if donor is None:
+                continue
+            candidate = (
+                assignments[
+                    assignments["split"].eq(donor)
+                    & assignments["has_eligible_claim_history"].eq(1)
+                ]
+                .sort_values(["split_assignment_hash", "machine_key"], kind="mergesort")
+                .tail(1)
+            )
+            assignments.loc[candidate.index, "split"] = missing_split
+
+    if assignments["split"].isna().any() or assignments["machine_key"].duplicated().any():
+        raise ValueError("Failed to create one valid fixed split assignment per machine.")
+    assignments.to_csv(assignment_path, index=False)
+    write_json(expected_meta, metadata_path)
+    summary = summarize_machine_split_assignments(assignments, ratios)
+    return assignments, summary
+
+
+def summarize_machine_split_assignments(assignments: pd.DataFrame, ratios: Mapping[str, float]) -> pd.DataFrame:
+    rows = []
+    for split_name in ["train", "validation", "test"]:
+        sub = assignments[assignments["split"].eq(split_name)]
+        rows.append({
+            "split": split_name,
+            "machines": int(len(sub)),
+            "machines_with_eligible_claim_history": int(sub.get("has_eligible_claim_history", pd.Series(dtype=int)).sum()),
+            "machines_without_eligible_claim_history": int((sub.get("has_eligible_claim_history", pd.Series(dtype=int)) == 0).sum()),
+            "full_models": int(sub.get("full_model", pd.Series(dtype=str)).nunique(dropna=True)),
+            "configured_ratio": float(ratios[split_name]),
+            "actual_machine_ratio": float(len(sub) / len(assignments)) if len(assignments) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def _negative_counts(mode: str, total: int) -> Tuple[int, int]:
+    if mode == "controlled":
+        return total, 0
+    if mode == "random":
+        return 0, total
+    controlled = int(np.ceil(total / 2.0))
+    return controlled, total - controlled
+
+
+_RANDOM_WINDOW_END_CACHE: Dict[int, Dict[str, np.ndarray]] = {}
+_RANDOM_ELIGIBLE_WINDOW_CACHE: Dict[tuple, Dict[str, np.ndarray]] = {}
+
+
+def _random_window_end_candidates_by_machine(
+    sources: Mapping[str, pd.DataFrame],
+) -> Dict[str, np.ndarray]:
+    """Return candidate activity dates once per Step 02 process.
+
+    The previous implementation rebuilt this machine/date dictionary separately
+    for training and holdout construction. Operation data is usually the largest
+    table, so caching it removes a substantial duplicate groupby cost.
+    """
+    cache_key = id(sources)
+    cached = _RANDOM_WINDOW_END_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    operation = sources.get("operation", pd.DataFrame())
+    out: Dict[str, np.ndarray] = {}
+    if operation is not None and not operation.empty and "LOCAL_DATE" in operation.columns:
+        work = operation[["machine_key", "LOCAL_DATE"]].copy()
+        work["LOCAL_DATE"] = pd.to_datetime(work["LOCAL_DATE"], errors="coerce").dt.normalize()
+        work = work.dropna(subset=["machine_key", "LOCAL_DATE"])
+        for machine_key, group in work.groupby("machine_key", sort=False):
+            dates = np.sort(group["LOCAL_DATE"].unique().astype("datetime64[ns]"))
+            if len(dates):
+                out[str(machine_key)] = dates
+
+    # Fallback to another source date only for machines without operation dates.
+    fallback_frames = []
+    for name, date_col in [
+        ("fault", "event_date"),
+        ("fluid", "sample_drawn_date"),
+        ("maintenance", "event_date"),
+    ]:
+        df = sources.get(name, pd.DataFrame())
+        if df is not None and not df.empty and date_col in df.columns:
+            fallback_frames.append(
+                df[["machine_key", date_col]].rename(columns={date_col: "candidate_date"})
+            )
+    if fallback_frames:
+        fallback = pd.concat(fallback_frames, ignore_index=True)
+        fallback["candidate_date"] = pd.to_datetime(
+            fallback["candidate_date"], errors="coerce"
+        ).dt.normalize()
+        fallback = fallback.dropna(subset=["machine_key", "candidate_date"])
+        for machine_key, group in fallback.groupby("machine_key", sort=False):
+            key = str(machine_key)
+            if key not in out:
+                dates = np.sort(group["candidate_date"].unique().astype("datetime64[ns]"))
+                if len(dates):
+                    out[key] = dates
+
+    _RANDOM_WINDOW_END_CACHE[cache_key] = out
+    return out
+
+
+def build_fixed_horizon_evaluation_base_rows(
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    split_assignments: pd.DataFrame,
+    window_config: Mapping,
+    config,
+    included_splits: Sequence[str] = ("validation", "test"),
+    minimum_followup_days: int = 365,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build one fixed, outcome-independent evaluation window per holdout machine.
+
+    The matched case-control holdout is appropriate for evaluating the original
+    training target, but it is not appropriate for a future-claim horizon sweep:
+    case windows are anchored a fixed number of days before a known claim and
+    matched controls are deliberately selected to have no claim during a future
+    exclusion interval.  That construction can make several horizon labels
+    identical by design.
+
+    This function instead selects a deterministic random window for every
+    validation/test machine with sufficient source history and fully observable
+    claim follow-up.  Selection does not inspect future claims.  The row identity
+    therefore stays fixed while ``claim_within_horizon`` labels can be recomputed
+    independently for 30, 60, 90, 120, 180, 365 days, or another supported
+    horizon.
+    """
+
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = int(lead_max - lead_min)
+    if observation_days <= 0:
+        raise ValueError("lead_max_days must be greater than lead_min_days.")
+
+    followup_days = int(minimum_followup_days)
+    if followup_days <= 0:
+        raise ValueError("minimum_followup_days must be positive.")
+
+    requested_splits = {str(x) for x in included_splits}
+    assignments = split_assignments.copy()
+    assignments["machine_key"] = assignments["machine_key"].astype(str)
+    assignments = assignments[assignments["split"].astype(str).isin(requested_splits)].copy()
+
+    coverage = build_source_coverage(sources)
+    master = machine_master.copy()
+    master["machine_key"] = master["machine_key"].astype(str)
+    missing_coverage = [
+        c for c in ["first_source_date", "last_source_date"] if c not in master.columns
+    ]
+    if missing_coverage:
+        master = master.merge(
+            coverage[["machine_key", *missing_coverage]],
+            on="machine_key",
+            how="left",
+        )
+
+    assignment_cols = [
+        c for c in ["machine_key", "split", "full_model", "serial"]
+        if c in assignments.columns
+    ]
+    assignment_meta = assignments[assignment_cols].drop_duplicates("machine_key")
+    master = master.merge(
+        assignment_meta,
+        on="machine_key",
+        how="inner",
+        suffixes=("", "_assigned"),
+        validate="one_to_one",
+    )
+    for field in ["full_model", "serial"]:
+        assigned = f"{field}_assigned"
+        if assigned in master.columns:
+            current = master.get(field, pd.Series("", index=master.index)).astype("string").fillna("").str.strip()
+            master[field] = master.get(field, pd.Series("", index=master.index)).where(
+                current.ne(""), master[assigned]
+            )
+            master = master.drop(columns=[assigned])
+    if "full_model" not in master.columns:
+        master["full_model"] = ""
+    if "serial" not in master.columns:
+        master["serial"] = ""
+    master["full_model"] = master["full_model"].map(clean_model)
+    master["first_source_date"] = pd.to_datetime(master["first_source_date"], errors="coerce")
+    master["last_source_date"] = pd.to_datetime(master["last_source_date"], errors="coerce")
+
+    candidate_dates = _random_window_end_candidates_by_machine(sources)
+    max_observation = _max_claim_observation_date(config).normalize()
+    latest_globally_observable_end = max_observation - pd.Timedelta(days=followup_days)
+    seed_value = int(getattr(config, "FIXED_SPLIT_RANDOM_STATE", 42))
+    window_name = window_config_name(window_config)
+
+    rows: List[dict] = []
+    audit_rows: List[dict] = []
+    for _, machine in master.sort_values(["split", "machine_key"], kind="mergesort").iterrows():
+        machine_key = str(machine["machine_key"])
+        split_name = str(machine["split"])
+        first_source = pd.to_datetime(machine.get("first_source_date"), errors="coerce")
+        last_source = pd.to_datetime(machine.get("last_source_date"), errors="coerce")
+        raw_dates = np.asarray(
+            candidate_dates.get(machine_key, np.array([], dtype="datetime64[ns]")),
+            dtype="datetime64[ns]",
+        )
+
+        reason = "eligible"
+        selected_end = pd.NaT
+        eligible_count = 0
+        if pd.isna(first_source) or pd.isna(last_source):
+            reason = "missing_source_coverage"
+        elif len(raw_dates) == 0:
+            reason = "no_activity_dates"
+        else:
+            ends = pd.DatetimeIndex(pd.to_datetime(raw_dates, errors="coerce")).dropna()
+            if not ends.empty:
+                ends = ends.normalize().unique().sort_values()
+            earliest_end = pd.Timestamp(first_source).normalize() + pd.Timedelta(days=observation_days)
+            latest_end = min(
+                pd.Timestamp(last_source).normalize(),
+                pd.Timestamp(latest_globally_observable_end).normalize(),
+            )
+            if latest_end < earliest_end:
+                reason = "insufficient_history_or_future_followup"
+            else:
+                ends = ends[(ends >= earliest_end) & (ends <= latest_end)]
+                eligible_count = int(len(ends))
+                if not eligible_count:
+                    reason = "no_activity_date_in_eligible_range"
+                else:
+                    selector = _stable_hash_int(
+                        f"{window_name}|{split_name}|{machine_key}|fixed_horizon_window",
+                        seed_value,
+                    )
+                    selected_end = pd.Timestamp(ends[selector % eligible_count])
+
+        audit_rows.append(
+            {
+                "machine_key": machine_key,
+                "split": split_name,
+                "window_name": window_name,
+                "status": "selected" if pd.notna(selected_end) else "excluded",
+                "reason": reason,
+                "candidate_activity_dates": int(len(raw_dates)),
+                "eligible_activity_dates": eligible_count,
+                "selected_window_end": selected_end,
+                "minimum_followup_days": followup_days,
+                "max_claim_observation_date": max_observation,
+            }
+        )
+        if pd.isna(selected_end):
+            continue
+
+        window_end = pd.Timestamp(selected_end)
+        window_start = window_end - pd.Timedelta(days=observation_days)
+        sample_id = f"{window_name}__fixed_horizon__{split_name}__{machine_key}"
+        rows.append(
+            {
+                "row_role": "fixed_horizon_evaluation_window",
+                # This placeholder is replaced with the largest configured
+                # horizon label after future-claim outcomes are annotated. It is
+                # never used to fit the model.
+                "target": 0,
+                "case_control_group_id": sample_id,
+                "evaluation_sample_id": sample_id,
+                "claim_episode_id": "",
+                "case_machine_key": machine_key,
+                "control_number_within_group": np.nan,
+                "machine_key": machine_key,
+                "full_model": machine.get("full_model", ""),
+                "serial": machine.get("serial", ""),
+                "split": split_name,
+                "window_name": window_name,
+                "lead_max_days": lead_max,
+                "lead_min_days": lead_min,
+                "window_start": window_start,
+                "window_end": window_end,
+                "linked_case_window_start": pd.NaT,
+                "linked_case_window_end": pd.NaT,
+                "future_claim_date": pd.NaT,
+                "days_from_window_end_to_claim": np.nan,
+                "negative_sampling_type": "not_applicable",
+                "control_sampling_reason": "fixed_outcome_independent_horizon_evaluation_window",
+                "control_no_claim_start": pd.NaT,
+                "control_no_claim_end": pd.NaT,
+                "minimum_observable_followup_days": followup_days,
+            }
+        )
+
+    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
+
+
+def _eligible_random_windows_by_machine(
+    sources: Mapping[str, pd.DataFrame],
+    machine_master: pd.DataFrame,
+    dates_by_machine: Mapping[str, np.ndarray],
+    lookback_days: int,
+    config,
+) -> Dict[str, np.ndarray]:
+    """Precompute all eligible random window ends once for a window design.
+
+    Eligibility for a random negative depends on the machine, the fixed window
+    length, the no-claim interval, source coverage, and the observation end date;
+    it does not depend on the linked positive case. Precomputing therefore
+    replaces the old nested loop that tested as many as 80 dates for every
+    candidate machine for every case.
+    """
+    prior_days = int(
+        getattr(config, "NEGATIVE_EXCLUDE_PRIOR_CLAIM_DAYS_BEFORE_WINDOW_START", 30)
+    )
+    future_days = int(getattr(config, "NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
+    max_observation = _max_claim_observation_date(config).normalize()
+    require_coverage = bool(getattr(config, "REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True))
+    cache_key = (
+        id(sources),
+        int(lookback_days),
+        prior_days,
+        future_days,
+        max_observation.value,
+        require_coverage,
+        sum(len(v) for v in dates_by_machine.values()),
+    )
+    cached = _RANDOM_ELIGIBLE_WINDOW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    master = machine_master.copy()
+    if "first_source_date" not in master.columns or "last_source_date" not in master.columns:
+        coverage = build_source_coverage(sources)
+        missing_cols = [
+            col for col in ["first_source_date", "last_source_date"]
+            if col not in master.columns
+        ]
+        master = master.merge(
+            coverage[["machine_key", *missing_cols]], on="machine_key", how="left"
+        )
+    master["machine_key"] = master["machine_key"].astype(str)
+    master["first_source_date"] = pd.to_datetime(
+        master.get("first_source_date"), errors="coerce"
+    )
+    master["last_source_date"] = pd.to_datetime(
+        master.get("last_source_date"), errors="coerce"
+    )
+    coverage_map = master.drop_duplicates("machine_key").set_index("machine_key")
+
+    raw_candidates = _random_window_end_candidates_by_machine(sources)
+    eligible: Dict[str, np.ndarray] = {}
+    lookback_delta = pd.Timedelta(days=int(lookback_days))
+    prior_delta = pd.Timedelta(days=prior_days)
+    future_delta = pd.Timedelta(days=future_days)
+
+    for machine_key, raw_dates in raw_candidates.items():
+        ends = pd.DatetimeIndex(pd.to_datetime(raw_dates, errors="coerce")).dropna()
+        if ends.empty:
+            continue
+        ends = ends.normalize().unique().sort_values()
+        starts = ends - lookback_delta
+        mask = np.asarray((ends + future_delta) <= max_observation, dtype=bool)
+
+        if require_coverage:
+            if machine_key not in coverage_map.index:
+                continue
+            row = coverage_map.loc[machine_key]
+            first_source = pd.to_datetime(row.get("first_source_date"), errors="coerce")
+            last_source = pd.to_datetime(row.get("last_source_date"), errors="coerce")
+            if pd.isna(first_source) or pd.isna(last_source):
+                continue
+            mask &= np.asarray((first_source <= ends) & (last_source >= starts), dtype=bool)
+
+        claim_dates = np.asarray(
+            dates_by_machine.get(machine_key, np.array([], dtype="datetime64[ns]")),
+            dtype="datetime64[ns]",
+        )
+        if len(claim_dates):
+            claim_dates = np.sort(claim_dates)
+            no_claim_starts = (starts - prior_delta).values.astype("datetime64[ns]")
+            no_claim_ends = (ends + future_delta).values.astype("datetime64[ns]")
+            left = np.searchsorted(claim_dates, no_claim_starts, side="left")
+            right = np.searchsorted(claim_dates, no_claim_ends, side="right")
+            mask &= left == right
+
+        kept = ends[mask]
+        if len(kept):
+            eligible[machine_key] = kept.values.astype("datetime64[ns]")
+
+    _RANDOM_ELIGIBLE_WINDOW_CACHE[cache_key] = eligible
+    return eligible
+
+
+def _negative_window_eligibility(
+    machine_key: str,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    machine_row: pd.Series,
+    dates_by_machine: Mapping[str, np.ndarray],
+    sources: Mapping[str, pd.DataFrame],
+    config,
+) -> Tuple[bool, str, dict]:
+    """Check one controlled negative window using the original lightweight rules."""
+    prior_days = int(
+        getattr(config, "NEGATIVE_EXCLUDE_PRIOR_CLAIM_DAYS_BEFORE_WINDOW_START", 30)
+    )
+    future_days = int(getattr(config, "NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
+    no_claim_start = window_start - pd.Timedelta(days=prior_days)
+    no_claim_end = window_end + pd.Timedelta(days=future_days)
+    details = {
+        "control_no_claim_start": no_claim_start,
+        "control_no_claim_end": no_claim_end,
+    }
+
+    if no_claim_end > _max_claim_observation_date(config):
+        return False, "future_claim_followup_not_fully_observable", details
+    if bool(getattr(config, "REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)):
+        first_source = pd.to_datetime(machine_row.get("first_source_date"), errors="coerce")
+        last_source = pd.to_datetime(machine_row.get("last_source_date"), errors="coerce")
+        if (
+            pd.isna(first_source)
+            or pd.isna(last_source)
+            or first_source > window_end
+            or last_source < window_start
+        ):
+            return False, "no_source_coverage_overlap_window", details
+    if has_claim_between(dates_by_machine, machine_key, no_claim_start, no_claim_end):
+        return False, "claim_in_negative_exclusion_interval", details
+    return True, "eligible", details
+
+
+def _controlled_negative_rows(
+    case: pd.Series,
+    candidates: pd.DataFrame,
+    count: int,
+    dates_by_machine: Mapping[str, np.ndarray],
+    sources: Mapping[str, pd.DataFrame],
+    config,
+    excluded_machines: Optional[set] = None,
+    random_state: Optional[int] = None,
+) -> Tuple[List[dict], dict]:
+    """Sample same-window controls with the original scan-until-filled approach."""
+    excluded_machines = set(excluded_machines or set())
+    selected: List[dict] = []
+    rejection_counts: Dict[str, int] = {}
+    candidate_count = int(len(candidates))
+    if count <= 0 or candidates.empty:
+        return selected, {
+            "candidate_count": candidate_count,
+            "checked": 0,
+            "rejections": rejection_counts,
+        }
+
+    window_start = pd.Timestamp(case["window_start"])
+    window_end = pd.Timestamp(case["window_end"])
+    prior_days = int(
+        getattr(config, "NEGATIVE_EXCLUDE_PRIOR_CLAIM_DAYS_BEFORE_WINDOW_START", 30)
+    )
+    future_days = int(getattr(config, "NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
+    no_claim_start = window_start - pd.Timedelta(days=prior_days)
+    no_claim_end = window_end + pd.Timedelta(days=future_days)
+    if no_claim_end > _max_claim_observation_date(config):
+        rejection_counts["future_claim_followup_not_fully_observable"] = candidate_count
+        return selected, {
+            "candidate_count": candidate_count,
+            "checked": 0,
+            "rejections": rejection_counts,
+        }
+
+    eligible_pool = candidates
+    if bool(getattr(config, "REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)):
+        first_source = pd.to_datetime(eligible_pool.get("first_source_date"), errors="coerce")
+        last_source = pd.to_datetime(eligible_pool.get("last_source_date"), errors="coerce")
+        coverage_mask = (
+            first_source.notna()
+            & last_source.notna()
+            & (first_source <= window_end)
+            & (last_source >= window_start)
+        )
+        rejected = int((~coverage_mask).sum())
+        if rejected:
+            rejection_counts["no_source_coverage_overlap_window"] = rejected
+        eligible_pool = eligible_pool.loc[coverage_mask]
+
+    seed_value = int(config.RANDOM_STATE if random_state is None else random_state)
+    seed = _stable_hash_int(
+        str(case["case_control_group_id"]) + "|controlled", seed_value
+    ) % (2**32 - 1)
+    ordered = eligible_pool.sample(frac=1.0, random_state=seed)
+    checked = 0
+    for _, ctrl in ordered.iterrows():
+        machine_key = str(ctrl["machine_key"])
+        if machine_key in excluded_machines:
+            continue
+        checked += 1
+        if has_claim_between(
+            dates_by_machine, machine_key, no_claim_start, no_claim_end
+        ):
+            rejection_counts["claim_in_negative_exclusion_interval"] = (
+                rejection_counts.get("claim_in_negative_exclusion_interval", 0) + 1
+            )
+            continue
+        selected.append(
+            {
+                "machine_key": machine_key,
+                "full_model": ctrl["full_model"],
+                "serial": ctrl.get("serial", ""),
+                "window_start": window_start,
+                "window_end": window_end,
+                "negative_sampling_type": "controlled",
+                "control_sampling_reason": (
+                    "same_calendar_window_same_full_model_no_claim_in_exclusion_interval"
+                ),
+                "control_no_claim_start": no_claim_start,
+                "control_no_claim_end": no_claim_end,
+            }
+        )
+        excluded_machines.add(machine_key)
+        if len(selected) >= count:
+            break
+    return selected, {
+        "candidate_count": candidate_count,
+        "checked": checked,
+        "rejections": rejection_counts,
+    }
+
+
+def _random_negative_rows(
+    case: pd.Series,
+    candidates: pd.DataFrame,
+    count: int,
+    eligible_windows: Mapping[str, np.ndarray],
+    config,
+    excluded_machines: Optional[set] = None,
+    random_state: Optional[int] = None,
+) -> Tuple[List[dict], dict]:
+    """Sample random same-model negatives from precomputed eligible windows."""
+    excluded_machines = set(excluded_machines or set())
+    selected: List[dict] = []
+    rejection_counts: Dict[str, int] = {}
+    if count <= 0 or candidates.empty:
+        return selected, {
+            "candidate_count": int(len(candidates)),
+            "checked_machines": 0,
+            "rejections": rejection_counts,
+        }
+
+    seed_value = int(config.RANDOM_STATE if random_state is None else random_state)
+    group_seed = _stable_hash_int(
+        str(case["case_control_group_id"]) + "|random", seed_value
+    )
+    ordered = candidates.sample(
+        frac=1.0, random_state=group_seed % (2**32 - 1)
+    )
+    lookback_days = int(case["lead_max_days"] - case["lead_min_days"])
+    prior_days = int(
+        getattr(config, "NEGATIVE_EXCLUDE_PRIOR_CLAIM_DAYS_BEFORE_WINDOW_START", 30)
+    )
+    future_days = int(getattr(config, "NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
+    checked_machines = 0
+
+    for _, ctrl in ordered.iterrows():
+        machine_key = str(ctrl["machine_key"])
+        if machine_key in excluded_machines:
+            continue
+        checked_machines += 1
+        dates = np.asarray(
+            eligible_windows.get(machine_key, np.array([], dtype="datetime64[ns]")),
+            dtype="datetime64[ns]",
+        )
+        if len(dates) == 0:
+            rejection_counts["no_eligible_random_window"] = (
+                rejection_counts.get("no_eligible_random_window", 0) + 1
+            )
+            continue
+
+        date_seed = _stable_hash_int(
+            f"{group_seed}|{machine_key}|window", seed_value
+        )
+        window_end = pd.Timestamp(dates[date_seed % len(dates)])
+        window_start = window_end - pd.Timedelta(days=lookback_days)
+        selected.append(
+            {
+                "machine_key": machine_key,
+                "full_model": ctrl["full_model"],
+                "serial": ctrl.get("serial", ""),
+                "window_start": window_start,
+                "window_end": window_end,
+                "negative_sampling_type": "random",
+                "control_sampling_reason": (
+                    "random_precomputed_eligible_window_same_full_model_no_claim"
+                ),
+                "control_no_claim_start": window_start - pd.Timedelta(days=prior_days),
+                "control_no_claim_end": window_end + pd.Timedelta(days=future_days),
+            }
+        )
+        excluded_machines.add(machine_key)
+        if len(selected) >= count:
+            break
+
+    return selected, {
+        "candidate_count": int(len(candidates)),
+        "checked_machines": checked_machines,
+        "rejections": rejection_counts,
+    }
 
 
 def build_case_control_base_rows(
@@ -805,51 +1626,86 @@ def build_case_control_base_rows(
     window_config: Mapping,
     config,
     claim_history_episodes: Optional[pd.DataFrame] = None,
+    split_assignments: Optional[pd.DataFrame] = None,
+    included_splits: Optional[Sequence[str]] = None,
+    sampling_mode_override: Optional[str] = None,
+    negatives_per_positive_override: Optional[int] = None,
+    random_state_override: Optional[int] = None,
+    apply_positive_case_cap: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rng = np.random.default_rng(config.RANDOM_STATE)
+    """Build positive and negative base rows for selected fixed machine splits.
+
+    `included_splits` lets Step 02 construct configurable training rows separately
+    from locked validation/test rows. Sampling overrides affect only this call and
+    therefore do not require mutating the global configuration module. A separate
+    random-state override keeps holdout sampling fixed during training experiments.
+    """
     lead_max = int(window_config["lead_max_days"])
     lead_min = int(window_config["lead_min_days"])
     if lead_max <= lead_min:
         raise ValueError("lead_max_days must be greater than lead_min_days.")
 
-    coverage = build_source_coverage(sources)
-    # Use the full claim-history table for prior-claim features and control
-    # exclusion checks, even when only a subset of claims is selected as
-    # positive modeling cases for the current window configuration.
     history_for_claim_checks = claim_history_episodes if claim_history_episodes is not None else episodes
     dates_by_machine = claim_dates_by_machine(history_for_claim_checks)
-    episodes = episodes.merge(
+    coverage = build_source_coverage(sources)
+    episodes_work = episodes.merge(
         coverage[["machine_key", "first_source_date", "last_source_date", "source_record_count_total"]],
         on="machine_key",
         how="left",
     )
+    if split_assignments is not None:
+        episodes_work = episodes_work.merge(
+            split_assignments[["machine_key", "split"]], on="machine_key", how="left", validate="many_to_one"
+        )
+    else:
+        episodes_work["split"] = "train"
+
+    selected_splits = None
+    if included_splits is not None:
+        selected_splits = {str(x).strip().lower() for x in included_splits}
+        invalid_splits = sorted(selected_splits - {"train", "validation", "test"})
+        if invalid_splits:
+            raise ValueError(f"included_splits contains invalid labels: {invalid_splits}")
+        episodes_work = episodes_work[episodes_work["split"].isin(selected_splits)].copy()
 
     positive_rows = []
-    skipped_rows = []
-    for _, ep in episodes.iterrows():
+    audit_rows = []
+    for _, ep in episodes_work.iterrows():
         claim_date = pd.Timestamp(ep["claim_date"])
         window_start = claim_date - pd.Timedelta(days=lead_max)
         window_end = claim_date - pd.Timedelta(days=lead_min)
-        if bool(getattr(config, "REQUIRE_POSITIVE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)):
-            first_src = ep.get("first_source_date")
-            last_src = ep.get("last_source_date")
-            if pd.isna(first_src) or pd.isna(last_src) or pd.Timestamp(first_src) > window_end or pd.Timestamp(last_src) < window_start:
-                skipped_rows.append({
-                    "claim_episode_id": ep["claim_episode_id"],
-                    "machine_key": ep["machine_key"],
+        if pd.isna(ep.get("split")):
+            audit_rows.append({
+                "claim_episode_id": ep.get("claim_episode_id"),
+                "machine_key": ep.get("machine_key"),
+                "status": "positive_excluded",
+                "reason": "machine_missing_fixed_split_assignment",
+            })
+            continue
+        if bool(getattr(config, "REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)):
+            first_src = pd.to_datetime(ep.get("first_source_date"), errors="coerce")
+            last_src = pd.to_datetime(ep.get("last_source_date"), errors="coerce")
+            if pd.isna(first_src) or pd.isna(last_src) or first_src > window_end or last_src < window_start:
+                audit_rows.append({
+                    "claim_episode_id": ep.get("claim_episode_id"),
+                    "machine_key": ep.get("machine_key"),
+                    "split": ep.get("split"),
+                    "status": "positive_excluded",
                     "reason": "positive_no_source_coverage_overlap_window",
                     "window_start": window_start,
                     "window_end": window_end,
                 })
                 continue
-        positive_row = {
+        row = {
             "row_role": "case",
             "target": 1,
             "case_control_group_id": f"{window_config_name(window_config)}__{ep['claim_episode_id']}",
+            "case_machine_key": ep["machine_key"],
             "claim_episode_id": ep["claim_episode_id"],
             "machine_key": ep["machine_key"],
-            "full_model": ep["full_model"],
-            "serial": ep["serial"],
+            "full_model": clean_model(ep["full_model"]),
+            "serial": ep.get("serial", ""),
+            "split": ep["split"],
             "window_name": window_config_name(window_config),
             "lead_max_days": lead_max,
             "lead_min_days": lead_min,
@@ -861,144 +1717,231 @@ def build_case_control_base_rows(
             "claim_numbers": ep.get("claim_numbers", ""),
             "claim_type_descriptions": ep.get("claim_type_descriptions", ""),
             "critical_fail_part_numbers": ep.get("critical_fail_part_numbers", ""),
+            "negative_sampling_type": "case",
         }
         for extra_col in [
-            "positive_claim_selection_mode",
-            "lead_max_days_threshold_for_repeat_claim",
-            "claim_sequence_number",
-            "machine_claim_event_count",
-            "is_first_claim_for_machine",
-            "previous_claim_date_same_machine",
-            "days_since_previous_claim_same_machine",
+            "positive_claim_selection_mode", "lead_max_days_threshold_for_repeat_claim",
+            "claim_sequence_number", "machine_claim_event_count", "is_first_claim_for_machine",
+            "previous_claim_date_same_machine", "days_since_previous_claim_same_machine",
             "claim_selection_reason",
         ]:
             if extra_col in ep.index:
-                positive_row[extra_col] = ep.get(extra_col)
-        positive_rows.append(positive_row)
-    positives = pd.DataFrame(positive_rows)
-    if getattr(config, "MAX_POSITIVE_CASES_PER_WINDOW", None):
-        n = int(config.MAX_POSITIVE_CASES_PER_WINDOW)
-        positives = positives.sample(n=min(n, len(positives)), random_state=config.RANDOM_STATE).reset_index(drop=True)
+                row[extra_col] = ep.get(extra_col)
+        positive_rows.append(row)
 
-    # Control pool.  For speed, sample controls by scanning a shuffled
-    # candidate list until enough eligible machines are found. This avoids
-    # checking every candidate for every positive case when only a few controls
-    # are requested.
+    positives = pd.DataFrame(positive_rows)
+    sampling_random_state = int(
+        config.RANDOM_STATE if random_state_override is None else random_state_override
+    )
+    max_cases = (
+        getattr(config, "MAX_POSITIVE_CASES_PER_WINDOW", None)
+        if apply_positive_case_cap
+        else None
+    )
+    if max_cases is not None and len(positives) > int(max_cases):
+        total = int(max_cases)
+        if total < 1:
+            positives = positives.iloc[0:0].copy()
+        else:
+            # Preserve the currently included split mix. A single-split training
+            # call therefore receives the full development cap rather than only
+            # TRAIN_RATIO times the cap.
+            split_sizes = positives["split"].value_counts().to_dict()
+            active = [name for name in ["train", "validation", "test"] if split_sizes.get(name, 0) > 0]
+            raw = {name: total * split_sizes[name] / len(positives) for name in active}
+            counts = {name: int(np.floor(raw[name])) for name in active}
+            for name in active:
+                if total >= len(active) and counts[name] == 0:
+                    counts[name] = 1
+            while sum(counts.values()) > total:
+                donor = max(active, key=lambda name: (counts[name], raw[name]))
+                if counts[donor] <= 1 and total >= len(active):
+                    break
+                counts[donor] -= 1
+            remainder = total - sum(counts.values())
+            order = sorted(active, key=lambda name: (raw[name] - counts[name], split_sizes[name]), reverse=True)
+            for i in range(remainder):
+                counts[order[i % len(order)]] += 1
+            sampled = []
+            for split_name in active:
+                sub = positives[positives["split"].eq(split_name)]
+                sampled.append(
+                    sub.sample(
+                        n=min(counts[split_name], len(sub)),
+                        random_state=sampling_random_state,
+                    )
+                )
+            positives = pd.concat(sampled, ignore_index=True).drop_duplicates("case_control_group_id")
+
     master = machine_master.copy()
     if "first_source_date" not in master.columns:
         master = master.merge(coverage, on="machine_key", how="left")
+    if split_assignments is not None:
+        assignment_cols = [
+            c for c in ["machine_key", "split", "full_model", "serial"]
+            if c in split_assignments.columns
+        ]
+        assignment_meta = split_assignments[assignment_cols].drop_duplicates("machine_key").copy()
+        assignment_meta = assignment_meta.rename(
+            columns={c: f"assigned_{c}" for c in assignment_cols if c != "machine_key"}
+        )
+        master = master.merge(
+            assignment_meta,
+            on="machine_key",
+            how="left",
+            validate="one_to_one",
+        )
+        for field in ["split", "full_model", "serial"]:
+            assigned = f"assigned_{field}"
+            if assigned not in master.columns:
+                continue
+            if field not in master.columns:
+                master[field] = master[assigned]
+            else:
+                current = master[field].astype("string").fillna("").str.strip()
+                master[field] = master[field].where(current.ne(""), master[assigned])
+            master = master.drop(columns=[assigned])
+    if "full_model" not in master.columns:
+        master["full_model"] = ""
+    if "serial" not in master.columns:
+        master["serial"] = ""
+    if "split" not in master.columns:
+        master["split"] = "train"
     master["full_model"] = master["full_model"].map(clean_model)
     master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
     master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
+    master_by_model_split = {
+        (model, split): group.reset_index(drop=True)
+        for (model, split), group in master.groupby(["full_model", "split"], dropna=False)
+    }
 
-    if bool(getattr(config, "CONTROL_MATCH_ON_FULL_MODEL", True)):
-        master_by_model = {
-            m: g.reset_index(drop=True)
-            for m, g in master.groupby("full_model", dropna=False)
-        }
-    else:
-        master_by_model = {"__ALL__": master.reset_index(drop=True)}
-
+    mode = (
+        normalize_negative_sampling_mode(sampling_mode_override, "sampling_mode_override")
+        if sampling_mode_override is not None
+        else negative_sampling_mode(config)
+    )
+    total_requested = (
+        validate_negative_count(negatives_per_positive_override, "negatives_per_positive_override")
+        if negatives_per_positive_override is not None
+        else negatives_per_positive(config)
+    )
+    requested_controlled, requested_random = _negative_counts(mode, total_requested)
+    random_windows: Dict[str, np.ndarray] = {}
+    if mode in {"random", "mixed"}:
+        random_windows = _eligible_random_windows_by_machine(
+            sources=sources,
+            machine_master=master,
+            dates_by_machine=dates_by_machine,
+            lookback_days=lead_max - lead_min,
+            config=config,
+        )
+    accepted_cases = []
     controls = []
-    control_audit_rows = []
-    n_controls = controls_per_positive(config)
-    for i, case in positives.iterrows():
-        window_start = pd.Timestamp(case["window_start"])
-        window_end = pd.Timestamp(case["window_end"])
-        no_claim_start = window_start - pd.Timedelta(days=int(config.CONTROL_EXCLUDE_PRIOR_CLAIM_DAYS_BEFORE_WINDOW_START))
-        no_claim_end = window_end + pd.Timedelta(days=int(config.CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END))
 
-        if bool(getattr(config, "CONTROL_MATCH_ON_FULL_MODEL", True)):
-            candidates = master_by_model.get(case["full_model"], pd.DataFrame()).copy()
-        else:
-            candidates = master_by_model["__ALL__"].copy()
-        if not candidates.empty:
-            candidates = candidates[candidates["machine_key"] != case["machine_key"]]
-        if bool(getattr(config, "CONTROL_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)) and not candidates.empty:
-            candidates = candidates[
-                candidates["first_source_date"].notna()
-                & candidates["last_source_date"].notna()
-                & (candidates["first_source_date"] <= window_end)
-                & (candidates["last_source_date"] >= window_start)
-            ]
-        candidate_count = int(len(candidates))
-        if candidates.empty:
-            control_audit_rows.append({
+    for _, case in positives.iterrows():
+        pool = master_by_model_split.get((case["full_model"], case["split"]), pd.DataFrame()).copy()
+        if not pool.empty:
+            pool = pool[pool["machine_key"].astype(str) != str(case["machine_key"])]
+        selected_controlled, ctrl_audit = _controlled_negative_rows(
+            case, pool, requested_controlled, dates_by_machine, sources, config,
+            random_state=sampling_random_state,
+        )
+        used = {str(r["machine_key"]) for r in selected_controlled}
+        selected_random, random_audit = _random_negative_rows(
+            case,
+            pool,
+            requested_random,
+            random_windows,
+            config,
+            excluded_machines=used,
+            random_state=sampling_random_state,
+        )
+        used.update(str(r["machine_key"]) for r in selected_random)
+
+        # In mixed mode, let the other method fill a shortfall without adding a
+        # separate mix-ratio knob.
+        selected = selected_controlled + selected_random
+        if mode == "mixed" and len(selected) < total_requested:
+            shortfall = total_requested - len(selected)
+            extra_random, extra_random_audit = _random_negative_rows(
+                case,
+                pool,
+                shortfall,
+                random_windows,
+                config,
+                excluded_machines=used,
+                random_state=sampling_random_state,
+            )
+            selected.extend(extra_random)
+            used.update(str(r["machine_key"]) for r in extra_random)
+            if len(selected) < total_requested:
+                extra_controlled, extra_ctrl_audit = _controlled_negative_rows(
+                    case, pool, total_requested - len(selected), dates_by_machine, sources, config,
+                    excluded_machines=used, random_state=sampling_random_state,
+                )
+                selected.extend(extra_controlled)
+                ctrl_audit["mixed_fallback"] = extra_ctrl_audit
+            random_audit["mixed_fallback"] = extra_random_audit
+
+        if not selected:
+            audit_rows.append({
                 "case_control_group_id": case["case_control_group_id"],
                 "claim_episode_id": case["claim_episode_id"],
-                "candidate_count_before_claim_filter": 0,
-                "eligible_control_count_checked_until_selected": 0,
-                "selected_control_count": 0,
-                "status": "no_candidates_before_claim_filter",
+                "case_machine_key": case["machine_key"],
+                "split": case["split"],
+                "status": "case_excluded_no_eligible_negatives",
+                "negative_sampling_mode": mode,
+                "requested_negative_count": total_requested,
+                "selected_negative_count": 0,
+                "controlled_audit": json.dumps(ctrl_audit, default=str),
+                "random_audit": json.dumps(random_audit, default=str),
             })
             continue
 
-        seed = int(hashlib.md5(str(case["case_control_group_id"]).encode("utf-8")).hexdigest()[:8], 16)
-        candidates = candidates.sample(frac=1.0, random_state=(config.RANDOM_STATE + seed) % (2**32 - 1))
-
-        selected_rows = []
-        checked = 0
-        for _, ctrl in candidates.iterrows():
-            checked += 1
-            m = ctrl["machine_key"]
-            if has_claim_between(dates_by_machine, m, no_claim_start, no_claim_end):
-                continue
-            selected_rows.append(ctrl)
-            if len(selected_rows) >= n_controls:
-                break
-
-        if not selected_rows:
-            control_audit_rows.append({
-                "case_control_group_id": case["case_control_group_id"],
-                "claim_episode_id": case["claim_episode_id"],
-                "candidate_count_before_claim_filter": candidate_count,
-                "eligible_control_count_checked_until_selected": 0,
-                "selected_control_count": 0,
-                "status": "no_eligible_controls_after_claim_filter",
-            })
-            continue
-
-        for j, ctrl in enumerate(selected_rows, start=1):
+        accepted_cases.append(case.to_dict())
+        for j, negative in enumerate(selected, start=1):
             controls.append({
                 "row_role": "control",
                 "target": 0,
                 "case_control_group_id": case["case_control_group_id"],
+                "case_machine_key": case["machine_key"],
                 "claim_episode_id": case["claim_episode_id"],
                 "control_number_within_group": j,
-                "machine_key": ctrl["machine_key"],
-                "full_model": ctrl["full_model"],
-                "serial": ctrl.get("serial", ""),
+                "machine_key": negative["machine_key"],
+                "full_model": negative["full_model"],
+                "serial": negative.get("serial", ""),
+                "split": case["split"],
                 "window_name": case["window_name"],
                 "lead_max_days": lead_max,
                 "lead_min_days": lead_min,
-                "window_start": window_start,
-                "window_end": window_end,
+                "window_start": negative["window_start"],
+                "window_end": negative["window_end"],
+                "linked_case_window_start": case["window_start"],
+                "linked_case_window_end": case["window_end"],
                 "future_claim_date": pd.NaT,
                 "days_from_window_end_to_claim": np.nan,
-                "control_no_claim_start": no_claim_start,
-                "control_no_claim_end": no_claim_end,
-                "control_sampling_reason": "same_window_same_full_model_no_claim_in_exclusion_horizon",
+                **negative,
             })
-        control_audit_rows.append({
+        audit_rows.append({
             "case_control_group_id": case["case_control_group_id"],
             "claim_episode_id": case["claim_episode_id"],
-            "candidate_count_before_claim_filter": candidate_count,
-            "eligible_control_count_checked_until_selected": int(checked),
-            "selected_control_count": int(len(selected_rows)),
-            "status": "selected" if len(selected_rows) >= n_controls else "selected_fewer_than_requested",
+            "case_machine_key": case["machine_key"],
+            "split": case["split"],
+            "status": "selected",
+            "negative_sampling_mode": mode,
+            "requested_negative_count": total_requested,
+            "requested_controlled_count": requested_controlled,
+            "requested_random_count": requested_random,
+            "selected_negative_count": len(selected),
+            "selected_controlled_count": sum(r["negative_sampling_type"] == "controlled" for r in selected),
+            "selected_random_count": sum(r["negative_sampling_type"] == "random" for r in selected),
+            "controlled_audit": json.dumps(ctrl_audit, default=str),
+            "random_audit": json.dumps(random_audit, default=str),
         })
 
-    base = pd.concat([positives, pd.DataFrame(controls)], ignore_index=True, sort=False)
-    audit = pd.concat([pd.DataFrame(skipped_rows), pd.DataFrame(control_audit_rows)], ignore_index=True, sort=False)
+    base = pd.concat([pd.DataFrame(accepted_cases), pd.DataFrame(controls)], ignore_index=True, sort=False)
+    audit = pd.DataFrame(audit_rows)
     return base, audit
-
-
-def _first_existing_timestamp(*values) -> pd.Timestamp:
-    for value in values:
-        if value is None or pd.isna(value):
-            continue
-        return pd.Timestamp(value)
-    return pd.NaT
 
 
 def _max_claim_observation_date(config) -> pd.Timestamp:
@@ -1009,636 +1952,6 @@ def _max_claim_observation_date(config) -> pd.Timestamp:
     return pd.Timestamp.today().normalize()
 
 
-def build_population_random_negative_base_rows(
-    reference_split_df: pd.DataFrame,
-    machine_master: pd.DataFrame,
-    sources: Mapping[str, pd.DataFrame],
-    claim_history_episodes: pd.DataFrame,
-    window_config: Mapping,
-    split_name: str,
-    negatives_per_positive: int,
-    config,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build population-like random negative windows for validation/test.
-
-    These rows are not matched to claim dates.  A row represents a realistic
-    production scoring window:
-
-        window_start = random_as_of_date - (lead_max_days - lead_min_days)
-        window_end   = random_as_of_date
-
-    It is labeled negative only when the machine has no claim in the configured
-    future no-claim horizon after window_end.  By default, rows with a claim
-    inside the observation window are also excluded to avoid labeling an active
-    claim window as a clean negative.
-    """
-
-    split_name = str(split_name)
-    lead_max = int(window_config["lead_max_days"])
-    lead_min = int(window_config["lead_min_days"])
-    observation_days = int(lead_max - lead_min)
-    if observation_days <= 0:
-        raise ValueError("lead_max_days must be greater than lead_min_days for population negatives.")
-
-    if reference_split_df is None or reference_split_df.empty or int(negatives_per_positive) <= 0:
-        return pd.DataFrame(), pd.DataFrame()
-
-    positives = reference_split_df[pd.to_numeric(reference_split_df.get("target", 0), errors="coerce").fillna(0).astype(int).eq(1)].copy()
-    positive_count = int(len(positives))
-    requested = int(positive_count * int(negatives_per_positive))
-    if requested <= 0:
-        return pd.DataFrame(), pd.DataFrame()
-
-    dates_by_machine = claim_dates_by_machine(claim_history_episodes)
-    coverage = build_source_coverage(sources)
-    master = machine_master.copy()
-    if "first_source_date" not in master.columns or "last_source_date" not in master.columns:
-        master = master.merge(coverage, on="machine_key", how="left")
-    master["full_model"] = master.get("full_model", "").map(clean_model)
-    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
-    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
-    master = master.dropna(subset=["machine_key", "first_source_date", "last_source_date"]).copy()
-    master = master[master["machine_key"].astype(str).str.len() > 0].copy()
-
-    if master.empty:
-        return pd.DataFrame(), pd.DataFrame([{
-            "split": split_name,
-            "status": "no_machine_master_candidates",
-            "requested_population_negative_rows": requested,
-            "selected_population_negative_rows": 0,
-        }])
-
-    # Use the chronological validation/test date range from the matched split so
-    # random negatives are sampled from the same historical period as the holdout.
-    date_col = str(getattr(config, "SPLIT_DATE_COL", "window_end"))
-    date_source = positives if not positives.empty else reference_split_df
-    if date_col not in date_source.columns:
-        date_col = "window_end"
-    split_min = pd.to_datetime(date_source[date_col], errors="coerce").min()
-    split_max = pd.to_datetime(date_source[date_col], errors="coerce").max()
-    if pd.isna(split_min) or pd.isna(split_max):
-        split_min = pd.to_datetime(reference_split_df["window_end"], errors="coerce").min()
-        split_max = pd.to_datetime(reference_split_df["window_end"], errors="coerce").max()
-
-    future_horizon = int(getattr(
-        config,
-        "POPULATION_RANDOM_NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END",
-        getattr(config, "CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180),
-    ))
-    require_future_observable = bool(getattr(config, "POPULATION_RANDOM_NEGATIVE_REQUIRE_FUTURE_OBSERVABILITY", True))
-    max_claim_observed_date = _max_claim_observation_date(config)
-    if require_future_observable:
-        split_max = min(pd.Timestamp(split_max), max_claim_observed_date - pd.Timedelta(days=future_horizon))
-
-    exclude_claims_in_window = bool(getattr(config, "POPULATION_RANDOM_NEGATIVE_EXCLUDE_CLAIMS_DURING_OBSERVATION_WINDOW", True))
-    require_coverage = bool(getattr(config, "POPULATION_RANDOM_NEGATIVE_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True))
-    max_attempts = int(getattr(config, "POPULATION_RANDOM_NEGATIVE_MAX_ATTEMPTS_MULTIPLIER", 80)) * max(requested, 1)
-    random_state_offset = 100000 if split_name == "validation" else 200000
-    rng = np.random.default_rng(int(getattr(config, "RANDOM_STATE", 42)) + random_state_offset + lead_max * 10 + lead_min)
-
-    rows = []
-    audit_rows = []
-    seen = set()
-    checked = 0
-    master_records = master.reset_index(drop=True)
-    n_master = len(master_records)
-
-    while len(rows) < requested and checked < max_attempts:
-        checked += 1
-        ctrl = master_records.iloc[int(rng.integers(0, n_master))]
-        m = ctrl["machine_key"]
-
-        earliest_end = max(pd.Timestamp(ctrl["first_source_date"]) + pd.Timedelta(days=observation_days), pd.Timestamp(split_min))
-        latest_end = min(pd.Timestamp(ctrl["last_source_date"]), pd.Timestamp(split_max))
-        if pd.isna(earliest_end) or pd.isna(latest_end) or latest_end < earliest_end:
-            continue
-        span_days = int((latest_end - earliest_end).days)
-        offset = int(rng.integers(0, span_days + 1)) if span_days > 0 else 0
-        window_end = earliest_end + pd.Timedelta(days=offset)
-        window_start = window_end - pd.Timedelta(days=observation_days)
-
-        if require_coverage:
-            if pd.Timestamp(ctrl["first_source_date"]) > window_end or pd.Timestamp(ctrl["last_source_date"]) < window_start:
-                continue
-
-        future_start = window_end + pd.Timedelta(days=1)
-        future_end = window_end + pd.Timedelta(days=future_horizon)
-        if has_claim_between(dates_by_machine, m, future_start, future_end):
-            continue
-        if exclude_claims_in_window and has_claim_between(dates_by_machine, m, window_start, window_end):
-            continue
-
-        key = (str(m), pd.Timestamp(window_end).date().isoformat(), split_name)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        idx = len(rows) + 1
-        rows.append({
-            "row_role": "population_negative",
-            "target": 0,
-            "split": split_name,
-            "case_control_group_id": f"{window_config_name(window_config)}__population_negative__{split_name}__{idx:07d}",
-            "claim_episode_id": "",
-            "control_number_within_group": np.nan,
-            "machine_key": m,
-            "full_model": ctrl.get("full_model", ""),
-            "serial": ctrl.get("serial", ""),
-            "window_name": window_config_name(window_config),
-            "lead_max_days": lead_max,
-            "lead_min_days": lead_min,
-            "population_window_length_days": observation_days,
-            "window_start": window_start,
-            "window_end": window_end,
-            "future_claim_date": pd.NaT,
-            "days_from_window_end_to_claim": np.nan,
-            "control_no_claim_start": future_start,
-            "control_no_claim_end": future_end,
-            "control_sampling_reason": "population_random_negative_no_claim_in_future_horizon",
-            "population_negative_split": split_name,
-            "population_negative_requested_ratio": int(negatives_per_positive),
-            "population_negative_future_horizon_days": future_horizon,
-            "population_negative_observation_days": observation_days,
-            "population_negative_excluded_claims_in_window": exclude_claims_in_window,
-        })
-
-    audit_rows.append({
-        "split": split_name,
-        "window_name": window_config_name(window_config),
-        "lead_max_days": lead_max,
-        "lead_min_days": lead_min,
-        "observation_days": observation_days,
-        "positive_rows_in_reference_split": positive_count,
-        "negatives_per_positive_requested": int(negatives_per_positive),
-        "requested_population_negative_rows": requested,
-        "selected_population_negative_rows": int(len(rows)),
-        "candidate_machines": int(len(master_records)),
-        "attempts_checked": int(checked),
-        "max_attempts": int(max_attempts),
-        "split_date_min_used": split_min,
-        "split_date_max_used": split_max,
-        "future_horizon_days": future_horizon,
-        "require_future_observability": require_future_observable,
-        "exclude_claims_during_observation_window": exclude_claims_in_window,
-        "require_source_coverage_overlap_window": require_coverage,
-        "status": "selected_requested_count" if len(rows) >= requested else "selected_fewer_than_requested",
-    })
-    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
-
-
-def _max_evaluation_horizon_days_for_asof(config) -> int:
-    """Return the maximum horizon needed to label as-of population rows safely."""
-    horizons = configured_evaluation_horizons(config)
-    if horizons:
-        return int(max(horizons))
-    return int(getattr(config, "CONTROL_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
-
-
-def build_asof_population_evaluation_base_rows(
-    reference_split_df: pd.DataFrame,
-    machine_master: pd.DataFrame,
-    sources: Mapping[str, pd.DataFrame],
-    claim_history_episodes: pd.DataFrame,
-    window_config: Mapping,
-    split_name: str,
-    config,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build realistic as-of-date population evaluation windows.
-
-    These rows are evaluation-only and are not used for training.  They mimic a
-    production scoring snapshot: for each historical as-of date in the holdout
-    period, build one lookback window per eligible machine, then let future
-    claim-horizon columns decide whether the row is positive for 30/60/90/etc.
-    day evaluation.
-    """
-
-    split_name = str(split_name)
-    lead_max = int(window_config["lead_max_days"])
-    lead_min = int(window_config["lead_min_days"])
-    observation_days = int(lead_max - lead_min)
-    if observation_days <= 0:
-        raise ValueError("lead_max_days must be greater than lead_min_days for as-of population evaluation.")
-
-    if reference_split_df is None or reference_split_df.empty:
-        return pd.DataFrame(), pd.DataFrame([{
-            "split": split_name,
-            "status": "empty_reference_split",
-            "selected_asof_rows": 0,
-        }])
-
-    coverage = build_source_coverage(sources)
-    master = machine_master.copy()
-    if "first_source_date" not in master.columns or "last_source_date" not in master.columns:
-        master = master.merge(coverage, on="machine_key", how="left")
-    master["full_model"] = master.get("full_model", "").map(clean_model)
-    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
-    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
-    master = master.dropna(subset=["machine_key", "first_source_date", "last_source_date"]).copy()
-    master = master[master["machine_key"].astype(str).str.len() > 0].copy()
-    if master.empty:
-        return pd.DataFrame(), pd.DataFrame([{
-            "split": split_name,
-            "status": "no_machine_master_candidates",
-            "selected_asof_rows": 0,
-        }])
-
-    date_col = str(getattr(config, "SPLIT_DATE_COL", "window_end"))
-    date_source = reference_split_df.copy()
-    if date_col not in date_source.columns:
-        date_col = "window_end"
-    split_min = pd.to_datetime(date_source[date_col], errors="coerce").min()
-    split_max = pd.to_datetime(date_source[date_col], errors="coerce").max()
-    if pd.isna(split_min) or pd.isna(split_max):
-        return pd.DataFrame(), pd.DataFrame([{
-            "split": split_name,
-            "status": "missing_reference_date_range",
-            "selected_asof_rows": 0,
-        }])
-
-    max_horizon = _max_evaluation_horizon_days_for_asof(config)
-    require_future_observable = bool(getattr(config, "ASOF_EVALUATION_REQUIRE_FUTURE_OBSERVABILITY", True))
-    max_claim_observed_date = _max_claim_observation_date(config)
-    if require_future_observable:
-        split_max = min(pd.Timestamp(split_max), max_claim_observed_date - pd.Timedelta(days=max_horizon))
-    if split_max < split_min:
-        return pd.DataFrame(), pd.DataFrame([{
-            "split": split_name,
-            "status": "no_dates_after_future_observability_filter",
-            "selected_asof_rows": 0,
-            "reference_split_min": split_min,
-            "reference_split_max_after_filter": split_max,
-            "max_evaluation_horizon_days": max_horizon,
-            "max_claim_observed_date": max_claim_observed_date,
-        }])
-
-    frequency_days = int(getattr(config, "ASOF_EVALUATION_SNAPSHOT_FREQUENCY_DAYS", 30) or 30)
-    frequency_days = max(1, frequency_days)
-    snapshot_dates = list(pd.date_range(pd.Timestamp(split_min), pd.Timestamp(split_max), freq=f"{frequency_days}D"))
-    if not snapshot_dates or snapshot_dates[-1] != pd.Timestamp(split_max):
-        snapshot_dates.append(pd.Timestamp(split_max))
-
-    max_machines_per_snapshot = getattr(config, "ASOF_EVALUATION_MAX_MACHINES_PER_SNAPSHOT", None)
-    if max_machines_per_snapshot is not None:
-        max_machines_per_snapshot = int(max_machines_per_snapshot)
-        if max_machines_per_snapshot <= 0:
-            max_machines_per_snapshot = None
-
-    split_max_rows_attr = f"{split_name.upper()}_ASOF_EVALUATION_MAX_ROWS"
-    max_rows = getattr(config, split_max_rows_attr, None)
-    if max_rows is None:
-        max_rows = getattr(config, "ASOF_EVALUATION_MAX_ROWS_PER_SPLIT", None)
-    if max_rows is not None:
-        max_rows = int(max_rows)
-        if max_rows <= 0:
-            max_rows = None
-
-    require_coverage = bool(getattr(config, "ASOF_EVALUATION_REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True))
-    exclude_claims_in_window = bool(getattr(config, "ASOF_EVALUATION_EXCLUDE_CLAIMS_DURING_OBSERVATION_WINDOW", False))
-    dates_by_machine = claim_dates_by_machine(claim_history_episodes)
-    random_state_offset = 300000 if split_name == "validation" else 400000
-    rng = np.random.default_rng(int(getattr(config, "RANDOM_STATE", 42)) + random_state_offset + lead_max * 10 + lead_min)
-
-    rows = []
-    audit_rows = []
-    seen = set()
-    for snapshot_idx, as_of in enumerate(snapshot_dates, start=1):
-        window_end = pd.Timestamp(as_of)
-        window_start = window_end - pd.Timedelta(days=observation_days)
-        candidates = master.copy()
-        if require_coverage:
-            candidates = candidates[
-                (candidates["first_source_date"] <= window_end)
-                & (candidates["last_source_date"] >= window_start)
-            ].copy()
-        if exclude_claims_in_window and not candidates.empty:
-            keep_mask = [not has_claim_between(dates_by_machine, m, window_start, window_end) for m in candidates["machine_key"]]
-            candidates = candidates.loc[keep_mask].copy()
-        eligible_count = int(len(candidates))
-        if candidates.empty:
-            audit_rows.append({
-                "split": split_name,
-                "snapshot_index": snapshot_idx,
-                "as_of_date": window_end,
-                "eligible_machines": 0,
-                "selected_rows": 0,
-                "status": "no_eligible_machines",
-            })
-            continue
-        if max_machines_per_snapshot is not None and len(candidates) > max_machines_per_snapshot:
-            seed = int(rng.integers(0, 2**31 - 1))
-            candidates = candidates.sample(n=max_machines_per_snapshot, random_state=seed)
-        selected_count = 0
-        for _, ctrl in candidates.iterrows():
-            if max_rows is not None and len(rows) >= max_rows:
-                break
-            m = ctrl["machine_key"]
-            key = (str(m), window_end.date().isoformat(), split_name)
-            if key in seen:
-                continue
-            seen.add(key)
-            idx = len(rows) + 1
-            rows.append({
-                "row_role": "asof_population_window",
-                "target": 0,
-                "split": split_name,
-                "case_control_group_id": f"{window_config_name(window_config)}__asof_population__{split_name}__{window_end.strftime('%Y%m%d')}__{idx:07d}",
-                "claim_episode_id": "",
-                "control_number_within_group": np.nan,
-                "machine_key": m,
-                "full_model": ctrl.get("full_model", ""),
-                "serial": ctrl.get("serial", ""),
-                "window_name": window_config_name(window_config),
-                "lead_max_days": lead_max,
-                "lead_min_days": lead_min,
-                "population_window_length_days": observation_days,
-                "as_of_date": window_end,
-                "window_start": window_start,
-                "window_end": window_end,
-                "future_claim_date": pd.NaT,
-                "days_from_window_end_to_claim": np.nan,
-                "control_no_claim_start": pd.NaT,
-                "control_no_claim_end": pd.NaT,
-                "control_sampling_reason": "asof_population_snapshot_window",
-                "asof_population_split": split_name,
-                "asof_snapshot_frequency_days": frequency_days,
-                "asof_max_evaluation_horizon_days": max_horizon,
-                "asof_require_future_observability": require_future_observable,
-                "asof_excluded_claims_in_observation_window": exclude_claims_in_window,
-            })
-            selected_count += 1
-        audit_rows.append({
-            "split": split_name,
-            "snapshot_index": snapshot_idx,
-            "as_of_date": window_end,
-            "window_start": window_start,
-            "window_end": window_end,
-            "eligible_machines": eligible_count,
-            "selected_rows": int(selected_count),
-            "max_machines_per_snapshot": max_machines_per_snapshot,
-            "status": "selected",
-        })
-        if max_rows is not None and len(rows) >= max_rows:
-            break
-
-    audit_rows.append({
-        "split": split_name,
-        "snapshot_index": "summary",
-        "as_of_date": pd.NaT,
-        "window_start": pd.NaT,
-        "window_end": pd.NaT,
-        "reference_split_min": split_min,
-        "reference_split_max_used": split_max,
-        "snapshot_count": int(len(snapshot_dates)),
-        "selected_rows": int(len(rows)),
-        "candidate_machines": int(len(master)),
-        "observation_days": observation_days,
-        "max_evaluation_horizon_days": max_horizon,
-        "require_future_observability": require_future_observable,
-        "require_source_coverage_overlap_window": require_coverage,
-        "exclude_claims_during_observation_window": exclude_claims_in_window,
-        "status": "selected_rows" if rows else "no_rows_selected",
-    })
-    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
-
-def latest_operation_smr_before(operation_df: pd.DataFrame, machine_key: str, cutoff) -> float:
-    if operation_df.empty:
-        return np.nan
-    sub = operation_df[(operation_df["machine_key"] == machine_key) & (operation_df["LOCAL_DATE"] <= pd.Timestamp(cutoff))]
-    if sub.empty or "smr_hours" not in sub.columns:
-        return np.nan
-    sub = sub.sort_values("LOCAL_DATE", kind="mergesort")
-    val = pd.to_numeric(sub["smr_hours"], errors="coerce").dropna()
-    if val.empty:
-        return np.nan
-    return float(val.iloc[-1])
-
-
-# -----------------------------------------------------------------------------
-# Window feature extraction
-# -----------------------------------------------------------------------------
-def make_group_dict(df: pd.DataFrame, date_col: str) -> Dict[str, pd.DataFrame]:
-    out = {}
-    if df.empty:
-        return out
-    work = df.copy()
-    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-    work = work.dropna(subset=[date_col])
-    for m, g in work.sort_values(["machine_key", date_col], kind="mergesort").groupby("machine_key"):
-        g = g.reset_index(drop=True)
-        # Cache an int64 datetime array for fast binary-search slicing.
-        g.attrs["_date_col"] = date_col
-        g.attrs["_date_values_ns"] = g[date_col].values.astype("datetime64[ns]").astype("int64")
-        out[m] = g
-    return out
-
-
-def window_slice(grouped: Mapping[str, pd.DataFrame], machine_key: str, date_col: str, start, end) -> pd.DataFrame:
-    g = grouped.get(machine_key)
-    if g is None or g.empty:
-        return pd.DataFrame()
-    date_values = g.attrs.get("_date_values_ns")
-    if date_values is None:
-        date_values = pd.to_datetime(g[date_col]).values.astype("datetime64[ns]").astype("int64")
-    start_ns = pd.Timestamp(start).to_datetime64().astype("datetime64[ns]").astype("int64")
-    end_ns = pd.Timestamp(end).to_datetime64().astype("datetime64[ns]").astype("int64")
-    left = int(np.searchsorted(date_values, start_ns, side="left"))
-    right = int(np.searchsorted(date_values, end_ns, side="right"))
-    if right <= left:
-        return g.iloc[0:0]
-    return g.iloc[left:right]
-
-
-def build_window_features(base_rows: pd.DataFrame, sources: Mapping[str, pd.DataFrame], episodes: pd.DataFrame) -> pd.DataFrame:
-    fault_groups = make_group_dict(sources.get("fault", pd.DataFrame()), "event_date")
-    fluid_groups = make_group_dict(sources.get("fluid", pd.DataFrame()), "sample_drawn_date")
-    maintenance_groups = make_group_dict(sources.get("maintenance", pd.DataFrame()), "event_date")
-    operation_groups = make_group_dict(sources.get("operation", pd.DataFrame()), "LOCAL_DATE")
-    dates_by_machine = claim_dates_by_machine(episodes)
-
-    feature_rows = []
-    for _, row in base_rows.iterrows():
-        machine_key = row["machine_key"]
-        start = pd.Timestamp(row["window_start"])
-        end = pd.Timestamp(row["window_end"])
-        f_fault = aggregate_faults(window_slice(fault_groups, machine_key, "event_date", start, end), end)
-        f_fluid = aggregate_fluids(window_slice(fluid_groups, machine_key, "sample_drawn_date", start, end), end)
-        f_maint = aggregate_maintenance(window_slice(maintenance_groups, machine_key, "event_date", start, end), end)
-        f_oper = aggregate_operation(window_slice(operation_groups, machine_key, "LOCAL_DATE", start, end), end)
-        prior_count, days_since_prior = count_claims_before(dates_by_machine, machine_key, start)
-        source_record_count = (
-            f_fault["fault_count_window"]
-            + f_fluid["fluid_sample_count_window"]
-            + f_maint["maintenance_event_count_window"]
-            + f_oper["operation_day_count_window"]
-        )
-        features = {
-            "prior_claim_count_before_window": prior_count,
-            "days_since_prior_claim_before_window": days_since_prior,
-            "source_record_count_window": source_record_count,
-            "has_any_source_window": int(source_record_count > 0),
-        }
-        features.update(f_fault)
-        features.update(f_fluid)
-        features.update(f_maint)
-        features.update(f_oper)
-        feature_rows.append(features)
-    return pd.concat([base_rows.reset_index(drop=True), pd.DataFrame(feature_rows)], axis=1)
-
-
-def _mode_or_none(series: pd.Series, default: str = "NONE") -> str:
-    s = series.dropna().astype(str).str.strip()
-    s = s[s.ne("")]
-    if s.empty:
-        return default
-    return str(s.value_counts().index[0])
-
-
-def aggregate_faults(df: pd.DataFrame, window_end) -> dict:
-    if df.empty:
-        return {
-            "has_fault_window": 0,
-            "fault_count_window": 0,
-            "fault_unique_code_count_window": 0,
-            "fault_l03plus_count_window": 0,
-            "fault_l04plus_count_window": 0,
-            "fault_max_action_level_window": 0.0,
-            "fault_max_evidence_score_window": 0.0,
-            "fault_mean_evidence_score_window": 0.0,
-            "fault_max_log_occurrence_window": 0.0,
-            "fault_days_since_latest_in_window": np.nan,
-            "fault_mechanical_count_window": 0,
-            "fault_electrical_count_window": 0,
-            "fault_dominant_component_window": "NONE",
-        }
-    action = pd.to_numeric(df.get("action_level_num", 0), errors="coerce").fillna(0)
-    score = pd.to_numeric(df.get("failure_code_evidence_score", 0), errors="coerce").fillna(0)
-    log_occ = pd.to_numeric(df.get("log_occurrence_count", 0), errors="coerce").fillna(0)
-    latest_date = pd.to_datetime(df["event_date"]).max()
-    comp_col = "related_component" if "related_component" in df.columns else "applicable_component"
-    return {
-        "has_fault_window": 1,
-        "fault_count_window": int(len(df)),
-        "fault_unique_code_count_window": int(df.get("fault_code", pd.Series(dtype=str)).nunique(dropna=True)),
-        "fault_l03plus_count_window": int((action >= 3).sum()),
-        "fault_l04plus_count_window": int((action >= 4).sum()),
-        "fault_max_action_level_window": float(action.max()) if len(action) else 0.0,
-        "fault_max_evidence_score_window": float(score.max()) if len(score) else 0.0,
-        "fault_mean_evidence_score_window": float(score.mean()) if len(score) else 0.0,
-        "fault_max_log_occurrence_window": float(log_occ.max()) if len(log_occ) else 0.0,
-        "fault_days_since_latest_in_window": float((pd.Timestamp(window_end) - latest_date).days),
-        "fault_mechanical_count_window": int(pd.to_numeric(df.get("is_mechanical_failure_code", 0), errors="coerce").fillna(0).sum()),
-        "fault_electrical_count_window": int(pd.to_numeric(df.get("is_electrical_failure_code", 0), errors="coerce").fillna(0).sum()),
-        "fault_dominant_component_window": _mode_or_none(df.get(comp_col, pd.Series(dtype=str))),
-    }
-
-
-def aggregate_fluids(df: pd.DataFrame, window_end) -> dict:
-    base = {
-        "has_fluid_window": 0,
-        "fluid_sample_count_window": 0,
-        "fluid_max_severity_window": 0.0,
-        "fluid_latest_severity_window": 0.0,
-        "fluid_days_since_latest_sample_window": np.nan,
-        "fluid_max_cu_ppm_window": 0.0,
-        "fluid_max_fe_ppm_window": 0.0,
-        "fluid_max_pb_ppm_window": 0.0,
-        "fluid_max_soot_percent_window": 0.0,
-        "fluid_max_water_percent_window": 0.0,
-    }
-    if df.empty:
-        return base
-    df = df.sort_values("sample_drawn_date", kind="mergesort")
-    latest = df.iloc[-1]
-    severity = pd.to_numeric(df.get("sample_result_severity_order", 0), errors="coerce").fillna(0)
-    latest_date = pd.Timestamp(latest["sample_drawn_date"])
-    base.update({
-        "has_fluid_window": 1,
-        "fluid_sample_count_window": int(len(df)),
-        "fluid_max_severity_window": float(severity.max()) if len(severity) else 0.0,
-        "fluid_latest_severity_window": float(pd.to_numeric(pd.Series([latest.get("sample_result_severity_order", 0)]), errors="coerce").fillna(0).iloc[0]),
-        "fluid_days_since_latest_sample_window": float((pd.Timestamp(window_end) - latest_date).days),
-        "fluid_max_cu_ppm_window": _max_numeric(df, "Cu_Copper_PPM"),
-        "fluid_max_fe_ppm_window": _max_numeric(df, "Fe_Iron_PPM"),
-        "fluid_max_pb_ppm_window": _max_numeric(df, "Pb_Lead_PPM"),
-        "fluid_max_soot_percent_window": _max_numeric(df, "Soot_Soot_PERCENT"),
-        "fluid_max_water_percent_window": _max_numeric(df, "Water_Water_PERCENT"),
-    })
-    return base
-
-
-def _max_numeric(df: pd.DataFrame, col: str) -> float:
-    if col not in df.columns:
-        return 0.0
-    s = pd.to_numeric(df[col], errors="coerce").dropna()
-    return float(s.max()) if len(s) else 0.0
-
-
-def aggregate_maintenance(df: pd.DataFrame, window_end) -> dict:
-    if df.empty:
-        return {
-            "has_maintenance_window": 0,
-            "maintenance_event_count_window": 0,
-            "maintenance_monitor_reset_count_window": 0,
-            "maintenance_overdue_count_window": 0,
-            "maintenance_due_now_count_window": 0,
-            "maintenance_min_remaining_hours_window": np.nan,
-            "maintenance_days_since_latest_event_window": np.nan,
-            "maintenance_dominant_component_window": "NONE",
-        }
-    latest_date = pd.to_datetime(df["event_date"]).max()
-    remaining = pd.to_numeric(df.get("remaining_hours", np.nan), errors="coerce")
-    comp_col = "related_component" if "related_component" in df.columns else "maintenance_type"
-    return {
-        "has_maintenance_window": 1,
-        "maintenance_event_count_window": int(len(df)),
-        "maintenance_monitor_reset_count_window": int(pd.to_numeric(df.get("is_monitor_reset", 0), errors="coerce").fillna(0).sum()),
-        "maintenance_overdue_count_window": int(pd.to_numeric(df.get("is_overdue", 0), errors="coerce").fillna(0).sum()),
-        "maintenance_due_now_count_window": int(pd.to_numeric(df.get("is_due_now", 0), errors="coerce").fillna(0).sum()),
-        "maintenance_min_remaining_hours_window": float(remaining.min()) if remaining.notna().any() else np.nan,
-        "maintenance_days_since_latest_event_window": float((pd.Timestamp(window_end) - latest_date).days),
-        "maintenance_dominant_component_window": _mode_or_none(df.get(comp_col, pd.Series(dtype=str))),
-    }
-
-
-def aggregate_operation(df: pd.DataFrame, window_end) -> dict:
-    if df.empty:
-        return {
-            "has_operation_window": 0,
-            "operation_day_count_window": 0,
-            "operation_working_hours_sum_window": 0.0,
-            "operation_working_hours_mean_window": 0.0,
-            "operation_working_hours_max_window": 0.0,
-            "operation_engine_running_hours_sum_window": 0.0,
-            "operation_idle_hours_sum_window": 0.0,
-            "operation_idle_share_window": np.nan,
-            "operation_latest_smr_window": np.nan,
-            "operation_smr_delta_window": np.nan,
-            "operation_high_throttle_day_count_window": 0,
-        }
-    df = df.sort_values("LOCAL_DATE", kind="mergesort")
-    working = pd.to_numeric(df.get("working_hours_clean", df.get("actual_working_hours_clean", 0)), errors="coerce").fillna(0)
-    engine = pd.to_numeric(df.get("engine_running_hours_clean", 0), errors="coerce").fillna(0)
-    idle = pd.to_numeric(df.get("engine_idling_hours_clean", 0), errors="coerce").fillna(0)
-    smr = pd.to_numeric(df.get("smr_hours", np.nan), errors="coerce").dropna()
-    high_throttle = pd.to_numeric(df.get("high_throttle_day_flag", 0), errors="coerce").fillna(0)
-    return {
-        "has_operation_window": 1,
-        "operation_day_count_window": int(len(df)),
-        "operation_working_hours_sum_window": float(working.sum()),
-        "operation_working_hours_mean_window": float(working.mean()) if len(working) else 0.0,
-        "operation_working_hours_max_window": float(working.max()) if len(working) else 0.0,
-        "operation_engine_running_hours_sum_window": float(engine.sum()),
-        "operation_idle_hours_sum_window": float(idle.sum()),
-        "operation_idle_share_window": float(idle.sum() / engine.sum()) if engine.sum() > 0 else np.nan,
-        "operation_latest_smr_window": float(smr.iloc[-1]) if len(smr) else np.nan,
-        "operation_smr_delta_window": float(smr.iloc[-1] - smr.iloc[0]) if len(smr) >= 2 else np.nan,
-        "operation_high_throttle_day_count_window": int((high_throttle > 0).sum()),
-    }
-
-
-# -----------------------------------------------------------------------------
-# Modeling helpers
-# -----------------------------------------------------------------------------
 def make_one_hot_encoder():
     from sklearn.preprocessing import OneHotEncoder
     try:
@@ -1984,105 +2297,84 @@ def validate_dataset_features(df: pd.DataFrame, config) -> Tuple[List[str], List
     return features, missing
 
 
-def split_groups_random(df: pd.DataFrame, group_col: str, test_size: float, random_state: int):
-    rng = np.random.default_rng(random_state)
-    groups = np.array(sorted(df[group_col].dropna().unique()))
-    rng.shuffle(groups)
-    n_test = max(1, int(np.ceil(len(groups) * test_size)))
-    test_groups = set(groups[:n_test])
-    test_mask = df[group_col].isin(test_groups)
-    return df.loc[~test_mask].copy(), df.loc[test_mask].copy()
+def summarize_fixed_dataset_splits(df: pd.DataFrame, config) -> pd.DataFrame:
+    """Summarize the already-assigned machine-level random splits."""
+    if "split" not in df.columns:
+        raise ValueError("Dataset is missing the fixed machine-level 'split' column.")
+    ratios = _normalized_split_ratios(config)
+    rows = []
+    for split_name in ["train", "validation", "test"]:
+        sub = df[df["split"].eq(split_name)].copy()
+        target = pd.to_numeric(sub.get("target", pd.Series(dtype=float)), errors="coerce")
+        rows.append({
+            "split": split_name,
+            "rows": int(len(sub)),
+            "positive_rows": int(target.fillna(0).sum()) if len(sub) else 0,
+            "negative_rows": int(target.eq(0).sum()) if len(sub) else 0,
+            "positive_rate": float(target.mean()) if len(sub) else np.nan,
+            "machines": int(sub["machine_key"].nunique(dropna=True)) if "machine_key" in sub.columns else 0,
+            "case_machines": int(sub["case_machine_key"].nunique(dropna=True)) if "case_machine_key" in sub.columns else 0,
+            "case_control_groups": int(sub["case_control_group_id"].nunique(dropna=True)) if "case_control_group_id" in sub.columns else 0,
+            "full_models": int(sub["full_model"].nunique(dropna=True)) if "full_model" in sub.columns else 0,
+            "configured_machine_ratio": float(ratios[split_name]),
+        })
+    return pd.DataFrame(rows)
 
 
-def split_case_control_train_validation_test(
-    df: pd.DataFrame,
-    config,
-    group_col: str = "case_control_group_id",
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Assign chronological train / validation / test splits by case-control group.
+def validate_fixed_dataset_splits(df: pd.DataFrame, config) -> pd.DataFrame:
+    """Validate fixed random holdouts and return their summary.
 
-    Each positive case and its sampled controls share one case_control_group_id.
-    This function assigns the whole group to one split using the configured split
-    date, usually window_end. The returned dataframe includes a `split` column.
+    Every physical machine must occur in one split only, every case-control group
+    must stay within one split, and each configured split must contain both target
+    classes. This protects validation/test from machine-history leakage.
     """
+    required = {"split", "machine_key", "case_control_group_id", "target"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Dataset is missing required fixed-split columns: {missing}")
 
-    if group_col not in df.columns:
-        raise ValueError(f"Required group column is missing: {group_col}")
+    allowed = {"train", "validation", "test"}
+    observed = set(df["split"].dropna().astype(str).unique())
+    invalid = sorted(observed - allowed)
+    if invalid:
+        raise ValueError(f"Unexpected split labels: {invalid}")
 
-    split_date_col = str(getattr(config, "SPLIT_DATE_COL", "window_end"))
-    if split_date_col not in df.columns:
-        raise ValueError(f"Configured SPLIT_DATE_COL is missing: {split_date_col}")
-
-    ratios = {
-        "train": float(getattr(config, "TRAIN_RATIO", 0.70)),
-        "validation": float(getattr(config, "VALIDATION_RATIO", 0.15)),
-        "test": float(getattr(config, "TEST_RATIO", 0.15)),
-    }
-    ratio_sum = sum(v for v in ratios.values() if v > 0)
-    if ratio_sum <= 0:
-        raise ValueError("TRAIN_RATIO + VALIDATION_RATIO + TEST_RATIO must be positive.")
-    ratios = {k: max(v, 0.0) / ratio_sum for k, v in ratios.items()}
-
-    work = df.copy()
-    work[split_date_col] = pd.to_datetime(work[split_date_col], errors="coerce")
-    if work[split_date_col].isna().any():
-        bad = int(work[split_date_col].isna().sum())
-        raise ValueError(f"Split date column {split_date_col} has {bad} missing/unparseable values.")
-
-    group_summary = (
-        work.groupby(group_col, dropna=False)
-        .agg(
-            split_date=(split_date_col, "min"),
-            rows=(group_col, "size"),
-            positive_rows=("target", "sum"),
+    machine_split_count = df.groupby("machine_key", dropna=False)["split"].nunique(dropna=False)
+    leaking_machines = machine_split_count[machine_split_count > 1]
+    if not leaking_machines.empty:
+        sample = leaking_machines.head(10).index.astype(str).tolist()
+        raise ValueError(
+            "Machine leakage detected across train/validation/test. "
+            f"Example machine keys: {sample}"
         )
-        .reset_index()
-        .sort_values(["split_date", group_col], kind="mergesort")
-        .reset_index(drop=True)
-    )
 
-    n_groups = len(group_summary)
-    train_end = int(np.floor(n_groups * ratios["train"]))
-    validation_end = int(np.floor(n_groups * (ratios["train"] + ratios["validation"])))
-
-    # Keep at least one group in validation/test when their ratios are positive
-    # and enough groups exist. This avoids empty holdouts on small debug samples.
-    if ratios["validation"] > 0 and n_groups >= 3 and validation_end <= train_end:
-        validation_end = min(train_end + 1, n_groups)
-    if ratios["test"] > 0 and n_groups >= 3 and validation_end >= n_groups:
-        validation_end = n_groups - 1
-    if train_end <= 0 and n_groups > 0:
-        train_end = 1
-    if validation_end < train_end:
-        validation_end = train_end
-
-    group_summary["split"] = "test"
-    if train_end > 0:
-        group_summary.loc[: train_end - 1, "split"] = "train"
-    if validation_end > train_end:
-        group_summary.loc[train_end: validation_end - 1, "split"] = "validation"
-
-    split_map = dict(zip(group_summary[group_col], group_summary["split"]))
-    work["split"] = work[group_col].map(split_map).astype(str)
-
-    split_summary = (
-        work.groupby("split", dropna=False)
-        .agg(
-            rows=("target", "size"),
-            positive_rows=("target", "sum"),
-            groups=(group_col, "nunique"),
-            split_date_min=(split_date_col, "min"),
-            split_date_max=(split_date_col, "max"),
+    group_split_count = df.groupby("case_control_group_id", dropna=False)["split"].nunique(dropna=False)
+    leaking_groups = group_split_count[group_split_count > 1]
+    if not leaking_groups.empty:
+        sample = leaking_groups.head(10).index.astype(str).tolist()
+        raise ValueError(
+            "Case-control groups span multiple splits. "
+            f"Example group IDs: {sample}"
         )
-        .reset_index()
-    )
-    split_summary["positive_rate"] = split_summary["positive_rows"] / split_summary["rows"]
-    split_summary["train_ratio_configured"] = ratios["train"]
-    split_summary["validation_ratio_configured"] = ratios["validation"]
-    split_summary["test_ratio_configured"] = ratios["test"]
-    split_summary["split_date_col"] = split_date_col
 
-    return work, split_summary
+    summary = summarize_fixed_dataset_splits(df, config)
+    ratios = _normalized_split_ratios(config)
+    for split_name in ["train", "validation", "test"]:
+        if ratios[split_name] <= 0:
+            continue
+        sub = df[df["split"].eq(split_name)]
+        if sub.empty:
+            raise ValueError(
+                f"Fixed split '{split_name}' is empty. The eligible machine/claim population "
+                "is too small for the configured holdout ratios."
+            )
+        classes = set(pd.to_numeric(sub["target"], errors="coerce").dropna().astype(int).unique())
+        if classes != {0, 1}:
+            raise ValueError(
+                f"Fixed split '{split_name}' does not contain both positive and negative rows. "
+                "Review the machine split summary and negative-sampling audit."
+            )
+    return summary
 
 
 def prediction_frame(df: pd.DataFrame, score: np.ndarray) -> pd.DataFrame:
@@ -2110,8 +2402,7 @@ def prediction_frame(df: pd.DataFrame, score: np.ndarray) -> pd.DataFrame:
     return out
 
 # -----------------------------------------------------------------------------
-# Faster vectorized window feature extraction. This definition intentionally
-# overrides the earlier row-loop build_window_features function.
+# Vectorized base window feature extraction.
 # -----------------------------------------------------------------------------
 def _base_with_row_id(base_rows: pd.DataFrame) -> pd.DataFrame:
     base = base_rows.reset_index(drop=True).copy()
@@ -2160,32 +2451,6 @@ def _fill_numeric_categorical(features: pd.DataFrame, config) -> pd.DataFrame:
     return features
 
 
-def _safe_component_group_name(name: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z_]+", "_", str(name).strip().lower()).strip("_")
-
-
-def _component_text_frame(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
-    present = [c for c in cols if c in df.columns]
-    if not present:
-        return pd.Series([""] * len(df), index=df.index, dtype=object)
-    out = pd.Series([""] * len(df), index=df.index, dtype=object)
-    for col in present:
-        out = out + " " + df[col].fillna("").astype(str)
-    return out.str.lower()
-
-
-def _component_mask(text: pd.Series, keywords: Sequence[str]) -> pd.Series:
-    kws = [str(k).strip().lower() for k in keywords if str(k).strip()]
-    if not kws:
-        return pd.Series(False, index=text.index)
-    pattern = "|".join(re.escape(k) for k in kws)
-    return text.str.contains(pattern, regex=True, na=False)
-
-
-def _component_groups(config) -> Mapping[str, Sequence[str]]:
-    return getattr(config, "COMPONENT_FEATURE_GROUPS", {}) or {}
-
-
 def _aggregate_faults_vectorized(base: pd.DataFrame, fault: pd.DataFrame) -> pd.DataFrame:
     keep = [
         "fault_code",
@@ -2194,18 +2459,22 @@ def _aggregate_faults_vectorized(base: pd.DataFrame, fault: pd.DataFrame) -> pd.
         "log_occurrence_count",
         "is_mechanical_failure_code",
         "is_electrical_failure_code",
-        "related_component",
-        "applicable_component",
-        "event_error_name_en",
     ]
     m = _source_window_join(base, fault, "event_date", keep)
     if m.empty:
         return pd.DataFrame(columns=["row_id"])
-    m["action_level_num"] = pd.to_numeric(m.get("action_level_num", 0), errors="coerce").fillna(0)
-    m["failure_code_evidence_score"] = pd.to_numeric(m.get("failure_code_evidence_score", 0), errors="coerce").fillna(0)
-    m["log_occurrence_count"] = pd.to_numeric(m.get("log_occurrence_count", 0), errors="coerce").fillna(0)
-    m["is_mechanical_failure_code"] = pd.to_numeric(m.get("is_mechanical_failure_code", 0), errors="coerce").fillna(0)
-    m["is_electrical_failure_code"] = pd.to_numeric(m.get("is_electrical_failure_code", 0), errors="coerce").fillna(0)
+    if "fault_code" not in m.columns:
+        m["fault_code"] = ""
+    for col in [
+        "action_level_num",
+        "failure_code_evidence_score",
+        "log_occurrence_count",
+        "is_mechanical_failure_code",
+        "is_electrical_failure_code",
+    ]:
+        if col not in m.columns:
+            m[col] = 0.0
+        m[col] = pd.to_numeric(m[col], errors="coerce").fillna(0)
     m["_l03plus"] = (m["action_level_num"] >= 3).astype(int)
     m["_l04plus"] = (m["action_level_num"] >= 4).astype(int)
     ag = m.groupby("row_id", dropna=False).agg(
@@ -2224,37 +2493,6 @@ def _aggregate_faults_vectorized(base: pd.DataFrame, fault: pd.DataFrame) -> pd.
     ).reset_index()
     ag = ag.merge(base[["row_id", "window_end"]], on="row_id", how="left")
     ag["fault_days_since_latest_in_window"] = (ag["window_end"] - ag["latest_fault_date"]).dt.days.astype(float)
-    comp_col = "related_component" if "related_component" in m.columns else "applicable_component"
-    dom = (
-        m[["row_id", comp_col]]
-        .dropna()
-        .assign(_component=lambda x: x[comp_col].astype(str).str.strip())
-    )
-    if not dom.empty:
-        dom = dom[dom["_component"].ne("")]
-        dom = dom.groupby("row_id")['_component'].agg(lambda x: x.value_counts().index[0]).reset_index()
-        dom = dom.rename(columns={"_component": "fault_dominant_component_window"})
-        ag = ag.merge(dom, on="row_id", how="left")
-    if bool(getattr(__import__("config"), "ENABLE_COMPONENT_FEATURES", False)):
-        cfg = __import__("config")
-        text = _component_text_frame(
-            m,
-            ["related_component", "applicable_component", "event_error_name_en", "fault_code"],
-        )
-        for raw_group, keywords in _component_groups(cfg).items():
-            group = _safe_component_group_name(raw_group)
-            sub = m.loc[_component_mask(text, keywords)].copy()
-            if sub.empty:
-                continue
-            comp = sub.groupby("row_id", dropna=False).agg(
-                **{
-                    f"fault_component_{group}_count_window": ("event_date", "size"),
-                    f"fault_component_{group}_l03plus_count_window": ("_l03plus", "sum"),
-                    f"fault_component_{group}_max_action_level_window": ("action_level_num", "max"),
-                    f"fault_component_{group}_max_evidence_score_window": ("failure_code_evidence_score", "max"),
-                }
-            ).reset_index()
-            ag = ag.merge(comp, on="row_id", how="left")
     return ag.drop(columns=["latest_fault_date", "window_end"], errors="ignore")
 
 
@@ -2271,8 +2509,9 @@ def _aggregate_fluids_vectorized(base: pd.DataFrame, fluid: pd.DataFrame) -> pd.
     if m.empty:
         return pd.DataFrame(columns=["row_id"])
     for col in keep:
-        if col in m.columns:
-            m[col] = pd.to_numeric(m[col], errors="coerce")
+        if col not in m.columns:
+            m[col] = np.nan
+        m[col] = pd.to_numeric(m[col], errors="coerce")
     ag = m.groupby("row_id", dropna=False).agg(
         has_fluid_window=("sample_drawn_date", lambda x: 1),
         fluid_sample_count_window=("sample_drawn_date", "size"),
@@ -2293,23 +2532,14 @@ def _aggregate_fluids_vectorized(base: pd.DataFrame, fluid: pd.DataFrame) -> pd.
 
 
 def _aggregate_maintenance_vectorized(base: pd.DataFrame, maintenance: pd.DataFrame) -> pd.DataFrame:
-    keep = [
-        "is_monitor_reset",
-        "is_overdue",
-        "is_due_now",
-        "remaining_hours",
-        "related_component",
-        "related_component_1",
-        "related_component_2",
-        "EVENT_NAME_EN",
-        "maintenance_type",
-    ]
+    keep = ["is_monitor_reset", "is_overdue", "is_due_now", "remaining_hours"]
     m = _source_window_join(base, maintenance, "event_date", keep)
     if m.empty:
         return pd.DataFrame(columns=["row_id"])
-    for col in ["is_monitor_reset", "is_overdue", "is_due_now", "remaining_hours"]:
-        if col in m.columns:
-            m[col] = pd.to_numeric(m[col], errors="coerce")
+    for col in keep:
+        if col not in m.columns:
+            m[col] = np.nan if col == "remaining_hours" else 0.0
+        m[col] = pd.to_numeric(m[col], errors="coerce")
     ag = m.groupby("row_id", dropna=False).agg(
         has_maintenance_window=("event_date", lambda x: 1),
         maintenance_event_count_window=("event_date", "size"),
@@ -2319,47 +2549,10 @@ def _aggregate_maintenance_vectorized(base: pd.DataFrame, maintenance: pd.DataFr
         maintenance_min_remaining_hours_window=("remaining_hours", "min"),
         latest_maintenance_date=("event_date", "max"),
     ).reset_index()
-    comp_col = "related_component" if "related_component" in m.columns else "maintenance_type"
-    dom = (
-        m[["row_id", comp_col]]
-        .dropna()
-        .assign(_component=lambda x: x[comp_col].astype(str).str.strip())
-    )
-    if not dom.empty:
-        dom = dom[dom["_component"].ne("")]
-        dom = dom.groupby("row_id")['_component'].agg(lambda x: x.value_counts().index[0]).reset_index()
-        dom = dom.rename(columns={"_component": "maintenance_dominant_component_window"})
-        ag = ag.merge(dom, on="row_id", how="left")
-    if bool(getattr(__import__("config"), "ENABLE_COMPONENT_FEATURES", False)):
-        cfg = __import__("config")
-        text = _component_text_frame(
-            m,
-            [
-                "related_component",
-                "related_component_1",
-                "related_component_2",
-                "EVENT_NAME_EN",
-                "maintenance_type",
-            ],
-        )
-        for raw_group, keywords in _component_groups(cfg).items():
-            group = _safe_component_group_name(raw_group)
-            sub = m.loc[_component_mask(text, keywords)].copy()
-            if sub.empty:
-                continue
-            comp = sub.groupby("row_id", dropna=False).agg(
-                **{
-                    f"maintenance_component_{group}_count_window": ("event_date", "size"),
-                    f"maintenance_component_{group}_overdue_count_window": ("is_overdue", "sum"),
-                    f"maintenance_component_{group}_due_now_count_window": ("is_due_now", "sum"),
-                    f"maintenance_component_{group}_monitor_reset_count_window": ("is_monitor_reset", "sum"),
-                    f"maintenance_component_{group}_min_remaining_hours_window": ("remaining_hours", "min"),
-                }
-            ).reset_index()
-            ag = ag.merge(comp, on="row_id", how="left")
-
     ag = ag.merge(base[["row_id", "window_end"]], on="row_id", how="left")
-    ag["maintenance_days_since_latest_event_window"] = (ag["window_end"] - ag["latest_maintenance_date"]).dt.days.astype(float)
+    ag["maintenance_days_since_latest_event_window"] = (
+        ag["window_end"] - ag["latest_maintenance_date"]
+    ).dt.days.astype(float)
     return ag.drop(columns=["latest_maintenance_date", "window_end"], errors="ignore")
 
 
@@ -2377,9 +2570,17 @@ def _aggregate_operation_vectorized(base: pd.DataFrame, operation: pd.DataFrame)
         return pd.DataFrame(columns=["row_id"])
     if "working_hours_clean" not in m.columns and "actual_working_hours_clean" in m.columns:
         m["working_hours_clean"] = m["actual_working_hours_clean"]
-    for col in ["smr_hours", "working_hours_clean", "engine_running_hours_clean", "engine_idling_hours_clean", "high_throttle_day_flag"]:
-        if col in m.columns:
-            m[col] = pd.to_numeric(m[col], errors="coerce")
+    defaults = {
+        "smr_hours": np.nan,
+        "working_hours_clean": 0.0,
+        "engine_running_hours_clean": 0.0,
+        "engine_idling_hours_clean": 0.0,
+        "high_throttle_day_flag": 0.0,
+    }
+    for col, default in defaults.items():
+        if col not in m.columns:
+            m[col] = default
+        m[col] = pd.to_numeric(m[col], errors="coerce")
     ag = m.groupby("row_id", dropna=False).agg(
         has_operation_window=("LOCAL_DATE", lambda x: 1),
         operation_day_count_window=("LOCAL_DATE", "size"),
@@ -2403,7 +2604,12 @@ def _aggregate_operation_vectorized(base: pd.DataFrame, operation: pd.DataFrame)
     return ag.drop(columns=["_first_smr"], errors="ignore")
 
 
-def build_window_features(base_rows: pd.DataFrame, sources: Mapping[str, pd.DataFrame], episodes: pd.DataFrame) -> pd.DataFrame:
+def _build_base_window_features(
+    base_rows: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    episodes: pd.DataFrame,
+    config,
+) -> pd.DataFrame:
     base = _base_with_row_id(base_rows)
     features = _default_feature_frame(base)
     features = _merge_features(features, _aggregate_faults_vectorized(base, sources.get("fault", pd.DataFrame())))
@@ -2415,7 +2621,9 @@ def build_window_features(base_rows: pd.DataFrame, sources: Mapping[str, pd.Data
     prior_counts = []
     days_since = []
     for _, row in base.iterrows():
-        prior_count, days = count_claims_before(dates_by_machine, row["machine_key"], row["window_start"])
+        prior_count, days = count_claims_before(
+            dates_by_machine, row["machine_key"], row["window_start"]
+        )
         prior_counts.append(prior_count)
         days_since.append(days)
     features["prior_claim_count_before_window"] = prior_counts
@@ -2427,19 +2635,39 @@ def build_window_features(base_rows: pd.DataFrame, sources: Mapping[str, pd.Data
         "maintenance_event_count_window",
         "operation_day_count_window",
     ]
-    for c in count_cols:
-        if c not in features.columns:
-            features[c] = 0
+    for col in count_cols:
+        if col not in features.columns:
+            features[col] = 0
     features["source_record_count_window"] = features[count_cols].fillna(0).sum(axis=1)
     features["has_any_source_window"] = (features["source_record_count_window"] > 0).astype(int)
-    features = _fill_numeric_categorical(features, __import__("config"))
+    features = _fill_numeric_categorical(features, config)
+
     base_no_id = base.drop(columns=["row_id"]).reset_index(drop=True)
     feature_part = features.drop(columns=["row_id"]).reset_index(drop=True)
-    overlap = [c for c in feature_part.columns if c in base_no_id.columns]
+    overlap = [col for col in feature_part.columns if col in base_no_id.columns]
     if overlap:
         feature_part = feature_part.drop(columns=overlap)
-    out = base_no_id.join(feature_part)
-    return out
+    return base_no_id.join(feature_part)
+
+
+def build_window_features(
+    base_rows: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    episodes: pd.DataFrame,
+    config=None,
+) -> pd.DataFrame:
+    """Build either the compact base features or the frozen snapshot features."""
+    cfg = config if config is not None else __import__("config")
+    if hasattr(cfg, "refresh_derived_config"):
+        cfg.refresh_derived_config()
+    mode = str(getattr(cfg, "FEATURE_SET", "base")).strip().lower()
+    if mode == "base":
+        return _build_base_window_features(base_rows, sources, episodes, cfg)
+    if mode == "frozen":
+        from feature_engineering import build_frozen_window_features
+
+        return build_frozen_window_features(base_rows, sources, cfg)
+    raise ValueError("FEATURE_SET must be 'base' or 'frozen'.")
 
 
 def xgboost_learning_curve_frame(pipeline, fit_metadata: Optional[Mapping] = None) -> pd.DataFrame:

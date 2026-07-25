@@ -1,15 +1,8 @@
-"""Step 05: Phase 1 data-design sweep on validation only.
+"""Step 05: compact data-design sweep on the fixed validation split.
 
-This sweep is intentionally compact:
-  - no cross-validation is run,
-  - no learning curves are saved,
-  - no SHAP / feature-importance artifacts are saved,
-  - no detailed prediction files are saved,
-  - each experiment directly fits on the training split and evaluates validation views.
-
-Use this step to choose data-design parameters such as controls-per-positive,
-validation population-negative ratio, and XGBoost class weighting. Keep model
-hyperparameter tuning for 06_tune_xgboost_hyperparameters.py.
+Use this step to compare negative-sampling mode, negatives per positive case,
+base versus frozen features, and XGBoost class weighting. Cross-validation and
+large interpretation artifacts are intentionally disabled during this phase.
 """
 from __future__ import annotations
 
@@ -32,15 +25,15 @@ PREP_STEPS = ["01_build_claim_episodes"]
 DEFAULT_RUN_STEPS = ["02_build_case_control_dataset", "04_fit_validate_model_report"]
 
 PARAMETER_ALIASES = {
-    "controls_per_positive_case": "CONTROLS_PER_POSITIVE_CASE",
-    "validation_random_negatives_per_positive": "VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE",
-    "asof_evaluation_max_machines_per_snapshot": "ASOF_EVALUATION_MAX_MACHINES_PER_SNAPSHOT",
-    "asof_evaluation_snapshot_frequency_days": "ASOF_EVALUATION_SNAPSHOT_FREQUENCY_DAYS",
+    "negative_sampling_mode": "NEGATIVE_SAMPLING_MODE",
+    "negatives_per_positive_case": "NEGATIVES_PER_POSITIVE_CASE",
+    "feature_set": "FEATURE_SET",
     "xgboost_class_importance_mode": "XGBOOST_CLASS_IMPORTANCE_MODE",
     "xgboost_fixed_scale_pos_weight": "XGBOOST_FIXED_SCALE_POS_WEIGHT",
     "positive_claim_selection_mode": "POSITIVE_CLAIM_SELECTION_MODE",
     "random_state": "RANDOM_STATE",
 }
+
 
 
 def _banner(title: str) -> None:
@@ -118,17 +111,17 @@ def _normalize_experiment(exp: Mapping[str, Any]) -> dict:
 
     parts = []
     preferred = [
-        "CONTROLS_PER_POSITIVE_CASE",
-        "ASOF_EVALUATION_MAX_MACHINES_PER_SNAPSHOT",
-        "ASOF_EVALUATION_SNAPSHOT_FREQUENCY_DAYS",
+        "NEGATIVE_SAMPLING_MODE",
+        "NEGATIVES_PER_POSITIVE_CASE",
+        "FEATURE_SET",
         "scale_pos_weight",
         "RANDOM_STATE",
         "POSITIVE_CLAIM_SELECTION_MODE",
     ]
     short_names = {
-        "CONTROLS_PER_POSITIVE_CASE": "ctrl",
-        "ASOF_EVALUATION_MAX_MACHINES_PER_SNAPSHOT": "asofm",
-        "ASOF_EVALUATION_SNAPSHOT_FREQUENCY_DAYS": "asoffreq",
+        "NEGATIVE_SAMPLING_MODE": "neg",
+        "NEGATIVES_PER_POSITIVE_CASE": "n",
+        "FEATURE_SET": "feat",
         "scale_pos_weight": "spw",
         "RANDOM_STATE": "seed",
         "POSITIVE_CLAIM_SELECTION_MODE": "claim",
@@ -179,6 +172,7 @@ def _apply_config(exp: Mapping[str, Any]) -> dict:
             continue
         setattr(config, key, value)
         applied[key] = value
+    config.refresh_derived_config()
     return applied
 
 
@@ -321,11 +315,7 @@ def _build_review_summary(metrics: pd.DataFrame, topk: pd.DataFrame) -> pd.DataF
         "top_10pct_precision_at_k",
         "threshold_free_roc_auc",
     ]
-    eval_priority = {
-        "population_like_validation": 0,
-        "validation_with_population_negatives": 1,
-        "matched_validation": 2,
-    }
+    eval_priority = {"validation": 0}
     base["evaluation_view_priority"] = base["evaluation_view"].map(eval_priority).fillna(9).astype(int)
     base["evaluation_horizon_days_sort"] = pd.to_numeric(base.get("evaluation_horizon_days", float("nan")), errors="coerce").fillna(-1)
     sort_cols = ["evaluation_view_priority", "evaluation_horizon_days_sort"] + [c for c in preferred_sort if c in base.columns]
@@ -357,10 +347,9 @@ def run() -> None:
 
     restore_keys = sorted({
         "OUTPUT_DIR",
-        "CONTROLS_PER_POSITIVE_CASE",
-        "VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE",
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION",
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST",
+        "NEGATIVE_SAMPLING_MODE",
+        "NEGATIVES_PER_POSITIVE_CASE",
+        "FEATURE_SET",
         "XGBOOST_CLASS_IMPORTANCE_MODE",
         "XGBOOST_FIXED_SCALE_POS_WEIGHT",
         "POSITIVE_CLAIM_SELECTION_MODE",
@@ -401,6 +390,7 @@ def run() -> None:
 
             for key, value in original_values.items():
                 setattr(config, key, value)
+            config.refresh_derived_config()
             config.OUTPUT_DIR = exp_dir
             applied = _apply_config(exp)
             _apply_phase1_policy(applied)
@@ -436,6 +426,7 @@ def run() -> None:
         for key, value in original_values.items():
             setattr(config, key, value)
         config.OUTPUT_DIR = original_output_dir
+        config.refresh_derived_config()
 
     run_summary = pd.DataFrame(run_rows)
     run_summary.to_csv(sweep_root / "design_sweep_run_summary.csv", index=False)
@@ -464,7 +455,7 @@ def run() -> None:
             "run_steps": run_steps,
             "cross_validation_enabled": False,
             "phase1_policy": [
-                "direct fit on training split and validate on validation views",
+                "direct fit on the fixed training split and score the fixed validation split",
                 "no cross-validation",
                 "no explicit L1/L2 tuning",
                 "no early stopping",

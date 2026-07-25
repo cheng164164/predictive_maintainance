@@ -1,13 +1,15 @@
-"""Run the standard validation-only case-control modeling workflow.
+"""Run the standard fixed-split case-control modeling workflow.
 
-This main workflow builds the source profiles, claim episodes, case-control
-windows, cross-validation diagnostics, and validation report. It does not run
-Phase 1 design sweep, hyperparameter tuning, or final test evaluation.
+This builds source profiles, claim episodes, fixed machine-level
+train/validation/test datasets, training-only cross-validation diagnostics, and
+the validation report. It does not score the test split.
 """
 from __future__ import annotations
 
 import importlib
 import traceback
+
+import config
 
 STEPS = [
     "00_profile_sources",
@@ -19,6 +21,7 @@ STEPS = [
 
 
 def main() -> None:
+    config.refresh_derived_config()
     for i, module_name in enumerate(STEPS, start=1):
         print("\n" + "=" * 88)
         print(f"Running workflow step {i}/{len(STEPS)}: {module_name}")

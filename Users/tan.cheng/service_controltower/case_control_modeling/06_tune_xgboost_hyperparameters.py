@@ -1,14 +1,8 @@
-"""Step 06: coarse XGBoost hyperparameter grid search on validation only.
+"""Step 06: coarse XGBoost grid search on the fixed validation split.
 
-Use this after Phase 1 design sweep has selected a promising data-design setup.
-This script:
-  1. applies HYPERPARAMETER_TUNING_DATA_DESIGN from config.py,
-  2. builds one dataset for that design,
-  3. expands HYPERPARAMETER_TUNING_GRID,
-  4. fits on the training split and evaluates validation views only,
-  5. collects validation metrics across the grid.
-
-The test split is not evaluated here.
+The selected data design is built once, every parameter configuration is fitted
+on the fixed training split, and the fixed validation split is reused. The test
+split is not evaluated here.
 """
 from __future__ import annotations
 
@@ -130,24 +124,19 @@ def _apply_scale_pos_weight(value: Any, applied: dict) -> None:
 
 def _apply_data_design(design: Mapping[str, Any]) -> dict:
     applied = {}
+    aliases = {
+        "negative_sampling_mode": "NEGATIVE_SAMPLING_MODE",
+        "negatives_per_positive_case": "NEGATIVES_PER_POSITIVE_CASE",
+        "feature_set": "FEATURE_SET",
+    }
     for key, value in design.items():
         if key == "scale_pos_weight":
             _apply_scale_pos_weight(value, applied)
-        elif key.isupper():
-            setattr(config, key, value)
-            applied[key] = value
-        else:
-            canonical = key.upper()
-            setattr(config, canonical, value)
-            applied[canonical] = value
-    config.ADD_ASOF_POPULATION_EVALUATION_TO_VALIDATION = True
-    config.ADD_ASOF_POPULATION_EVALUATION_TO_TEST = False
-    config.ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION = False
-    config.ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST = False
-    applied["ADD_ASOF_POPULATION_EVALUATION_TO_VALIDATION"] = True
-    applied["ADD_ASOF_POPULATION_EVALUATION_TO_TEST"] = False
-    applied["ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION"] = False
-    applied["ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST"] = False
+            continue
+        canonical = aliases.get(key, key if key.isupper() else key.upper())
+        setattr(config, canonical, value)
+        applied[canonical] = value
+    config.refresh_derived_config()
     return applied
 
 
@@ -176,6 +165,7 @@ def _snapshot(keys: set[str]) -> dict:
 def _restore(values: Mapping[str, Any]) -> None:
     for key, value in values.items():
         setattr(config, key, value)
+    config.refresh_derived_config()
 
 
 def _run_step(module_name: str) -> None:
@@ -252,7 +242,7 @@ def _build_tuning_review_summary(metrics: pd.DataFrame, topk: pd.DataFrame) -> p
             for extra in wide_parts[1:]:
                 wide = wide.merge(extra, on=key_cols, how="outer")
             base = base.merge(wide, on=key_cols, how="left")
-    eval_priority = {"asof_population_validation": 0, "population_like_validation": 1, "validation_with_population_negatives": 2, "matched_validation": 3}
+    eval_priority = {"validation": 0}
     base["evaluation_view_priority"] = base["evaluation_view"].map(eval_priority).fillna(9).astype(int)
     base["evaluation_horizon_days_sort"] = pd.to_numeric(base.get("evaluation_horizon_days", float("nan")), errors="coerce").fillna(-1)
     sort_cols = ["evaluation_view_priority", "evaluation_horizon_days_sort"] + [
@@ -263,6 +253,7 @@ def _build_tuning_review_summary(metrics: pd.DataFrame, topk: pd.DataFrame) -> p
     return out.drop(columns=["evaluation_view_priority", "evaluation_horizon_days_sort"], errors="ignore")
 
 def run() -> None:
+    config.refresh_derived_config()
     original_output_dir = config.OUTPUT_DIR
     tuning_root = original_output_dir / "06_xgboost_hyperparameter_tuning"
     dataset_output_dir = tuning_root / "_dataset_for_tuning"
@@ -282,22 +273,21 @@ def run() -> None:
 
     restore_keys = {
         "OUTPUT_DIR",
-        "CONTROLS_PER_POSITIVE_CASE",
-        "VALIDATION_RANDOM_NEGATIVES_PER_POSITIVE",
-        "ASOF_EVALUATION_MAX_MACHINES_PER_SNAPSHOT",
-        "ASOF_EVALUATION_SNAPSHOT_FREQUENCY_DAYS",
-        "VALIDATION_ASOF_EVALUATION_MAX_ROWS",
-        "ADD_ASOF_POPULATION_EVALUATION_TO_VALIDATION",
-        "ADD_ASOF_POPULATION_EVALUATION_TO_TEST",
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_VALIDATION",
-        "ADD_POPULATION_RANDOM_NEGATIVES_TO_TEST",
+        "MODELS_TO_RUN",
+        "NEGATIVE_SAMPLING_MODE",
+        "NEGATIVES_PER_POSITIVE_CASE",
+        "FEATURE_SET",
         "XGBOOST_CLASS_IMPORTANCE_MODE",
         "XGBOOST_FIXED_SCALE_POS_WEIGHT",
         "XGBOOST_PARAMS",
         "XGBOOST_USE_EARLY_STOPPING",
         "XGBOOST_EARLY_STOPPING_ROUNDS",
+        "SAVE_FEATURE_IMPORTANCE",
         "SAVE_SHAP_VALUES",
         "SHAP_EVALUATION_VIEWS",
+        "VALIDATION_SAVE_DETAILED_OUTPUTS",
+        "VALIDATION_INCLUDE_FEATURE_COLUMNS",
+        "VALIDATION_SAVE_MODEL_ARTIFACTS",
     }
     original_values = _snapshot(restore_keys)
     base_xgb_params = dict(config.XGBOOST_PARAMS)
@@ -308,6 +298,16 @@ def run() -> None:
     run_rows = []
 
     try:
+        # Hyperparameter tuning is an XGBoost-only comparison. Keep each run
+        # compact; interpretation artifacts are produced later for the selected
+        # model, not repeatedly for every grid point.
+        config.MODELS_TO_RUN = ["xgboost"]
+        config.SAVE_FEATURE_IMPORTANCE = False
+        config.SAVE_SHAP_VALUES = False
+        config.VALIDATION_SAVE_DETAILED_OUTPUTS = False
+        config.VALIDATION_INCLUDE_FEATURE_COLUMNS = False
+        config.VALIDATION_SAVE_MODEL_ARTIFACTS = False
+
         # Build the dataset once for the selected data design.
         config.OUTPUT_DIR = dataset_output_dir
         applied_design = _apply_data_design(data_design)
@@ -382,6 +382,7 @@ def run() -> None:
     finally:
         _restore(original_values)
         config.OUTPUT_DIR = original_output_dir
+        config.refresh_derived_config()
 
     pd.DataFrame(run_rows).to_csv(tuning_root / "hyperparameter_tuning_run_summary.csv", index=False)
     if combined_metrics:
@@ -404,6 +405,11 @@ def run() -> None:
             "data_design": data_design,
             "grid": grid,
             "test_split_used": False,
+            "tuning_policy": [
+                "XGBoost only",
+                "fixed validation split reused for every grid point",
+                "no SHAP, feature-importance, detailed prediction, or model-artifact files",
+            ],
             "summary_files": [
                 "hyperparameter_tuning_run_summary.csv",
                 "hyperparameter_tuning_validation_metrics.csv",
