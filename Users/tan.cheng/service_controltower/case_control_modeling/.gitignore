@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.coverage
+.DS_Store
+
+# Generated pipeline artifacts. Keep the placeholder so the folder is present.
+output/*
+!output/.gitkeep

@@ -46,6 +46,9 @@ DATE_COLUMNS = [
     "future_claim_date",
     "control_no_claim_start",
     "control_no_claim_end",
+    "next_claim_date_on_or_after_window_end",
+    "as_of_anchor_date",
+    "as_of_actual_next_claim_date",
 ]
 
 
@@ -795,12 +798,22 @@ def _train_score_one_dataset(dataset_row: pd.Series, output_dir: Path) -> dict:
                     group_summary = pd.DataFrame()
                     group_metrics = {}
                     group_file = ""
-                    is_matched_case_control_view = not (
+                    is_fixed_horizon_view = (
                         "row_role" in pred_base.columns
                         and pred_base["row_role"]
                         .astype(str)
                         .eq("fixed_horizon_evaluation_window")
                         .all()
+                    )
+                    is_random_machine_holdout = (
+                        "holdout_sampling_design" in pred_base.columns
+                        and pred_base["holdout_sampling_design"]
+                        .astype(str)
+                        .eq("random_machine_level_ratio_sweep")
+                        .all()
+                    )
+                    is_matched_case_control_view = not (
+                        is_fixed_horizon_view or is_random_machine_holdout
                     )
                     if "case_control_group_id" in pred_base.columns and is_matched_case_control_view:
                         pred_for_group = pred_base.copy()

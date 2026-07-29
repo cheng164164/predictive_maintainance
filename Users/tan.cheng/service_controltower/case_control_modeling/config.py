@@ -47,13 +47,14 @@ OUTPUT_DIR = PROJECT_DIR / "output"
 # reuse the same machine assignments and validation/test row identities.
 FIXED_SPLIT_ASSET_DIR = OUTPUT_DIR / "fixed_split_assets"
 
-WARRANTY_FILE_CANDIDATES = ["warranty.csv", "warranty(4).csv", "warranty(3).csv"]
-FAULT_CODES_FILE_CANDIDATES = ["fault_codes.csv", "fault_codes(2).csv", "fault_codes(1).csv"]
-FLUID_SAMPLES_FILE_CANDIDATES = ["fluid_samples.csv", "fluid_samples(4).csv", "fluid_samples(3).csv"]
-MAINTENANCE_FILE_CANDIDATES = ["maintenance.csv", "maintenance(3).csv", "maintenance(2).csv"]
+WARRANTY_FILE_CANDIDATES = ["warranty.csv", "warranty(5).csv", "warranty(4).csv", "warranty(3).csv"]
+FAULT_CODES_FILE_CANDIDATES = ["fault_codes.csv", "fault_codes(3).csv", "fault_codes(2).csv", "fault_codes(1).csv"]
+FLUID_SAMPLES_FILE_CANDIDATES = ["fluid_samples.csv", "fluid_samples(5).csv", "fluid_samples(4).csv", "fluid_samples(3).csv"]
+MAINTENANCE_FILE_CANDIDATES = ["maintenance.csv", "maintenance(4).csv", "maintenance(3).csv", "maintenance(2).csv"]
 OPERATION_FILE_CANDIDATES = [
     "operation.csv",
     "operation_partial.csv",
+    "operation_partial(3).csv",
     "operation_partial(2).csv",
     "operation_partial(1).csv",
 ]
@@ -147,15 +148,88 @@ VALIDATION_RATIO = 0.15
 TEST_RATIO = 0.15
 FIXED_SPLIT_RANDOM_STATE = 42
 
-# Locked validation/test construction. These settings are intentionally separate
-# from the training design switch above. Step 02 creates the holdout base rows
-# once and reuses them for every experiment, so comparisons use identical row
-# identities. "random" uses random eligible windows from same-full-model machines.
-# This matched holdout is used for the original training target and for model-fit
-# monitoring/early stopping. Claim-within-horizon evaluation uses a second fixed,
-# outcome-independent window cohort created automatically by Step 02.
-FIXED_HOLDOUT_NEGATIVE_SAMPLING_MODE = "random"
-FIXED_HOLDOUT_NEGATIVES_PER_POSITIVE_CASE = 3
+# Validation/test cohort design. This switch does not change training.
+#
+#   "random"
+#       Positive windows are claim-anchored. Each negative machine receives one
+#       independently sampled eligible no-claim window. Negatives are not matched
+#       to positives by full model or calendar date.
+#
+#   "controlled"
+#       Each positive claim window is matched to negative machines from the same
+#       full model using the exact same calendar window.
+#
+#   "as_of_anchor"
+#       Deployment-like fleet snapshot. One deterministic random as-of date is
+#       selected and shared by all validation/test machines. Every row uses the
+#       same calendar feature window ending on that date. The design target is 1
+#       when the machine has a claim within lead_min_days after the as-of date;
+#       otherwise it is 0. Ratio cohorts use nested randomly ranked negatives.
+HOLDOUT_NEGATIVE_SAMPLING_MODE = "random"
+
+# The as-of-date design searches daily candidate dates and requires at least this
+# many positive machines in both validation and test when feasible. If no date
+# reaches the requested minimum, the best feasible date is used and documented.
+HOLDOUT_AS_OF_MIN_POSITIVE_MACHINES = 10
+
+# Step 02 creates a fixed machine-level master pool and nested ratio datasets.
+# The 1:1 and 5:1 cohorts use exactly the same positives; larger ratios only add
+# negatives. The largest ratio is the reference validation/test dataset used by
+# Steps 04 and 07.
+HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS = [1, 3, 5, 10]
+HOLDOUT_RANDOM_STATE = 42
+
+# Step 08 ranking diagnostics. Percentage cutoffs show operational performance
+# at a fixed fraction of the population. Fixed counts make the workload identical
+# across prevalence ratios and are the preferred extreme-top degradation check.
+HOLDOUT_TOP_N_COUNTS = [10, 20, 50]
+
+# Machine-level stratified bootstrap settings for Step 08. Positives and negatives
+# are resampled separately with replacement so each bootstrap replicate preserves
+# the evaluated negative:positive ratio.
+HOLDOUT_BOOTSTRAP_ENABLED = True
+HOLDOUT_BOOTSTRAP_N_RESAMPLES = 1000
+HOLDOUT_BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
+HOLDOUT_BOOTSTRAP_RANDOM_STATE = 20260727
+
+
+# =============================================================================
+# 5B. Multi-anchor natural-prevalence fleet validation/test
+# =============================================================================
+# This optional deployment-style evaluation is independent of the ratio-sampled
+# holdouts above. Each anchor is one fleet scoring date. All eligible validation
+# or test machines at that date are retained at the natural observed prevalence,
+# ranked within that date, and labeled by claims occurring after the anchor.
+MULTI_ANCHOR_FLEET_ENABLED = True
+
+# Explicit dates take precedence. Leave these lists empty to choose deterministic
+# anchors automatically. Validation anchors are selected from the earlier feasible
+# period; test anchors are selected from the later feasible period.
+MULTI_ANCHOR_FLEET_VALIDATION_DATES = []
+MULTI_ANCHOR_FLEET_TEST_DATES = []
+MULTI_ANCHOR_FLEET_VALIDATION_ANCHOR_COUNT = 3
+MULTI_ANCHOR_FLEET_TEST_ANCHOR_COUNT = 2
+
+# Automatic anchor selection requirements. Anchors must have complete follow-up
+# for the largest evaluation horizon and enough positive machines in the relevant
+# split. Dates are kept apart to avoid nearly duplicate fleet snapshots.
+MULTI_ANCHOR_FLEET_MIN_POSITIVE_MACHINES = 5
+MULTI_ANCHOR_FLEET_MIN_ELIGIBLE_MACHINES = 50
+MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS = 60
+MULTI_ANCHOR_FLEET_VALIDATION_PERIOD_FRACTION = 0.70
+MULTI_ANCHOR_FLEET_TEST_START_GAP_DAYS = 30
+MULTI_ANCHOR_FLEET_RANDOM_STATE = 20260728
+
+# None keeps the complete eligible fleet. A positive integer is only a development
+# cap: all positives are kept first, then deterministic negatives fill the cap.
+MULTI_ANCHOR_FLEET_MAX_MACHINES_PER_ANCHOR = None
+
+# Step 10 reports ranking and actual claim timing at these fixed workloads.
+MULTI_ANCHOR_FLEET_TOP_K_RATES = [0.01, 0.05, 0.10, 0.20]
+MULTI_ANCHOR_FLEET_TOP_N_COUNTS = [10, 20, 50]
+MULTI_ANCHOR_FLEET_BOOTSTRAP_ENABLED = True
+MULTI_ANCHOR_FLEET_BOOTSTRAP_N_RESAMPLES = 1000
+MULTI_ANCHOR_FLEET_BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 
 
 # =============================================================================
@@ -169,17 +243,19 @@ FIXED_HOLDOUT_NEGATIVES_PER_POSITIVE_CASE = 3
 #       Evaluate against the original case-control target.
 #
 #   "claim_within_horizon"
-#       Evaluate whether the machine has a claim within the configured number
-#       of days after window_end. Step 02 creates fixed random evaluation windows
-#       for validation/test machines without using future claims to select them.
-#       The sample identities stay fixed, while labels are recomputed separately
-#       for every listed horizon. Step 04 writes a horizon-trend report; Step 03
-#       and Step 07 use the largest configured horizon.
+#       Evaluate whether the machine has a claim within each configured number
+#       of days after window_end. Sample identities and model scores stay fixed,
+#       while labels are recomputed separately for every listed horizon. Step 04,
+#       Step 07, and Step 08 write horizon-specific results. With
+#       HOLDOUT_NEGATIVE_SAMPLING_MODE="as_of_anchor", the active shared-date
+#       deployment cohort is reused for all horizons. With random/controlled
+#       holdouts, Step 02 also creates the separate outcome-independent horizon
+#       cohort used by the standard validation and final-test reports.
 #
-# Rerun Step 02 when switching into claim_within_horizon so the separate fixed
-# horizon-evaluation cohort and future-claim lead times are created. Changing the
-# horizon list afterward does not change the locked sample identities; metric
-# code derives each label directly from days-to-next-claim.
+# Rerun Step 02 when switching into claim_within_horizon so future-claim timing
+# and any required horizon cohort are materialized. Changing the horizon list
+# afterward does not change locked sample identities; metric code derives every
+# label directly from days-to-next-claim.
 EVALUATION_TARGET_MODE = "training_target"  # or "claim_within_horizon"
 EVALUATION_CLAIM_HORIZON_DAYS = [30, 60, 90, 120, 180, 365]
 EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END = True
@@ -235,7 +311,7 @@ XGBOOST_FIT_VERBOSE = False
 
 # "auto" computes negative/positive rows from each training split.
 # "fixed" uses XGBOOST_FIXED_SCALE_POS_WEIGHT. "none" omits the parameter.
-XGBOOST_CLASS_IMPORTANCE_MODE = "auto"
+XGBOOST_CLASS_IMPORTANCE_MODE = "none"
 XGBOOST_FIXED_SCALE_POS_WEIGHT = 1.0
 
 SAVE_FEATURE_IMPORTANCE = True

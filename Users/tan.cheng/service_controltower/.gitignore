@@ -65,7 +65,8 @@ case_control_modeling/output/**
 
 /failure_risk_model/output/**
 failure_risk_model/output/**
-
+/machine_health_score_model/output/**
+machine_health_score_model/output/**
 ###############################################################################
 # JSON outputs
 ###############################################################################

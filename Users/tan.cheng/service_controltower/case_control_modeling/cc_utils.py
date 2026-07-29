@@ -1452,6 +1452,7 @@ def _controlled_negative_rows(
     config,
     excluded_machines: Optional[set] = None,
     random_state: Optional[int] = None,
+    sampling_seed_key: Optional[str] = None,
 ) -> Tuple[List[dict], dict]:
     """Sample same-window controls with the original scan-until-filled approach."""
     excluded_machines = set(excluded_machines or set())
@@ -1497,9 +1498,12 @@ def _controlled_negative_rows(
         eligible_pool = eligible_pool.loc[coverage_mask]
 
     seed_value = int(config.RANDOM_STATE if random_state is None else random_state)
-    seed = _stable_hash_int(
-        str(case["case_control_group_id"]) + "|controlled", seed_value
-    ) % (2**32 - 1)
+    seed_key = (
+        str(sampling_seed_key)
+        if sampling_seed_key is not None
+        else str(case["case_control_group_id"])
+    )
+    seed = _stable_hash_int(seed_key + "|controlled", seed_value) % (2**32 - 1)
     ordered = eligible_pool.sample(frac=1.0, random_state=seed)
     checked = 0
     for _, ctrl in ordered.iterrows():
@@ -1944,6 +1948,1701 @@ def build_case_control_base_rows(
     return base, audit
 
 
+def configured_holdout_negative_ratios(config) -> List[int]:
+    """Return sorted unique holdout negative:positive ratios.
+
+    The ratios control validation/test composition only. Training continues to
+    use NEGATIVE_SAMPLING_MODE and NEGATIVES_PER_POSITIVE_CASE.
+    """
+    raw = getattr(config, "HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS", [1, 2, 3, 4, 5])
+    if isinstance(raw, (str, int, float, np.integer, np.floating)):
+        raw = [raw]
+    ratios: List[int] = []
+    for value in raw:
+        ratio = int(value)
+        if ratio < 1:
+            raise ValueError(
+                "HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS must contain integers >= 1. "
+                f"Received {value!r}."
+            )
+        ratios.append(ratio)
+    ratios = sorted(set(ratios))
+    if not ratios:
+        raise ValueError("HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS cannot be empty.")
+    return ratios
+
+
+def holdout_negative_sampling_mode(config) -> str:
+    """Return the validation/test cohort design.
+
+    Training uses :func:`negative_sampling_mode` independently. Supported holdout
+    designs are ``random``, ``controlled``, and ``as_of_anchor``. The third mode
+    changes both positive and negative construction so every machine is scored at
+    one shared deployment-like as-of date.
+    """
+    raw = str(getattr(config, "HOLDOUT_NEGATIVE_SAMPLING_MODE", "random")).strip().lower()
+    aliases = {
+        "random": "random",
+        "independent_random": "random",
+        "controlled": "controlled",
+        "matched": "controlled",
+        "as_of_anchor": "as_of_anchor",
+        "asof_anchor": "as_of_anchor",
+        "anchored_date": "as_of_anchor",
+        "as_of_date": "as_of_anchor",
+        "deployment_snapshot": "as_of_anchor",
+    }
+    if raw not in aliases:
+        raise ValueError(
+            "HOLDOUT_NEGATIVE_SAMPLING_MODE must be 'random', 'controlled', "
+            "or 'as_of_anchor'."
+        )
+    return aliases[raw]
+
+
+def holdout_machine_selection_scope(config, window_config: Mapping) -> str:
+    """Return the deterministic machine-ranking scope for holdout construction.
+
+    A normal single-window run retains the historical window-specific hash token,
+    which preserves existing fixed random holdouts and prior point estimates. When
+    two or more distinct ``WINDOW_CONFIGS`` are evaluated together, every window
+    uses one shared token. This aligns the positive-machine ranking, claim-event
+    selection, and negative-machine ranking as closely as eligibility permits, so
+    differences between window experiments are not mainly caused by resampling a
+    different holdout population.
+    """
+    raw_configs = getattr(config, "WINDOW_CONFIGS", [window_config])
+    normalized = set()
+    try:
+        for item in raw_configs:
+            normalized.add(
+                (int(item["lead_max_days"]), int(item["lead_min_days"]))
+            )
+    except Exception:
+        normalized = {
+            (int(window_config["lead_max_days"]), int(window_config["lead_min_days"]))
+        }
+    if len(normalized) <= 1:
+        return window_config_name(window_config)
+    return "shared_across_configured_window_designs_v1"
+
+
+def _random_holdout_positive_candidates(
+    episodes: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    split_assignments: pd.DataFrame,
+    window_config: Mapping,
+    config,
+    included_splits: Sequence[str],
+    random_state: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Create at most one deterministic random eligible claim window per machine."""
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    window_name = window_config_name(window_config)
+    selection_scope = holdout_machine_selection_scope(config, window_config)
+    requested_splits = {str(x) for x in included_splits}
+
+    coverage_cols = [
+        c for c in ["machine_key", "first_source_date", "last_source_date"]
+        if c in machine_master.columns
+    ]
+    coverage = machine_master[coverage_cols].drop_duplicates("machine_key").copy()
+    if "first_source_date" not in coverage.columns or "last_source_date" not in coverage.columns:
+        raise ValueError(
+            "machine_master must contain first_source_date and last_source_date "
+            "before random holdout construction."
+        )
+
+    assignment_cols = [
+        c for c in ["machine_key", "split", "full_model", "serial"]
+        if c in split_assignments.columns
+    ]
+    assignments = split_assignments[assignment_cols].drop_duplicates("machine_key").copy()
+    work = episodes.copy()
+    work["machine_key"] = work["machine_key"].astype(str)
+    work["claim_date"] = pd.to_datetime(work["claim_date"], errors="coerce")
+    work = work.dropna(subset=["machine_key", "claim_date"])
+    work = work.merge(assignments, on="machine_key", how="left", suffixes=("", "_assigned"))
+    work = work.merge(coverage, on="machine_key", how="left", validate="many_to_one")
+    work = work[work["split"].astype(str).isin(requested_splits)].copy()
+
+    if "full_model_assigned" in work.columns:
+        current = work.get("full_model", pd.Series("", index=work.index)).astype("string").fillna("").str.strip()
+        work["full_model"] = work.get("full_model", pd.Series("", index=work.index)).where(
+            current.ne(""), work["full_model_assigned"]
+        )
+    if "serial_assigned" in work.columns:
+        current = work.get("serial", pd.Series("", index=work.index)).astype("string").fillna("").str.strip()
+        work["serial"] = work.get("serial", pd.Series("", index=work.index)).where(
+            current.ne(""), work["serial_assigned"]
+        )
+    work["full_model"] = work.get("full_model", pd.Series("", index=work.index)).map(clean_model)
+    work["serial"] = work.get("serial", pd.Series("", index=work.index)).map(clean_serial)
+    work["first_source_date"] = pd.to_datetime(work["first_source_date"], errors="coerce")
+    work["last_source_date"] = pd.to_datetime(work["last_source_date"], errors="coerce")
+    work["window_start"] = work["claim_date"] - pd.to_timedelta(lead_max, unit="D")
+    work["window_end"] = work["claim_date"] - pd.to_timedelta(lead_min, unit="D")
+
+    if bool(getattr(config, "REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)):
+        eligible = (
+            work["first_source_date"].notna()
+            & work["last_source_date"].notna()
+            & (work["first_source_date"] <= work["window_end"])
+            & (work["last_source_date"] >= work["window_start"])
+        )
+    else:
+        eligible = pd.Series(True, index=work.index)
+    work["holdout_candidate_status"] = np.where(
+        eligible, "eligible_positive_claim_window", "excluded_no_source_coverage_overlap_window"
+    )
+
+    audit_cols = [
+        c for c in [
+            "machine_key", "split", "full_model", "serial", "claim_episode_id",
+            "claim_date", "window_start", "window_end", "holdout_candidate_status",
+        ] if c in work.columns
+    ]
+    audit = work[audit_cols].copy()
+    audit.insert(0, "candidate_type", "positive")
+
+    eligible_work = work.loc[eligible].copy()
+    if eligible_work.empty:
+        return pd.DataFrame(), audit
+    eligible_work["_holdout_hash"] = eligible_work.apply(
+        lambda row: _stable_hash_int(
+            f"{selection_scope}|{row['split']}|{row['machine_key']}|"
+            f"{row.get('claim_episode_id', '')}|positive_claim_window",
+            random_state,
+        ),
+        axis=1,
+    )
+    eligible_work = eligible_work.sort_values(
+        ["split", "machine_key", "_holdout_hash", "claim_date", "claim_episode_id"],
+        kind="mergesort",
+    )
+    eligible_work = eligible_work.drop_duplicates(["split", "machine_key"], keep="first")
+
+    rows = pd.DataFrame(
+        {
+            "row_role": "case",
+            "target": 1,
+            "case_control_group_id": eligible_work.apply(
+                lambda row: (
+                    f"{window_name}__random_holdout__{row['split']}__case__"
+                    f"{row.get('claim_episode_id', row['machine_key'])}"
+                ),
+                axis=1,
+            ),
+            "case_machine_key": eligible_work["machine_key"].astype(str),
+            "claim_episode_id": eligible_work.get("claim_episode_id", ""),
+            "control_number_within_group": np.nan,
+            "machine_key": eligible_work["machine_key"].astype(str),
+            "full_model": eligible_work["full_model"],
+            "serial": eligible_work["serial"],
+            "split": eligible_work["split"].astype(str),
+            "window_name": window_name,
+            "lead_max_days": lead_max,
+            "lead_min_days": lead_min,
+            "window_start": eligible_work["window_start"],
+            "window_end": eligible_work["window_end"],
+            "linked_case_window_start": pd.NaT,
+            "linked_case_window_end": pd.NaT,
+            "future_claim_date": eligible_work["claim_date"],
+            "days_from_window_end_to_claim": float(lead_min),
+            "negative_sampling_type": "case",
+            "control_sampling_reason": "claim_anchored_positive_random_machine_holdout",
+            "control_no_claim_start": pd.NaT,
+            "control_no_claim_end": pd.NaT,
+            "holdout_sampling_design": "random_machine_level_ratio_sweep",
+            "_holdout_hash": eligible_work["_holdout_hash"].to_numpy(),
+        }
+    )
+    for extra_col in [
+        "claim_count_in_episode", "claim_numbers", "claim_type_descriptions",
+        "critical_fail_part_numbers", "positive_claim_selection_mode",
+        "claim_sequence_number", "machine_claim_event_count",
+        "days_since_previous_claim_same_machine", "claim_selection_reason",
+    ]:
+        if extra_col in eligible_work.columns:
+            rows[extra_col] = eligible_work[extra_col].to_numpy()
+    return rows.reset_index(drop=True), audit.reset_index(drop=True)
+
+
+def _random_holdout_negative_candidates(
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    claim_history_episodes: pd.DataFrame,
+    split_assignments: pd.DataFrame,
+    positive_candidate_machines: set[str],
+    window_config: Mapping,
+    config,
+    included_splits: Sequence[str],
+    random_state: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Create one deterministic eligible no-claim window per candidate machine."""
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = int(lead_max - lead_min)
+    window_name = window_config_name(window_config)
+    selection_scope = holdout_machine_selection_scope(config, window_config)
+    requested_splits = {str(x) for x in included_splits}
+
+    master = machine_master.copy()
+    master["machine_key"] = master["machine_key"].astype(str)
+    assignment_cols = [
+        c for c in ["machine_key", "split", "full_model", "serial"]
+        if c in split_assignments.columns
+    ]
+    assignments = split_assignments[assignment_cols].drop_duplicates("machine_key").copy()
+    master = master.merge(assignments, on="machine_key", how="left", suffixes=("", "_assigned"))
+    master = master[master["split"].astype(str).isin(requested_splits)].copy()
+    for field in ["full_model", "serial"]:
+        assigned = f"{field}_assigned"
+        if assigned in master.columns:
+            current = master.get(field, pd.Series("", index=master.index)).astype("string").fillna("").str.strip()
+            master[field] = master.get(field, pd.Series("", index=master.index)).where(
+                current.ne(""), master[assigned]
+            )
+            master = master.drop(columns=[assigned])
+    master["full_model"] = master.get("full_model", pd.Series("", index=master.index)).map(clean_model)
+    master["serial"] = master.get("serial", pd.Series("", index=master.index)).map(clean_serial)
+
+    dates_by_machine = claim_dates_by_machine(claim_history_episodes)
+    eligible_windows = _eligible_random_windows_by_machine(
+        sources=sources,
+        machine_master=master,
+        dates_by_machine=dates_by_machine,
+        lookback_days=observation_days,
+        config=config,
+    )
+    prior_days = int(getattr(config, "NEGATIVE_EXCLUDE_PRIOR_CLAIM_DAYS_BEFORE_WINDOW_START", 30))
+    future_days = int(getattr(config, "NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END", 180))
+
+    rows: List[dict] = []
+    audit_rows: List[dict] = []
+    for _, machine in master.sort_values(["split", "machine_key"], kind="mergesort").iterrows():
+        machine_key = str(machine["machine_key"])
+        split_name = str(machine["split"])
+        status = "eligible_negative_window"
+        selected_end = pd.NaT
+        raw_dates = np.asarray(
+            eligible_windows.get(machine_key, np.array([], dtype="datetime64[ns]")),
+            dtype="datetime64[ns]",
+        )
+        # A machine may be eligible as both a claim-anchored positive and a
+        # no-claim-window negative. The final joint sampler assigns it to only
+        # one class, which preserves machine independence while avoiding the
+        # severe holdout-size reduction caused by excluding every machine that
+        # has any eligible claim history.
+        if len(raw_dates) == 0:
+            status = "excluded_no_eligible_random_negative_window"
+        else:
+            selector = _stable_hash_int(
+                f"{selection_scope}|{split_name}|{machine_key}|random_holdout_negative_window",
+                random_state,
+            )
+            selected_end = pd.Timestamp(raw_dates[selector % len(raw_dates)])
+
+        audit_rows.append(
+            {
+                "candidate_type": "negative",
+                "machine_key": machine_key,
+                "split": split_name,
+                "full_model": machine.get("full_model", ""),
+                "serial": machine.get("serial", ""),
+                "holdout_candidate_status": status,
+                "machine_has_eligible_positive_claim_window": (
+                    machine_key in positive_candidate_machines
+                ),
+                "eligible_window_count": int(len(raw_dates)),
+                "selected_window_end": selected_end,
+            }
+        )
+        if pd.isna(selected_end):
+            continue
+
+        window_end = pd.Timestamp(selected_end)
+        window_start = window_end - pd.Timedelta(days=observation_days)
+        row_id = f"{window_name}__random_holdout__{split_name}__control__{machine_key}"
+        sort_hash = _stable_hash_int(
+            f"{selection_scope}|{split_name}|{machine_key}|random_holdout_negative_order",
+            random_state,
+        )
+        rows.append(
+            {
+                "row_role": "control",
+                "target": 0,
+                "case_control_group_id": row_id,
+                "case_machine_key": machine_key,
+                "claim_episode_id": "",
+                "control_number_within_group": 1,
+                "machine_key": machine_key,
+                "full_model": machine.get("full_model", ""),
+                "serial": machine.get("serial", ""),
+                "split": split_name,
+                "window_name": window_name,
+                "lead_max_days": lead_max,
+                "lead_min_days": lead_min,
+                "window_start": window_start,
+                "window_end": window_end,
+                "linked_case_window_start": pd.NaT,
+                "linked_case_window_end": pd.NaT,
+                "future_claim_date": pd.NaT,
+                "days_from_window_end_to_claim": np.nan,
+                "negative_sampling_type": "random_holdout",
+                "control_sampling_reason": (
+                    "random_machine_window_no_claim_in_configured_exclusion_interval"
+                ),
+                "control_no_claim_start": window_start - pd.Timedelta(days=prior_days),
+                "control_no_claim_end": window_end + pd.Timedelta(days=future_days),
+                "holdout_sampling_design": "random_machine_level_ratio_sweep",
+                "_holdout_hash": sort_hash,
+            }
+        )
+    return pd.DataFrame(rows), pd.DataFrame(audit_rows)
+
+
+def build_random_holdout_ratio_base_pool(
+    episodes: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    window_config: Mapping,
+    config,
+    claim_history_episodes: Optional[pd.DataFrame] = None,
+    split_assignments: Optional[pd.DataFrame] = None,
+    included_splits: Sequence[str] = ("validation", "test"),
+    random_state_override: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build a fixed random validation/test master pool for ratio experiments.
+
+    Design properties:
+    - machine-level split assignments are respected;
+    - each holdout machine contributes at most one row;
+    - positive rows use the configured claim-relative feature window;
+    - negative rows use independently sampled eligible no-claim windows;
+    - positives and negatives are not matched by case, calendar date, or full model;
+    - the master pool contains enough nested negatives for the largest configured
+      negative:positive ratio.
+    """
+    if split_assignments is None:
+        raise ValueError("split_assignments are required for random holdout construction.")
+    ratios = configured_holdout_negative_ratios(config)
+    max_ratio = int(max(ratios))
+    seed = int(
+        getattr(config, "HOLDOUT_RANDOM_STATE", getattr(config, "FIXED_SPLIT_RANDOM_STATE", 42))
+        if random_state_override is None
+        else random_state_override
+    )
+    history = claim_history_episodes if claim_history_episodes is not None else episodes
+
+    positives, positive_audit = _random_holdout_positive_candidates(
+        episodes=episodes,
+        machine_master=machine_master,
+        split_assignments=split_assignments,
+        window_config=window_config,
+        config=config,
+        included_splits=included_splits,
+        random_state=seed,
+    )
+    positive_candidate_machines = set(positives.get("machine_key", pd.Series(dtype=str)).astype(str))
+    negatives, negative_audit = _random_holdout_negative_candidates(
+        machine_master=machine_master,
+        sources=sources,
+        claim_history_episodes=history,
+        split_assignments=split_assignments,
+        positive_candidate_machines=positive_candidate_machines,
+        window_config=window_config,
+        config=config,
+        included_splits=included_splits,
+        random_state=seed,
+    )
+
+    selected_parts: List[pd.DataFrame] = []
+    summary_rows: List[dict] = []
+    selection_audit_rows: List[dict] = []
+    for split_name in [str(x) for x in included_splits]:
+        pos = positives[positives["split"].astype(str).eq(split_name)].copy()
+        neg = negatives[negatives["split"].astype(str).eq(split_name)].copy()
+        pos = pos.sort_values(["_holdout_hash", "machine_key"], kind="mergesort")
+        neg = neg.sort_values(["_holdout_hash", "machine_key"], kind="mergesort")
+
+        # Positives and negatives are selected jointly because a machine can
+        # have both an eligible claim-anchored window and an eligible no-claim
+        # window. Start from the largest feasible positive count and decrease
+        # only until enough *different* machines remain for the requested
+        # maximum negative ratio. This keeps the holdout random and much larger
+        # than the old rule that excluded every claim-history machine from the
+        # negative pool.
+        union_machine_count = int(
+            len(set(pos["machine_key"].astype(str)) | set(neg["machine_key"].astype(str)))
+        )
+        selected_positive_count = min(
+            int(len(pos)), int(union_machine_count // (max_ratio + 1))
+        )
+        selected_pos = pd.DataFrame()
+        available_neg = pd.DataFrame()
+        while selected_positive_count >= 1:
+            selected_pos = pos.head(selected_positive_count).copy()
+            selected_positive_keys = set(selected_pos["machine_key"].astype(str))
+            available_neg = neg[
+                ~neg["machine_key"].astype(str).isin(selected_positive_keys)
+            ].copy()
+            if len(available_neg) >= selected_positive_count * max_ratio:
+                break
+            selected_positive_count -= 1
+
+        if selected_positive_count < 1:
+            summary_rows.append(
+                {
+                    "split": split_name,
+                    "positive_candidates": int(len(pos)),
+                    "negative_candidates": int(len(neg)),
+                    "candidate_machine_overlap": int(
+                        len(set(pos["machine_key"].astype(str)) & set(neg["machine_key"].astype(str)))
+                    ),
+                    "unique_candidate_machines": union_machine_count,
+                    "selected_positive_rows": 0,
+                    "selected_negative_rows_at_max_ratio": 0,
+                    "max_negative_to_positive_ratio": max_ratio,
+                    "status": "insufficient_candidates",
+                }
+            )
+            continue
+
+        selected_neg = available_neg.head(selected_positive_count * max_ratio).copy()
+        selected_pos["holdout_positive_rank"] = np.arange(1, len(selected_pos) + 1)
+        selected_pos["holdout_negative_rank"] = np.nan
+        selected_neg["holdout_positive_rank"] = np.nan
+        selected_neg["holdout_negative_rank"] = np.arange(1, len(selected_neg) + 1)
+        for frame in [selected_pos, selected_neg]:
+            frame["holdout_max_negative_to_positive_ratio"] = max_ratio
+            frame["holdout_random_state"] = seed
+        selected_parts.extend([selected_pos, selected_neg])
+
+        selected_pos_keys = set(selected_pos["machine_key"].astype(str))
+        selected_neg_keys = set(selected_neg["machine_key"].astype(str))
+        for _, row in pos.iterrows():
+            selection_audit_rows.append(
+                {
+                    "candidate_type": "positive",
+                    "machine_key": row["machine_key"],
+                    "split": split_name,
+                    "selected_in_master_pool": str(row["machine_key"]) in selected_pos_keys,
+                    "selection_reason": (
+                        "selected_random_positive_machine"
+                        if str(row["machine_key"]) in selected_pos_keys
+                        else "excluded_to_preserve_all_requested_negative_ratios"
+                    ),
+                }
+            )
+        for _, row in neg.iterrows():
+            selection_audit_rows.append(
+                {
+                    "candidate_type": "negative",
+                    "machine_key": row["machine_key"],
+                    "split": split_name,
+                    "selected_in_master_pool": str(row["machine_key"]) in selected_neg_keys,
+                    "selection_reason": (
+                        "selected_random_negative_machine"
+                        if str(row["machine_key"]) in selected_neg_keys
+                        else (
+                            "excluded_machine_selected_as_positive"
+                            if str(row["machine_key"]) in selected_pos_keys
+                            else "not_needed_for_configured_max_ratio"
+                        )
+                    ),
+                }
+            )
+        summary_rows.append(
+            {
+                "split": split_name,
+                "positive_candidates": int(len(pos)),
+                "negative_candidates": int(len(neg)),
+                "candidate_machine_overlap": int(
+                    len(set(pos["machine_key"].astype(str)) & set(neg["machine_key"].astype(str)))
+                ),
+                "unique_candidate_machines": union_machine_count,
+                "selected_positive_rows": int(len(selected_pos)),
+                "selected_negative_rows_at_max_ratio": int(len(selected_neg)),
+                "max_negative_to_positive_ratio": max_ratio,
+                "status": "selected",
+            }
+        )
+
+    master_pool = (
+        pd.concat(selected_parts, ignore_index=True, sort=False)
+        if selected_parts
+        else pd.DataFrame()
+    )
+    if not master_pool.empty:
+        master_pool = master_pool.sort_values(
+            ["split", "target", "_holdout_hash", "machine_key"],
+            ascending=[True, False, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        if master_pool["machine_key"].duplicated().any():
+            duplicate_keys = master_pool.loc[
+                master_pool["machine_key"].duplicated(keep=False), "machine_key"
+            ].astype(str).unique().tolist()[:10]
+            raise ValueError(
+                "Random holdout master pool contains duplicate machines. "
+                f"Examples: {duplicate_keys}"
+            )
+        master_pool = master_pool.drop(columns=["_holdout_hash"], errors="ignore")
+
+    detailed_audit = pd.concat(
+        [positive_audit, negative_audit, pd.DataFrame(selection_audit_rows)],
+        ignore_index=True,
+        sort=False,
+    )
+    return master_pool, detailed_audit, pd.DataFrame(summary_rows)
+
+
+def build_controlled_holdout_ratio_base_pool(
+    episodes: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    window_config: Mapping,
+    config,
+    claim_history_episodes: Optional[pd.DataFrame] = None,
+    split_assignments: Optional[pd.DataFrame] = None,
+    included_splits: Sequence[str] = ("validation", "test"),
+    random_state_override: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build fixed matched validation/test cohorts for ratio experiments.
+
+    Each retained positive machine is matched to ``max(ratios)`` different
+    control machines from the same split and full model. Controls use the exact
+    positive calendar window and satisfy the normal no-claim and source-coverage
+    rules. A physical machine can appear only once in the master pool.
+    """
+    if split_assignments is None:
+        raise ValueError("split_assignments are required for controlled holdout construction.")
+    ratios = configured_holdout_negative_ratios(config)
+    max_ratio = int(max(ratios))
+    seed = int(
+        getattr(config, "HOLDOUT_RANDOM_STATE", getattr(config, "FIXED_SPLIT_RANDOM_STATE", 42))
+        if random_state_override is None
+        else random_state_override
+    )
+    history = claim_history_episodes if claim_history_episodes is not None else episodes
+    requested_splits = [str(x) for x in included_splits]
+    window_name = window_config_name(window_config)
+    selection_scope = holdout_machine_selection_scope(config, window_config)
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+
+    positives, positive_audit = _random_holdout_positive_candidates(
+        episodes=episodes,
+        machine_master=machine_master,
+        split_assignments=split_assignments,
+        window_config=window_config,
+        config=config,
+        included_splits=included_splits,
+        random_state=seed,
+    )
+
+    master = machine_master.copy()
+    master["machine_key"] = master["machine_key"].astype(str)
+    assignment_cols = [
+        c for c in ["machine_key", "split", "full_model", "serial"]
+        if c in split_assignments.columns
+    ]
+    assignments = split_assignments[assignment_cols].drop_duplicates("machine_key").copy()
+    master = master.merge(assignments, on="machine_key", how="left", suffixes=("", "_assigned"))
+    for field in ["full_model", "serial", "split"]:
+        assigned = f"{field}_assigned"
+        if assigned not in master.columns:
+            continue
+        if field not in master.columns:
+            master[field] = master[assigned]
+        else:
+            current = master[field].astype("string").fillna("").str.strip()
+            master[field] = master[field].where(current.ne(""), master[assigned])
+        master = master.drop(columns=[assigned])
+    master["full_model"] = master.get("full_model", pd.Series("", index=master.index)).map(clean_model)
+    master["serial"] = master.get("serial", pd.Series("", index=master.index)).map(clean_serial)
+    master["split"] = master.get("split", pd.Series("", index=master.index)).astype(str)
+    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
+    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
+    master = master[master["split"].isin(requested_splits)].copy()
+    master_by_model_split = {
+        (str(model), str(split)): group.reset_index(drop=True)
+        for (model, split), group in master.groupby(["full_model", "split"], dropna=False)
+    }
+    dates_by_machine = claim_dates_by_machine(history)
+
+    selected_parts: List[pd.DataFrame] = []
+    selection_audit_rows: List[dict] = []
+    summary_rows: List[dict] = []
+    for split_name in requested_splits:
+        split_pos = positives[positives["split"].astype(str).eq(split_name)].copy()
+        split_pos = split_pos.sort_values(["_holdout_hash", "machine_key"], kind="mergesort")
+        used_machines: set[str] = set()
+        accepted_cases: List[dict] = []
+        accepted_controls: List[dict] = []
+        rejected_short_controls = 0
+        rejected_used_as_control = 0
+
+        for _, raw_case in split_pos.iterrows():
+            case = raw_case.copy()
+            case_machine = str(case["machine_key"])
+            if case_machine in used_machines:
+                rejected_used_as_control += 1
+                selection_audit_rows.append({
+                    "candidate_type": "positive",
+                    "machine_key": case_machine,
+                    "split": split_name,
+                    "selected_in_master_pool": False,
+                    "selection_reason": "excluded_machine_already_selected_as_control",
+                })
+                continue
+
+            case_id = str(case["case_control_group_id"]).replace(
+                "__random_holdout__", "__controlled_holdout__"
+            )
+            case["case_control_group_id"] = case_id
+            case["holdout_match_id"] = case_id
+            case["holdout_sampling_design"] = "controlled_same_window_same_full_model_ratio_sweep"
+            case["control_sampling_reason"] = "claim_anchored_positive_controlled_machine_holdout"
+            case["negative_sampling_type"] = "case"
+
+            pool = master_by_model_split.get(
+                (str(case.get("full_model", "")), split_name), pd.DataFrame()
+            ).copy()
+            if not pool.empty:
+                pool = pool[
+                    ~pool["machine_key"].astype(str).isin(used_machines | {case_machine})
+                ].copy()
+            selected, control_audit = _controlled_negative_rows(
+                case=case,
+                candidates=pool,
+                count=max_ratio,
+                dates_by_machine=dates_by_machine,
+                sources=sources,
+                config=config,
+                excluded_machines=used_machines | {case_machine},
+                random_state=seed,
+                sampling_seed_key=(
+                    f"{selection_scope}|{split_name}|{case_machine}|"
+                    f"{case.get('claim_episode_id', '')}|controlled_holdout"
+                ),
+            )
+            if len(selected) < max_ratio:
+                rejected_short_controls += 1
+                selection_audit_rows.append({
+                    "candidate_type": "positive",
+                    "machine_key": case_machine,
+                    "split": split_name,
+                    "full_model": case.get("full_model", ""),
+                    "claim_episode_id": case.get("claim_episode_id", ""),
+                    "selected_in_master_pool": False,
+                    "selection_reason": "excluded_insufficient_unique_controlled_negatives",
+                    "requested_control_count": max_ratio,
+                    "eligible_control_count_selected": len(selected),
+                    "control_audit": json.dumps(control_audit, default=str),
+                })
+                continue
+
+            accepted_cases.append(case.to_dict())
+            used_machines.add(case_machine)
+            for j, negative in enumerate(selected, start=1):
+                control_machine = str(negative["machine_key"])
+                used_machines.add(control_machine)
+                accepted_controls.append({
+                    "row_role": "control",
+                    "target": 0,
+                    "case_control_group_id": (
+                        f"{case_id}__control__{j}__{control_machine}"
+                    ),
+                    "holdout_match_id": case_id,
+                    "case_machine_key": case_machine,
+                    "matched_positive_machine_key": case_machine,
+                    "claim_episode_id": case.get("claim_episode_id", ""),
+                    "control_number_within_group": j,
+                    "holdout_control_rank_within_positive": j,
+                    "machine_key": control_machine,
+                    "full_model": negative.get("full_model", case.get("full_model", "")),
+                    "serial": negative.get("serial", ""),
+                    "split": split_name,
+                    "window_name": window_name,
+                    "lead_max_days": lead_max,
+                    "lead_min_days": lead_min,
+                    "window_start": negative["window_start"],
+                    "window_end": negative["window_end"],
+                    "linked_case_window_start": case["window_start"],
+                    "linked_case_window_end": case["window_end"],
+                    "future_claim_date": pd.NaT,
+                    "days_from_window_end_to_claim": np.nan,
+                    "negative_sampling_type": "controlled_holdout",
+                    "control_sampling_reason": negative["control_sampling_reason"],
+                    "control_no_claim_start": negative["control_no_claim_start"],
+                    "control_no_claim_end": negative["control_no_claim_end"],
+                    "holdout_sampling_design": "controlled_same_window_same_full_model_ratio_sweep",
+                    "_holdout_hash": _stable_hash_int(
+                        f"{selection_scope}|{split_name}|{case_machine}|{j}|"
+                        f"{control_machine}|controlled_holdout_order", seed
+                    ),
+                })
+                selection_audit_rows.append({
+                    "candidate_type": "negative",
+                    "machine_key": control_machine,
+                    "split": split_name,
+                    "full_model": negative.get("full_model", ""),
+                    "selected_in_master_pool": True,
+                    "selection_reason": "selected_controlled_same_window_same_full_model_negative",
+                    "matched_positive_machine_key": case_machine,
+                    "holdout_control_rank_within_positive": j,
+                })
+            selection_audit_rows.append({
+                "candidate_type": "positive",
+                "machine_key": case_machine,
+                "split": split_name,
+                "full_model": case.get("full_model", ""),
+                "claim_episode_id": case.get("claim_episode_id", ""),
+                "selected_in_master_pool": True,
+                "selection_reason": "selected_controlled_positive_machine",
+                "requested_control_count": max_ratio,
+                "eligible_control_count_selected": max_ratio,
+                "control_audit": json.dumps(control_audit, default=str),
+            })
+
+        cases_df = pd.DataFrame(accepted_cases)
+        controls_df = pd.DataFrame(accepted_controls)
+        if not cases_df.empty:
+            cases_df = cases_df.sort_values(["_holdout_hash", "machine_key"], kind="mergesort").reset_index(drop=True)
+            cases_df["holdout_positive_rank"] = np.arange(1, len(cases_df) + 1)
+            cases_df["holdout_negative_rank"] = np.nan
+            cases_df["holdout_control_rank_within_positive"] = np.nan
+            rank_map = dict(zip(cases_df["case_control_group_id"].astype(str), cases_df["holdout_positive_rank"]))
+            cases_df["matched_holdout_positive_rank"] = cases_df["holdout_positive_rank"]
+            if not controls_df.empty:
+                controls_df["matched_holdout_positive_rank"] = controls_df["holdout_match_id"].astype(str).map(rank_map)
+                controls_df = controls_df.sort_values(
+                    ["matched_holdout_positive_rank", "holdout_control_rank_within_positive", "machine_key"],
+                    kind="mergesort",
+                ).reset_index(drop=True)
+                controls_df["holdout_positive_rank"] = np.nan
+                controls_df["holdout_negative_rank"] = np.arange(1, len(controls_df) + 1)
+            for frame in [cases_df, controls_df]:
+                if frame.empty:
+                    continue
+                frame["holdout_max_negative_to_positive_ratio"] = max_ratio
+                frame["holdout_random_state"] = seed
+            selected_parts.extend([cases_df, controls_df])
+
+        summary_rows.append({
+            "split": split_name,
+            "holdout_negative_sampling_mode": "controlled",
+            "positive_candidates": int(len(split_pos)),
+            "selected_positive_rows": int(len(cases_df)),
+            "selected_negative_rows_at_max_ratio": int(len(controls_df)),
+            "max_negative_to_positive_ratio": max_ratio,
+            "positive_candidates_excluded_insufficient_controls": int(rejected_short_controls),
+            "positive_candidates_excluded_used_as_control": int(rejected_used_as_control),
+            "status": "selected" if len(cases_df) else "insufficient_candidates",
+        })
+
+    master_pool = (
+        pd.concat(selected_parts, ignore_index=True, sort=False)
+        if selected_parts
+        else pd.DataFrame()
+    )
+    if not master_pool.empty:
+        master_pool = master_pool.sort_values(
+            ["split", "target", "holdout_positive_rank", "holdout_negative_rank", "machine_key"],
+            ascending=[True, False, True, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        if master_pool["machine_key"].astype(str).duplicated().any():
+            duplicate_keys = master_pool.loc[
+                master_pool["machine_key"].astype(str).duplicated(keep=False), "machine_key"
+            ].astype(str).unique().tolist()[:10]
+            raise ValueError(
+                "Controlled holdout master pool contains duplicate machines. "
+                f"Examples: {duplicate_keys}"
+            )
+        master_pool = master_pool.drop(columns=["_holdout_hash"], errors="ignore")
+
+    detailed_audit = pd.concat(
+        [positive_audit, pd.DataFrame(selection_audit_rows)],
+        ignore_index=True,
+        sort=False,
+    )
+    return master_pool, detailed_audit, pd.DataFrame(summary_rows)
+
+
+
+def _as_of_anchor_followup_days(window_config: Mapping, config) -> int:
+    """Return required observable future days for an anchored holdout."""
+    lead_min = int(window_config["lead_min_days"])
+    mode = str(getattr(config, "EVALUATION_TARGET_MODE", "training_target")).strip().lower()
+    horizons = configured_evaluation_horizons(config) if mode == "claim_within_horizon" else []
+    return max([lead_min, *[int(x) for x in horizons]])
+
+
+def _as_of_anchor_candidate_dates(
+    episodes: pd.DataFrame,
+    window_config: Mapping,
+    config,
+) -> list[pd.Timestamp]:
+    """Return deterministic daily anchor candidates near observed claim dates."""
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = int(window_config["lead_max_days"]) - lead_min
+    followup_days = _as_of_anchor_followup_days(window_config, config)
+    include_cutoff = bool(getattr(config, "EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END", True))
+
+    claim_dates = pd.to_datetime(episodes.get("claim_date"), errors="coerce").dropna().drop_duplicates()
+    if claim_dates.empty:
+        return []
+    lower = pd.Timestamp(getattr(config, "MIN_VALID_EVENT_DATE", claim_dates.min())) + pd.Timedelta(days=observation_days)
+    upper = _max_claim_observation_date(config) - pd.Timedelta(days=followup_days)
+    first_delta = 0 if include_cutoff else 1
+    candidates: set[pd.Timestamp] = set()
+    for claim_date in claim_dates:
+        for delta in range(first_delta, lead_min + 1):
+            anchor = pd.Timestamp(claim_date).normalize() - pd.Timedelta(days=delta)
+            if lower <= anchor <= upper:
+                candidates.add(anchor)
+    return sorted(candidates)
+
+
+def _as_of_anchor_machine_candidates(
+    anchor_date: pd.Timestamp,
+    prepared_master: pd.DataFrame,
+    dates_by_machine: Mapping[str, np.ndarray],
+    window_config: Mapping,
+    config,
+    split_name: str,
+) -> pd.DataFrame:
+    """Label all source-covered machines at one shared as-of date."""
+    anchor = pd.Timestamp(anchor_date).normalize()
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = lead_max - lead_min
+    window_start = anchor - pd.Timedelta(days=observation_days)
+    include_cutoff = bool(getattr(config, "EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END", True))
+
+    sub = prepared_master[prepared_master["split"].astype(str).eq(str(split_name))].copy()
+    if bool(getattr(config, "REQUIRE_SOURCE_COVERAGE_OVERLAP_WINDOW", True)):
+        sub = sub[
+            sub["first_source_date"].notna()
+            & sub["last_source_date"].notna()
+            & (sub["first_source_date"] <= anchor)
+            & (sub["last_source_date"] >= window_start)
+        ].copy()
+    if sub.empty:
+        return sub
+
+    next_dates: list[pd.Timestamp] = []
+    days_values: list[float] = []
+    for machine_key in sub["machine_key"].astype(str):
+        next_date, days = next_claim_on_or_after(
+            dates_by_machine,
+            machine_key,
+            anchor,
+            include_cutoff=include_cutoff,
+        )
+        next_dates.append(next_date)
+        days_values.append(days)
+    sub["as_of_anchor_date"] = anchor
+    sub["window_start"] = window_start
+    sub["window_end"] = anchor
+    sub["as_of_actual_next_claim_date"] = pd.to_datetime(next_dates, errors="coerce")
+    sub["as_of_days_to_next_claim"] = pd.to_numeric(days_values, errors="coerce")
+    days = sub["as_of_days_to_next_claim"]
+    lower_ok = days.ge(0) if include_cutoff else days.gt(0)
+    sub["target"] = (days.notna() & lower_ok & days.le(float(lead_min))).astype(int)
+    return sub
+
+
+def build_as_of_anchor_holdout_ratio_base_pool(
+    episodes: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    window_config: Mapping,
+    config,
+    claim_history_episodes: Optional[pd.DataFrame] = None,
+    split_assignments: Optional[pd.DataFrame] = None,
+    included_splits: Sequence[str] = ("validation", "test"),
+    random_state_override: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build a deployment-like holdout at one shared random as-of date.
+
+    Every selected validation/test row uses the same calendar ``window_end``.
+    The design target is whether a claim occurs within ``lead_min_days`` after
+    the anchor. Larger evaluation horizons can relabel the same fixed machines
+    without changing their feature windows or scores.
+    """
+    if split_assignments is None:
+        raise ValueError("split_assignments are required for as_of_anchor holdout construction.")
+    requested_splits = [str(x) for x in included_splits]
+    ratios = configured_holdout_negative_ratios(config)
+    max_ratio = int(max(ratios))
+    seed = int(
+        getattr(config, "HOLDOUT_RANDOM_STATE", getattr(config, "FIXED_SPLIT_RANDOM_STATE", 42))
+        if random_state_override is None
+        else random_state_override
+    )
+    history = claim_history_episodes if claim_history_episodes is not None else episodes
+    dates_by_machine = claim_dates_by_machine(history)
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = lead_max - lead_min
+    window_name = window_config_name(window_config)
+    selection_scope = holdout_machine_selection_scope(config, window_config)
+
+    master = machine_master.copy()
+    master["machine_key"] = master["machine_key"].astype(str)
+    assignment_cols = [
+        c for c in ["machine_key", "split", "full_model", "serial"]
+        if c in split_assignments.columns
+    ]
+    assignments = split_assignments[assignment_cols].drop_duplicates("machine_key").copy()
+    master = master.merge(assignments, on="machine_key", how="left", suffixes=("", "_assigned"))
+    for field in ["full_model", "serial"]:
+        assigned = f"{field}_assigned"
+        if assigned in master.columns:
+            current = master.get(field, pd.Series("", index=master.index)).astype("string").fillna("").str.strip()
+            master[field] = master.get(field, pd.Series("", index=master.index)).where(current.ne(""), master[assigned])
+            master = master.drop(columns=[assigned])
+    master["full_model"] = master.get("full_model", pd.Series("", index=master.index)).map(clean_model)
+    master["serial"] = master.get("serial", pd.Series("", index=master.index)).map(clean_serial)
+    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
+    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
+    master = master[master["split"].astype(str).isin(requested_splits)].copy()
+
+    candidates = _as_of_anchor_candidate_dates(history, window_config, config)
+    if not candidates:
+        raise ValueError("No eligible as-of anchor dates are available after applying follow-up limits.")
+    min_positive = max(1, int(getattr(config, "HOLDOUT_AS_OF_MIN_POSITIVE_MACHINES", 10)))
+    candidate_order = sorted(
+        candidates,
+        key=lambda date: _stable_hash_int(
+            f"{selection_scope}|{pd.Timestamp(date).date()}|as_of_anchor_date", seed
+        ),
+    )
+
+    search_rows: list[dict] = []
+    chosen_anchor: Optional[pd.Timestamp] = None
+    best_anchor: Optional[pd.Timestamp] = None
+    best_capacity = -1
+    for anchor in candidate_order:
+        split_capacities: dict[str, int] = {}
+        feasible_minimum = True
+        search_row: dict = {"candidate_type": "anchor_date", "as_of_anchor_date": anchor}
+        for split_name in requested_splits:
+            candidates_df = _as_of_anchor_machine_candidates(
+                anchor, master, dates_by_machine, window_config, config, split_name
+            )
+            positive_count = int(candidates_df["target"].eq(1).sum()) if not candidates_df.empty else 0
+            negative_count = int(candidates_df["target"].eq(0).sum()) if not candidates_df.empty else 0
+            capacity = min(positive_count, negative_count // max_ratio)
+            split_capacities[split_name] = capacity
+            search_row[f"{split_name}_eligible_machines"] = int(len(candidates_df))
+            search_row[f"{split_name}_positive_candidates"] = positive_count
+            search_row[f"{split_name}_negative_candidates"] = negative_count
+            search_row[f"{split_name}_max_ratio_positive_capacity"] = capacity
+            feasible_minimum = feasible_minimum and capacity >= min_positive
+        common_capacity = min(split_capacities.values()) if split_capacities else 0
+        search_row["common_min_positive_capacity"] = common_capacity
+        search_row["meets_requested_minimum"] = bool(feasible_minimum)
+        search_rows.append(search_row)
+        if common_capacity > best_capacity:
+            best_capacity = common_capacity
+            best_anchor = pd.Timestamp(anchor)
+        if feasible_minimum:
+            chosen_anchor = pd.Timestamp(anchor)
+            break
+    if chosen_anchor is None:
+        chosen_anchor = best_anchor
+    if chosen_anchor is None or best_capacity < 1:
+        raise ValueError(
+            "No as-of anchor date has both positive and negative machines for every requested split."
+        )
+
+    episode_lookup = history.copy()
+    episode_lookup["machine_key"] = episode_lookup["machine_key"].astype(str)
+    episode_lookup["claim_date"] = pd.to_datetime(episode_lookup["claim_date"], errors="coerce")
+    episode_lookup = episode_lookup.sort_values(
+        ["machine_key", "claim_date", "claim_episode_id"], kind="mergesort"
+    ).drop_duplicates(["machine_key", "claim_date"], keep="first")
+    episode_id_map = {
+        (str(row.machine_key), pd.Timestamp(row.claim_date)): str(getattr(row, "claim_episode_id", ""))
+        for row in episode_lookup.itertuples(index=False)
+        if pd.notna(row.claim_date)
+    }
+
+    selected_parts: list[pd.DataFrame] = []
+    audit_rows: list[dict] = search_rows
+    summary_rows: list[dict] = []
+    for split_name in requested_splits:
+        candidates_df = _as_of_anchor_machine_candidates(
+            chosen_anchor, master, dates_by_machine, window_config, config, split_name
+        )
+        positives = candidates_df[candidates_df["target"].eq(1)].copy()
+        negatives = candidates_df[candidates_df["target"].eq(0)].copy()
+        positives["_holdout_hash"] = positives["machine_key"].astype(str).map(
+            lambda m: _stable_hash_int(
+                f"{selection_scope}|{chosen_anchor.date()}|{split_name}|{m}|as_of_positive", seed
+            )
+        )
+        negatives["_holdout_hash"] = negatives["machine_key"].astype(str).map(
+            lambda m: _stable_hash_int(
+                f"{selection_scope}|{chosen_anchor.date()}|{split_name}|{m}|as_of_negative", seed
+            )
+        )
+        positives = positives.sort_values(["_holdout_hash", "machine_key"], kind="mergesort")
+        negatives = negatives.sort_values(["_holdout_hash", "machine_key"], kind="mergesort")
+        selected_positive_count = min(len(positives), len(negatives) // max_ratio)
+        selected_pos = positives.head(selected_positive_count).copy()
+        selected_neg = negatives.head(selected_positive_count * max_ratio).copy()
+        selected_pos["holdout_positive_rank"] = np.arange(1, len(selected_pos) + 1)
+        selected_pos["holdout_negative_rank"] = np.nan
+        selected_neg["holdout_positive_rank"] = np.nan
+        selected_neg["holdout_negative_rank"] = np.arange(1, len(selected_neg) + 1)
+
+        frames: list[pd.DataFrame] = []
+        for target_value, selected in [(1, selected_pos), (0, selected_neg)]:
+            if selected.empty:
+                continue
+            out = pd.DataFrame({
+                "row_role": "case" if target_value == 1 else "control",
+                "target": target_value,
+                "machine_key": selected["machine_key"].astype(str),
+                "full_model": selected["full_model"],
+                "serial": selected["serial"],
+                "split": split_name,
+                "window_name": window_name,
+                "lead_max_days": lead_max,
+                "lead_min_days": lead_min,
+                "window_start": chosen_anchor - pd.Timedelta(days=observation_days),
+                "window_end": chosen_anchor,
+                "linked_case_window_start": pd.NaT,
+                "linked_case_window_end": pd.NaT,
+                "as_of_anchor_date": chosen_anchor,
+                "as_of_prediction_horizon_days": lead_min,
+                "as_of_actual_next_claim_date": selected["as_of_actual_next_claim_date"].to_numpy(),
+                "as_of_days_to_next_claim": selected["as_of_days_to_next_claim"].to_numpy(),
+                "future_claim_date": (
+                    selected["as_of_actual_next_claim_date"].to_numpy()
+                    if target_value == 1 else pd.NaT
+                ),
+                "days_from_window_end_to_claim": (
+                    selected["as_of_days_to_next_claim"].to_numpy()
+                    if target_value == 1 else np.nan
+                ),
+                "negative_sampling_type": "case" if target_value == 1 else "as_of_anchor",
+                "control_sampling_reason": (
+                    "as_of_anchor_claim_within_lead_min_days"
+                    if target_value == 1
+                    else "as_of_anchor_no_claim_within_lead_min_days"
+                ),
+                "control_no_claim_start": pd.NaT if target_value == 1 else chosen_anchor,
+                "control_no_claim_end": (
+                    pd.NaT if target_value == 1 else chosen_anchor + pd.Timedelta(days=lead_min)
+                ),
+                "holdout_sampling_design": "as_of_anchor_same_calendar_snapshot_ratio_sweep",
+                "holdout_max_negative_to_positive_ratio": max_ratio,
+                "holdout_random_state": seed,
+                "holdout_positive_rank": selected["holdout_positive_rank"].to_numpy(),
+                "holdout_negative_rank": selected["holdout_negative_rank"].to_numpy(),
+            })
+            out["case_machine_key"] = out["machine_key"]
+            out["control_number_within_group"] = np.nan if target_value == 1 else 1
+            out["case_control_group_id"] = out["machine_key"].map(
+                lambda m: f"{window_name}__as_of_anchor__{split_name}__{'case' if target_value == 1 else 'control'}__{m}"
+            )
+            out["claim_episode_id"] = [
+                episode_id_map.get((str(m), pd.Timestamp(d)), "")
+                if target_value == 1 and pd.notna(d) else ""
+                for m, d in zip(out["machine_key"], out["as_of_actual_next_claim_date"])
+            ]
+            frames.append(out)
+        if frames:
+            selected_parts.extend(frames)
+
+        selected_pos_keys = set(selected_pos["machine_key"].astype(str))
+        selected_neg_keys = set(selected_neg["machine_key"].astype(str))
+        for _, row in candidates_df.iterrows():
+            machine_key = str(row["machine_key"])
+            audit_rows.append({
+                "candidate_type": "machine_at_selected_anchor",
+                "as_of_anchor_date": chosen_anchor,
+                "split": split_name,
+                "machine_key": machine_key,
+                "full_model": row.get("full_model", ""),
+                "design_target_within_lead_min": int(row["target"]),
+                "actual_next_claim_date": row.get("as_of_actual_next_claim_date"),
+                "days_to_next_claim": row.get("as_of_days_to_next_claim"),
+                "selected_in_master_pool": machine_key in selected_pos_keys or machine_key in selected_neg_keys,
+                "selection_reason": (
+                    "selected_as_of_positive" if machine_key in selected_pos_keys
+                    else "selected_as_of_negative" if machine_key in selected_neg_keys
+                    else "not_needed_for_configured_max_ratio"
+                ),
+            })
+        summary_rows.append({
+            "split": split_name,
+            "holdout_negative_sampling_mode": "as_of_anchor",
+            "as_of_anchor_date": chosen_anchor,
+            "as_of_prediction_horizon_days": lead_min,
+            "as_of_observation_window_days": observation_days,
+            "eligible_machines_at_anchor": int(len(candidates_df)),
+            "positive_candidates": int(len(positives)),
+            "negative_candidates": int(len(negatives)),
+            "selected_positive_rows": int(len(selected_pos)),
+            "selected_negative_rows_at_max_ratio": int(len(selected_neg)),
+            "max_negative_to_positive_ratio": max_ratio,
+            "requested_min_positive_machines": min_positive,
+            "requested_minimum_met": bool(len(selected_pos) >= min_positive),
+            "status": "selected",
+        })
+
+    master_pool = pd.concat(selected_parts, ignore_index=True, sort=False) if selected_parts else pd.DataFrame()
+    if not master_pool.empty:
+        master_pool = master_pool.sort_values(
+            ["split", "target", "holdout_positive_rank", "holdout_negative_rank", "machine_key"],
+            ascending=[True, False, True, True, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        if master_pool["machine_key"].astype(str).duplicated().any():
+            raise ValueError("As-of anchor holdout master pool contains duplicate machines.")
+    return master_pool, pd.DataFrame(audit_rows), pd.DataFrame(summary_rows)
+
+
+def _configured_multi_anchor_dates(config, split_name: str) -> list[pd.Timestamp]:
+    """Return explicit configured multi-anchor dates for one split."""
+    attr = (
+        "MULTI_ANCHOR_FLEET_VALIDATION_DATES"
+        if str(split_name) == "validation"
+        else "MULTI_ANCHOR_FLEET_TEST_DATES"
+    )
+    raw = getattr(config, attr, [])
+    if raw is None:
+        return []
+    if isinstance(raw, (str, pd.Timestamp, np.datetime64)):
+        raw = [raw]
+    dates = []
+    for value in raw:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            raise ValueError(f"Invalid date in {attr}: {value!r}")
+        dates.append(pd.Timestamp(ts).normalize())
+    return sorted(set(dates))
+
+
+def _select_spaced_anchor_dates(
+    candidates: Sequence[pd.Timestamp],
+    count: int,
+    min_gap_days: int,
+) -> list[pd.Timestamp]:
+    """Choose deterministic, approximately evenly spaced chronological dates."""
+    dates = sorted({pd.Timestamp(x).normalize() for x in candidates})
+    count = max(0, int(count))
+    if count == 0 or not dates:
+        return []
+    if count == 1:
+        return [dates[len(dates) // 2]]
+
+    targets = np.linspace(0, len(dates) - 1, num=min(count, len(dates)))
+    selected: list[pd.Timestamp] = []
+    used: set[pd.Timestamp] = set()
+    for target in targets:
+        order = sorted(
+            range(len(dates)),
+            key=lambda i: (abs(float(i) - float(target)), dates[i]),
+        )
+        chosen = None
+        for i in order:
+            candidate = dates[i]
+            if candidate in used:
+                continue
+            if all(abs((candidate - prior).days) >= int(min_gap_days) for prior in selected):
+                chosen = candidate
+                break
+        if chosen is not None:
+            selected.append(chosen)
+            used.add(chosen)
+
+    if len(selected) < count:
+        for candidate in dates:
+            if candidate in used:
+                continue
+            if all(abs((candidate - prior).days) >= int(min_gap_days) for prior in selected):
+                selected.append(candidate)
+                used.add(candidate)
+                if len(selected) >= count:
+                    break
+    return sorted(selected)
+
+
+def select_multi_anchor_fleet_dates(
+    episodes: pd.DataFrame,
+    prepared_master: pd.DataFrame,
+    dates_by_machine: Mapping[str, np.ndarray],
+    window_config: Mapping,
+    config,
+) -> tuple[dict[str, list[pd.Timestamp]], pd.DataFrame]:
+    """Choose earlier validation anchors and later test anchors.
+
+    Explicit configured dates take precedence. Otherwise, daily candidate dates
+    are screened for complete future follow-up, source coverage, minimum fleet
+    size, and minimum positive count. Validation dates are selected from the
+    earlier feasible period and test dates from the later feasible period.
+    """
+    candidate_dates = _as_of_anchor_candidate_dates(episodes, window_config, config)
+    # Multi-anchor evaluation always reports every configured future-claim
+    # horizon, even when the main case-control evaluation mode is
+    # training_target. Therefore anchor eligibility must use the largest
+    # configured horizon rather than only lead_min_days.
+    configured_horizons = configured_evaluation_horizons(config)
+    required_followup_days = max(
+        [int(window_config["lead_min_days"]), *[int(x) for x in configured_horizons]]
+    )
+    latest_complete_anchor = _max_claim_observation_date(config) - pd.Timedelta(
+        days=required_followup_days
+    )
+    candidate_dates = [
+        pd.Timestamp(x).normalize()
+        for x in candidate_dates
+        if pd.Timestamp(x).normalize() <= latest_complete_anchor
+    ]
+    if not candidate_dates:
+        raise ValueError(
+            "No eligible multi-anchor fleet dates are available with complete "
+            f"follow-up for {required_followup_days} days."
+        )
+
+    min_positive = max(1, int(getattr(config, "MULTI_ANCHOR_FLEET_MIN_POSITIVE_MACHINES", 5)))
+    min_eligible = max(2, int(getattr(config, "MULTI_ANCHOR_FLEET_MIN_ELIGIBLE_MACHINES", 50)))
+    min_gap = max(0, int(getattr(config, "MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS", 60)))
+    validation_count = max(1, int(getattr(config, "MULTI_ANCHOR_FLEET_VALIDATION_ANCHOR_COUNT", 3)))
+    test_count = max(1, int(getattr(config, "MULTI_ANCHOR_FLEET_TEST_ANCHOR_COUNT", 2)))
+    validation_fraction = float(getattr(config, "MULTI_ANCHOR_FLEET_VALIDATION_PERIOD_FRACTION", 0.70))
+    if not 0 < validation_fraction < 1:
+        raise ValueError("MULTI_ANCHOR_FLEET_VALIDATION_PERIOD_FRACTION must be between 0 and 1.")
+    test_gap = max(0, int(getattr(config, "MULTI_ANCHOR_FLEET_TEST_START_GAP_DAYS", 30)))
+
+    audit_rows: list[dict] = []
+    feasible: dict[str, list[pd.Timestamp]] = {"validation": [], "test": []}
+    count_lookup: dict[tuple[str, pd.Timestamp], tuple[int, int, int]] = {}
+    for anchor in candidate_dates:
+        anchor = pd.Timestamp(anchor).normalize()
+        for split_name in ["validation", "test"]:
+            frame = _as_of_anchor_machine_candidates(
+                anchor, prepared_master, dates_by_machine, window_config, config, split_name
+            )
+            eligible_count = int(len(frame))
+            positive_count = int(frame["target"].eq(1).sum()) if not frame.empty else 0
+            negative_count = int(frame["target"].eq(0).sum()) if not frame.empty else 0
+            is_feasible = (
+                eligible_count >= min_eligible
+                and positive_count >= min_positive
+                and negative_count >= 1
+            )
+            count_lookup[(split_name, anchor)] = (
+                eligible_count, positive_count, negative_count
+            )
+            if is_feasible:
+                feasible[split_name].append(anchor)
+            audit_rows.append({
+                "candidate_type": "multi_anchor_date_screen",
+                "split": split_name,
+                "anchor_date": anchor,
+                "eligible_machines": eligible_count,
+                "positive_machines_within_design_horizon": positive_count,
+                "negative_machines_within_design_horizon": negative_count,
+                "minimum_eligible_required": min_eligible,
+                "minimum_positive_required": min_positive,
+                "is_feasible": bool(is_feasible),
+            })
+
+    explicit_validation = _configured_multi_anchor_dates(config, "validation")
+    explicit_test = _configured_multi_anchor_dates(config, "test")
+    all_dates = sorted(set(feasible["validation"]) | set(feasible["test"]))
+    if not all_dates:
+        raise ValueError(
+            "No date satisfies the multi-anchor minimum eligible-machine and positive-machine requirements."
+        )
+    boundary_index = min(
+        len(all_dates) - 1,
+        max(0, int(np.floor((len(all_dates) - 1) * validation_fraction))),
+    )
+    boundary_date = all_dates[boundary_index]
+
+    if explicit_validation:
+        selected_validation = explicit_validation
+    else:
+        validation_pool = [d for d in feasible["validation"] if d <= boundary_date]
+        if not validation_pool:
+            validation_pool = feasible["validation"]
+        selected_validation = _select_spaced_anchor_dates(
+            validation_pool, validation_count, min_gap
+        )
+
+    latest_validation = max(selected_validation) if selected_validation else boundary_date
+    earliest_test = latest_validation + pd.Timedelta(days=test_gap)
+    if explicit_test:
+        selected_test = explicit_test
+    else:
+        test_pool = [d for d in feasible["test"] if d >= earliest_test and d > boundary_date]
+        if not test_pool:
+            test_pool = [d for d in feasible["test"] if d > latest_validation]
+        if not test_pool:
+            test_pool = feasible["test"]
+        selected_test = _select_spaced_anchor_dates(test_pool, test_count, min_gap)
+
+    selected = {"validation": selected_validation, "test": selected_test}
+    for split_name, dates in selected.items():
+        if not dates:
+            raise ValueError(f"No {split_name} multi-anchor dates could be selected.")
+        feasible_set = set(feasible[split_name])
+        for order, anchor in enumerate(dates, start=1):
+            if pd.Timestamp(anchor).normalize() > latest_complete_anchor:
+                raise ValueError(
+                    f"Configured {split_name} anchor {pd.Timestamp(anchor).date()} lacks "
+                    f"complete {required_followup_days}-day future follow-up; latest "
+                    f"eligible anchor is {latest_complete_anchor.date()}."
+                )
+            if anchor not in feasible_set:
+                counts = count_lookup.get((split_name, anchor))
+                if counts is None:
+                    frame = _as_of_anchor_machine_candidates(
+                        anchor, prepared_master, dates_by_machine, window_config, config, split_name
+                    )
+                    counts = (
+                        int(len(frame)),
+                        int(frame["target"].eq(1).sum()) if not frame.empty else 0,
+                        int(frame["target"].eq(0).sum()) if not frame.empty else 0,
+                    )
+                if counts[0] < min_eligible or counts[1] < min_positive or counts[2] < 1:
+                    raise ValueError(
+                        f"Configured {split_name} anchor {anchor.date()} is not feasible: "
+                        f"eligible={counts[0]}, positives={counts[1]}, negatives={counts[2]}."
+                    )
+            audit_rows.append({
+                "candidate_type": "multi_anchor_selected_date",
+                "split": split_name,
+                "anchor_date": anchor,
+                "anchor_order": order,
+                "selection_source": "explicit" if (
+                    (split_name == "validation" and explicit_validation)
+                    or (split_name == "test" and explicit_test)
+                ) else "automatic",
+                "chronological_boundary_date": boundary_date,
+                "is_feasible": True,
+            })
+    return selected, pd.DataFrame(audit_rows)
+
+
+def build_multi_anchor_fleet_base_rows(
+    episodes: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    window_config: Mapping,
+    config,
+    claim_history_episodes: Optional[pd.DataFrame] = None,
+    split_assignments: Optional[pd.DataFrame] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build natural-prevalence fleet snapshots at several locked anchor dates.
+
+    Machines remain disjoint across train/validation/test through the fixed
+    assignment table, but a validation or test machine may appear once at each
+    anchor in its own split. Rankings must therefore be calculated independently
+    within each anchor date rather than across the pooled rows.
+    """
+    if split_assignments is None:
+        raise ValueError("split_assignments are required for multi-anchor fleet construction.")
+    history = claim_history_episodes if claim_history_episodes is not None else episodes
+    dates_by_machine = claim_dates_by_machine(history)
+    lead_max = int(window_config["lead_max_days"])
+    lead_min = int(window_config["lead_min_days"])
+    observation_days = lead_max - lead_min
+    window_name = window_config_name(window_config)
+    seed = int(getattr(config, "MULTI_ANCHOR_FLEET_RANDOM_STATE", 20260728))
+
+    master = machine_master.copy()
+    master["machine_key"] = master["machine_key"].astype(str)
+    assignment_cols = [
+        c for c in ["machine_key", "split", "full_model", "serial"]
+        if c in split_assignments.columns
+    ]
+    assignments = split_assignments[assignment_cols].drop_duplicates("machine_key").copy()
+    master = master.merge(assignments, on="machine_key", how="left", suffixes=("", "_assigned"))
+    for field in ["full_model", "serial"]:
+        assigned = f"{field}_assigned"
+        if assigned in master.columns:
+            current = master.get(field, pd.Series("", index=master.index)).astype("string").fillna("").str.strip()
+            master[field] = master.get(field, pd.Series("", index=master.index)).where(current.ne(""), master[assigned])
+            master = master.drop(columns=[assigned])
+    master["full_model"] = master.get("full_model", pd.Series("", index=master.index)).map(clean_model)
+    master["serial"] = master.get("serial", pd.Series("", index=master.index)).map(clean_serial)
+    master["first_source_date"] = pd.to_datetime(master.get("first_source_date"), errors="coerce")
+    master["last_source_date"] = pd.to_datetime(master.get("last_source_date"), errors="coerce")
+    master = master[master["split"].astype(str).isin(["validation", "test"])].copy()
+
+    selected_dates, date_audit = select_multi_anchor_fleet_dates(
+        history, master, dates_by_machine, window_config, config
+    )
+
+    episode_lookup = history.copy()
+    episode_lookup["machine_key"] = episode_lookup["machine_key"].astype(str)
+    episode_lookup["claim_date"] = pd.to_datetime(episode_lookup["claim_date"], errors="coerce")
+    if "claim_episode_id" not in episode_lookup.columns:
+        episode_lookup["claim_episode_id"] = ""
+    episode_lookup = episode_lookup.sort_values(
+        ["machine_key", "claim_date", "claim_episode_id"], kind="mergesort"
+    ).drop_duplicates(["machine_key", "claim_date"], keep="first")
+    episode_id_map = {
+        (str(row.machine_key), pd.Timestamp(row.claim_date)): str(row.claim_episode_id)
+        for row in episode_lookup.itertuples(index=False)
+        if pd.notna(row.claim_date)
+    }
+
+    max_rows_raw = getattr(config, "MULTI_ANCHOR_FLEET_MAX_MACHINES_PER_ANCHOR", None)
+    max_rows = None if max_rows_raw in (None, "", 0, "0") else max(1, int(max_rows_raw))
+    base_parts: list[pd.DataFrame] = []
+    audit_rows: list[dict] = date_audit.to_dict("records")
+    summary_rows: list[dict] = []
+    anchor_index_rows: list[dict] = []
+
+    for split_name in ["validation", "test"]:
+        for anchor_order, anchor in enumerate(selected_dates[split_name], start=1):
+            candidates = _as_of_anchor_machine_candidates(
+                anchor, master, dates_by_machine, window_config, config, split_name
+            ).copy()
+            candidates["machine_key"] = candidates["machine_key"].astype(str)
+            candidates["_fleet_hash"] = candidates["machine_key"].map(
+                lambda m: _stable_hash_int(
+                    f"{window_name}|{split_name}|{pd.Timestamp(anchor).date()}|{m}|multi_anchor_fleet",
+                    seed,
+                )
+            )
+            candidates = candidates.sort_values(["target", "_fleet_hash", "machine_key"], ascending=[False, True, True], kind="mergesort")
+            uncapped_rows = int(len(candidates))
+            uncapped_positive = int(candidates["target"].eq(1).sum())
+            if max_rows is not None and len(candidates) > max_rows:
+                positives = candidates[candidates["target"].eq(1)].copy()
+                negatives = candidates[candidates["target"].eq(0)].copy()
+                negative_slots = max(0, max_rows - len(positives))
+                candidates = pd.concat(
+                    [positives, negatives.head(negative_slots)], ignore_index=True, sort=False
+                )
+            candidates = candidates.sort_values(["machine_key"], kind="mergesort").reset_index(drop=True)
+            anchor_id = f"{split_name}__{pd.Timestamp(anchor).strftime('%Y%m%d')}"
+            out = pd.DataFrame({
+                "snapshot_id": [f"{anchor_id}__{m}" for m in candidates["machine_key"]],
+                "fleet_anchor_id": anchor_id,
+                "fleet_anchor_order": anchor_order,
+                "row_role": np.where(candidates["target"].eq(1), "case", "control"),
+                "target": candidates["target"].astype(int).to_numpy(),
+                "machine_key": candidates["machine_key"].to_numpy(),
+                "full_model": candidates["full_model"].to_numpy(),
+                "serial": candidates["serial"].to_numpy(),
+                "split": split_name,
+                "window_name": window_name,
+                "lead_max_days": lead_max,
+                "lead_min_days": lead_min,
+                "window_start": pd.Timestamp(anchor) - pd.Timedelta(days=observation_days),
+                "window_end": pd.Timestamp(anchor),
+                "as_of_anchor_date": pd.Timestamp(anchor),
+                "as_of_prediction_horizon_days": lead_min,
+                "as_of_actual_next_claim_date": candidates["as_of_actual_next_claim_date"].to_numpy(),
+                "as_of_days_to_next_claim": candidates["as_of_days_to_next_claim"].to_numpy(),
+                "future_claim_date": np.where(
+                    candidates["target"].eq(1),
+                    candidates["as_of_actual_next_claim_date"].to_numpy(),
+                    np.datetime64("NaT"),
+                ),
+                "days_from_window_end_to_claim": np.where(
+                    candidates["target"].eq(1),
+                    candidates["as_of_days_to_next_claim"].to_numpy(),
+                    np.nan,
+                ),
+                "negative_sampling_type": np.where(
+                    candidates["target"].eq(1), "case", "natural_fleet_negative"
+                ),
+                "control_sampling_reason": np.where(
+                    candidates["target"].eq(1),
+                    "claim_within_design_horizon_at_shared_anchor",
+                    "no_claim_within_design_horizon_at_shared_anchor",
+                ),
+                "holdout_sampling_design": "multi_anchor_natural_prevalence_fleet_snapshot",
+                "evaluation_population": "all_eligible_machines_at_anchor_natural_prevalence",
+                "holdout_random_state": seed,
+            })
+            out["case_machine_key"] = out["machine_key"]
+            out["control_number_within_group"] = np.nan
+            out["case_control_group_id"] = out["snapshot_id"]
+            out["claim_episode_id"] = [
+                episode_id_map.get((str(m), pd.Timestamp(d)), "") if pd.notna(d) else ""
+                for m, d in zip(out["machine_key"], out["as_of_actual_next_claim_date"])
+            ]
+            base_parts.append(out)
+
+            selected_keys = set(out["machine_key"].astype(str))
+            for row in candidates.itertuples(index=False):
+                audit_rows.append({
+                    "candidate_type": "multi_anchor_machine_snapshot",
+                    "split": split_name,
+                    "anchor_date": pd.Timestamp(anchor),
+                    "fleet_anchor_id": anchor_id,
+                    "machine_key": str(row.machine_key),
+                    "full_model": getattr(row, "full_model", ""),
+                    "design_target_within_lead_min": int(row.target),
+                    "actual_next_claim_date": getattr(row, "as_of_actual_next_claim_date", pd.NaT),
+                    "days_to_next_claim": getattr(row, "as_of_days_to_next_claim", np.nan),
+                    "selected_in_snapshot": str(row.machine_key) in selected_keys,
+                })
+            positive_rows = int(out["target"].eq(1).sum())
+            negative_rows = int(out["target"].eq(0).sum())
+            summary = {
+                "split": split_name,
+                "fleet_anchor_id": anchor_id,
+                "anchor_order": anchor_order,
+                "anchor_date": pd.Timestamp(anchor),
+                "window_start": pd.Timestamp(anchor) - pd.Timedelta(days=observation_days),
+                "window_end": pd.Timestamp(anchor),
+                "design_horizon_days": lead_min,
+                "uncapped_eligible_machines": uncapped_rows,
+                "uncapped_positive_machines": uncapped_positive,
+                "selected_rows": int(len(out)),
+                "positive_rows": positive_rows,
+                "negative_rows": negative_rows,
+                "natural_positive_rate": float(positive_rows / len(out)) if len(out) else np.nan,
+                "development_cap": max_rows,
+            }
+            summary_rows.append(summary)
+            anchor_index_rows.append(summary.copy())
+
+    base = pd.concat(base_parts, ignore_index=True, sort=False) if base_parts else pd.DataFrame()
+    if base.empty:
+        raise ValueError("Multi-anchor fleet construction produced no rows.")
+    if base["snapshot_id"].astype(str).duplicated().any():
+        raise ValueError("Multi-anchor fleet snapshots contain duplicate snapshot IDs.")
+    split_counts = base.groupby("machine_key", dropna=False)["split"].nunique(dropna=False)
+    if (split_counts > 1).any():
+        raise ValueError("Machine leakage detected across multi-anchor validation and test splits.")
+    base = base.sort_values(["split", "as_of_anchor_date", "machine_key"], kind="mergesort").reset_index(drop=True)
+    return (
+        base,
+        pd.DataFrame(audit_rows),
+        pd.DataFrame(summary_rows),
+        pd.DataFrame(anchor_index_rows),
+    )
+
+def build_holdout_ratio_base_pool(
+    episodes: pd.DataFrame,
+    machine_master: pd.DataFrame,
+    sources: Mapping[str, pd.DataFrame],
+    window_config: Mapping,
+    config,
+    claim_history_episodes: Optional[pd.DataFrame] = None,
+    split_assignments: Optional[pd.DataFrame] = None,
+    included_splits: Sequence[str] = ("validation", "test"),
+    random_state_override: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Dispatch to the configured validation/test negative-case design."""
+    mode = holdout_negative_sampling_mode(config)
+    builders = {
+        "random": build_random_holdout_ratio_base_pool,
+        "controlled": build_controlled_holdout_ratio_base_pool,
+        "as_of_anchor": build_as_of_anchor_holdout_ratio_base_pool,
+    }
+    builder = builders[mode]
+    return builder(
+        episodes=episodes,
+        machine_master=machine_master,
+        sources=sources,
+        window_config=window_config,
+        config=config,
+        claim_history_episodes=claim_history_episodes,
+        split_assignments=split_assignments,
+        included_splits=included_splits,
+        random_state_override=random_state_override,
+    )
+
+
+def holdout_ratio_subset(
+    master_pool: pd.DataFrame,
+    split_name: str,
+    negative_to_positive_ratio: int,
+) -> pd.DataFrame:
+    """Return a nested holdout subset for either random or controlled design."""
+    ratio = int(negative_to_positive_ratio)
+    if ratio < 1:
+        raise ValueError("negative_to_positive_ratio must be >= 1.")
+    sub = master_pool[master_pool["split"].astype(str).eq(str(split_name))].copy()
+    positives = sub[pd.to_numeric(sub["target"], errors="coerce").eq(1)].copy()
+    negatives = sub[pd.to_numeric(sub["target"], errors="coerce").eq(0)].copy()
+    positives = positives.sort_values(
+        ["holdout_positive_rank", "machine_key"], kind="mergesort"
+    )
+    if len(positives) == 0:
+        raise ValueError(f"Holdout split {split_name!r} has no positive rows.")
+
+    designs = set(sub.get("holdout_sampling_design", pd.Series(dtype=str)).dropna().astype(str))
+    controlled = any(value.startswith("controlled_") for value in designs)
+    if controlled:
+        if "holdout_control_rank_within_positive" not in negatives.columns:
+            raise ValueError(
+                "Controlled holdout pool is missing holdout_control_rank_within_positive."
+            )
+        negatives = negatives[
+            pd.to_numeric(
+                negatives["holdout_control_rank_within_positive"], errors="coerce"
+            ).le(ratio)
+        ].copy()
+        negatives = negatives.sort_values(
+            ["matched_holdout_positive_rank", "holdout_control_rank_within_positive", "machine_key"],
+            kind="mergesort",
+        )
+        nested_rule = "same positives; first N same-window same-model controls per positive"
+    else:
+        negatives = negatives.sort_values(
+            ["holdout_negative_rank", "machine_key"], kind="mergesort"
+        )
+        required_negatives = int(len(positives) * ratio)
+        if len(negatives) < required_negatives:
+            raise ValueError(
+                f"Holdout split {split_name!r} has {len(negatives)} negatives, "
+                f"but ratio {ratio}:1 requires {required_negatives}."
+            )
+        negatives = negatives.head(required_negatives).copy()
+        nested_rule = "same positives; negatives with global rank <= ratio * positive_count"
+
+    required_negatives = int(len(positives) * ratio)
+    if len(negatives) != required_negatives:
+        raise ValueError(
+            f"Holdout split {split_name!r} produced {len(negatives)} negatives for "
+            f"{len(positives)} positives at ratio {ratio}:1."
+        )
+    out = pd.concat([positives, negatives], ignore_index=True, sort=False)
+    out["holdout_negative_to_positive_ratio_requested"] = ratio
+    out["holdout_positive_rows_in_ratio_dataset"] = int(len(positives))
+    out["holdout_negative_rows_in_ratio_dataset"] = required_negatives
+    out["holdout_nested_negative_rule"] = nested_rule
+    out = out.sort_values(
+        ["target", "machine_key"], ascending=[False, True], kind="mergesort"
+    ).reset_index(drop=True)
+    if out["machine_key"].astype(str).duplicated().any():
+        raise ValueError("A machine appears more than once in a holdout ratio dataset.")
+    return out
+
+
+def random_holdout_ratio_subset(
+    master_pool: pd.DataFrame,
+    split_name: str,
+    negative_to_positive_ratio: int,
+) -> pd.DataFrame:
+    """Backward-compatible alias for :func:`holdout_ratio_subset`."""
+    return holdout_ratio_subset(
+        master_pool=master_pool,
+        split_name=split_name,
+        negative_to_positive_ratio=negative_to_positive_ratio,
+    )
+
 def _max_claim_observation_date(config) -> pd.Timestamp:
     for attr in ["MAX_CLAIM_DATE", "MAX_VALID_EVENT_DATE"]:
         value = getattr(config, attr, None)
@@ -2283,6 +3982,230 @@ def top_k_metrics(y_true, score, top_k_rates: Sequence[float]) -> pd.DataFrame:
             "min_score_in_top_k": float(s.iloc[top_idx].min()) if k else np.nan,
         })
     return pd.DataFrame(rows)
+
+
+def top_n_metrics(y_true, score, top_n_counts: Sequence[int]) -> pd.DataFrame:
+    """Calculate ranking metrics at fixed absolute machine counts.
+
+    Unlike percentage-based Top-K, the selected workload is identical across
+    prevalence-ratio cohorts. Counts larger than the cohort are capped at the
+    cohort size and reported through ``flagged_count``.
+    """
+    y = pd.Series(y_true).astype(int).reset_index(drop=True)
+    s = pd.Series(score).astype(float).reset_index(drop=True)
+    order = s.sort_values(ascending=False).index.to_numpy()
+    total_pos = int((y == 1).sum())
+    n = len(y)
+    base_rate = total_pos / n if n else np.nan
+    rows = []
+    for requested in top_n_counts:
+        top_n = int(requested)
+        if top_n < 1:
+            raise ValueError(f"Top-N counts must be >= 1; received {requested!r}.")
+        k = min(top_n, n) if n else 0
+        top_idx = order[:k]
+        tp = int(y.iloc[top_idx].sum()) if k else 0
+        precision = tp / k if k else np.nan
+        recall = tp / total_pos if total_pos else np.nan
+        rows.append({
+            "top_n_requested": top_n,
+            "rows": int(n),
+            "flagged_count": int(k),
+            "positive_count": total_pos,
+            "true_positive_at_n": tp,
+            "precision_at_n": float(precision),
+            "recall_at_n": float(recall),
+            "lift_vs_random": (
+                float(precision / base_rate)
+                if base_rate and base_rate > 0
+                else np.nan
+            ),
+            "min_score_in_top_n": float(s.iloc[top_idx].min()) if k else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def _percentile_interval(values: Sequence[float], confidence_level: float) -> dict:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if not 0 < float(confidence_level) < 1:
+        raise ValueError("confidence_level must be between 0 and 1.")
+    if len(arr) == 0:
+        return {
+            "bootstrap_valid_resamples": 0,
+            "bootstrap_mean": np.nan,
+            "bootstrap_standard_error": np.nan,
+            "ci_lower": np.nan,
+            "ci_upper": np.nan,
+        }
+    alpha = 1.0 - float(confidence_level)
+    return {
+        "bootstrap_valid_resamples": int(len(arr)),
+        "bootstrap_mean": float(np.mean(arr)),
+        "bootstrap_standard_error": float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
+        "ci_lower": float(np.quantile(arr, alpha / 2.0)),
+        "ci_upper": float(np.quantile(arr, 1.0 - alpha / 2.0)),
+    }
+
+
+def bootstrap_ranking_metric_intervals(
+    y_true,
+    score,
+    top_k_rates: Sequence[float],
+    top_n_counts: Sequence[int],
+    n_resamples: int = 1000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> Tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """Estimate machine-level percentile bootstrap confidence intervals.
+
+    Positive and negative machines are resampled separately with replacement.
+    This stratified nonparametric bootstrap preserves the evaluated prevalence
+    and negative:positive ratio in every replicate. It is appropriate here
+    because Step 02 guarantees one row per holdout machine.
+    """
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    y = pd.Series(y_true).astype(int).reset_index(drop=True).to_numpy()
+    s = np.asarray(score, dtype=float)
+    if len(y) != len(s):
+        raise ValueError("y_true and score must have the same length.")
+    if len(y) == 0:
+        raise ValueError("Cannot bootstrap an empty evaluation cohort.")
+    requested = int(n_resamples)
+    if requested < 1:
+        raise ValueError("n_resamples must be at least 1.")
+    pos_idx = np.flatnonzero(y == 1)
+    neg_idx = np.flatnonzero(y == 0)
+    if len(pos_idx) == 0 or len(neg_idx) == 0:
+        raise ValueError(
+            "Bootstrap confidence intervals require both positive and negative machines."
+        )
+
+    rates = [float(x) for x in top_k_rates]
+    counts = [int(x) for x in top_n_counts]
+    rng = np.random.default_rng(int(random_state))
+    ap_values: List[float] = []
+    auc_values: List[float] = []
+    topk_values = {
+        rate: {"precision_at_k": [], "recall_at_k": [], "lift_vs_random": []}
+        for rate in rates
+    }
+    topn_values = {
+        count: {"precision_at_n": [], "recall_at_n": [], "lift_vs_random": []}
+        for count in counts
+    }
+
+    for _ in range(requested):
+        sampled_idx = np.concatenate(
+            [
+                rng.choice(pos_idx, size=len(pos_idx), replace=True),
+                rng.choice(neg_idx, size=len(neg_idx), replace=True),
+            ]
+        )
+        rng.shuffle(sampled_idx)
+        y_boot = y[sampled_idx]
+        s_boot = s[sampled_idx]
+        ap_values.append(float(average_precision_score(y_boot, s_boot)))
+        auc_values.append(float(roc_auc_score(y_boot, s_boot)))
+
+        # NumPy ranking calculations avoid constructing two pandas DataFrames
+        # for every bootstrap replicate. This is materially faster for the
+        # 1,000-resample ratio and multi-window experiments while preserving the
+        # same definitions used by top_k_metrics and top_n_metrics.
+        order = np.argsort(-s_boot, kind="mergesort")
+        y_ranked = y_boot[order]
+        cumulative_positive = np.cumsum(y_ranked)
+        total_positive = int(cumulative_positive[-1]) if len(cumulative_positive) else 0
+        n_rows = int(len(y_boot))
+        base_rate = total_positive / n_rows if n_rows else np.nan
+
+        for rate in rates:
+            k = max(1, int(np.ceil(float(rate) * n_rows))) if n_rows else 0
+            tp = int(cumulative_positive[k - 1]) if k else 0
+            precision = tp / k if k else np.nan
+            recall = tp / total_positive if total_positive else np.nan
+            lift = (
+                precision / base_rate
+                if np.isfinite(base_rate) and base_rate > 0
+                else np.nan
+            )
+            bucket = topk_values[rate]
+            bucket["precision_at_k"].append(float(precision))
+            bucket["recall_at_k"].append(float(recall))
+            bucket["lift_vs_random"].append(float(lift))
+
+        for count in counts:
+            k = min(int(count), n_rows) if n_rows else 0
+            tp = int(cumulative_positive[k - 1]) if k else 0
+            precision = tp / k if k else np.nan
+            recall = tp / total_positive if total_positive else np.nan
+            lift = (
+                precision / base_rate
+                if np.isfinite(base_rate) and base_rate > 0
+                else np.nan
+            )
+            bucket = topn_values[count]
+            bucket["precision_at_n"].append(float(precision))
+            bucket["recall_at_n"].append(float(recall))
+            bucket["lift_vs_random"].append(float(lift))
+
+    ap_interval = _percentile_interval(ap_values, confidence_level)
+    auc_interval = _percentile_interval(auc_values, confidence_level)
+    threshold_free = {
+        "bootstrap_method": "stratified_machine_level_percentile",
+        "bootstrap_n_resamples_requested": requested,
+        "bootstrap_confidence_level": float(confidence_level),
+        "bootstrap_random_state": int(random_state),
+        "average_precision_bootstrap_valid_resamples": ap_interval["bootstrap_valid_resamples"],
+        "average_precision_bootstrap_mean": ap_interval["bootstrap_mean"],
+        "average_precision_bootstrap_standard_error": ap_interval["bootstrap_standard_error"],
+        "average_precision_ci_lower": ap_interval["ci_lower"],
+        "average_precision_ci_upper": ap_interval["ci_upper"],
+        "roc_auc_bootstrap_valid_resamples": auc_interval["bootstrap_valid_resamples"],
+        "roc_auc_bootstrap_mean": auc_interval["bootstrap_mean"],
+        "roc_auc_bootstrap_standard_error": auc_interval["bootstrap_standard_error"],
+        "roc_auc_ci_lower": auc_interval["ci_lower"],
+        "roc_auc_ci_upper": auc_interval["ci_upper"],
+    }
+
+    topk_rows: List[dict] = []
+    for rate in rates:
+        row = {
+            "top_k_rate": rate,
+            "bootstrap_method": "stratified_machine_level_percentile",
+            "bootstrap_n_resamples_requested": requested,
+            "bootstrap_confidence_level": float(confidence_level),
+            "bootstrap_random_state": int(random_state),
+        }
+        for metric, values in topk_values[rate].items():
+            interval = _percentile_interval(values, confidence_level)
+            row[f"{metric}_bootstrap_valid_resamples"] = interval["bootstrap_valid_resamples"]
+            row[f"{metric}_bootstrap_mean"] = interval["bootstrap_mean"]
+            row[f"{metric}_bootstrap_standard_error"] = interval["bootstrap_standard_error"]
+            row[f"{metric}_ci_lower"] = interval["ci_lower"]
+            row[f"{metric}_ci_upper"] = interval["ci_upper"]
+        topk_rows.append(row)
+
+    topn_rows: List[dict] = []
+    for count in counts:
+        row = {
+            "top_n_requested": count,
+            "bootstrap_method": "stratified_machine_level_percentile",
+            "bootstrap_n_resamples_requested": requested,
+            "bootstrap_confidence_level": float(confidence_level),
+            "bootstrap_random_state": int(random_state),
+        }
+        for metric, values in topn_values[count].items():
+            interval = _percentile_interval(values, confidence_level)
+            row[f"{metric}_bootstrap_valid_resamples"] = interval["bootstrap_valid_resamples"]
+            row[f"{metric}_bootstrap_mean"] = interval["bootstrap_mean"]
+            row[f"{metric}_bootstrap_standard_error"] = interval["bootstrap_standard_error"]
+            row[f"{metric}_ci_lower"] = interval["ci_lower"]
+            row[f"{metric}_ci_upper"] = interval["ci_upper"]
+        topn_rows.append(row)
+
+    return threshold_free, pd.DataFrame(topk_rows), pd.DataFrame(topn_rows)
 
 
 def dataset_feature_columns(config) -> List[str]:

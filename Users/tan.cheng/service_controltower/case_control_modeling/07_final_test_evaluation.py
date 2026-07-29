@@ -15,6 +15,7 @@ import pandas as pd
 
 import config
 from cc_utils import (
+    configured_evaluation_horizons,
     ensure_dir,
     fit_model_pipeline,
     get_evaluation_target,
@@ -35,6 +36,9 @@ DATE_COLUMNS = [
     "future_claim_date",
     "control_no_claim_start",
     "control_no_claim_end",
+    "next_claim_date_on_or_after_window_end",
+    "as_of_anchor_date",
+    "as_of_actual_next_claim_date",
 ]
 
 
@@ -59,6 +63,23 @@ def _existing_path(value) -> str | None:
 def _safe_name(text: str) -> str:
     import re
     return re.sub(r"[^A-Za-z0-9_.=-]+", "_", str(text).strip()).strip("_") or "view"
+
+
+def _evaluation_horizon_sweep() -> list[int | None]:
+    mode = str(getattr(config, "EVALUATION_TARGET_MODE", "training_target")).strip().lower()
+    if mode in {"training", "train", "target", "training_target", "original", "original_target"}:
+        return [None]
+    horizons = configured_evaluation_horizons(config)
+    if not horizons:
+        raise ValueError(
+            "EVALUATION_CLAIM_HORIZON_DAYS must contain at least one horizon when "
+            "EVALUATION_TARGET_MODE='claim_within_horizon'."
+        )
+    return [int(x) for x in horizons]
+
+
+def _horizon_slug(horizon_days: int | None) -> str:
+    return "training_target" if horizon_days is None else f"horizon_{int(horizon_days)}d"
 
 
 def _test_views(dataset_row: pd.Series) -> list[tuple[str, str]]:
@@ -193,60 +214,73 @@ def _score_test_views(dataset_row: pd.Series, model, algorithm: str, output_dir:
         validate_dataset_features(test_df, config)
         X_test = test_df[list(config.NUMERIC_FEATURES) + list(config.CATEGORICAL_FEATURES)]
         y_test_training = test_df["target"].astype(int)
-        y_test, eval_target_col, eval_target_mode, eval_horizon_days = get_evaluation_target(test_df, config)
         score = predict_score(model, X_test, algorithm)
 
-        free = threshold_free_metrics(y_test, score)
-        thresh = metrics_at_threshold(y_test, score, threshold=threshold)
-        lead_summary = future_claim_lead_time_summary(test_df, y_test)
-        metric_row = {
-            "dataset_id": dataset_id,
-            "algorithm": algorithm,
-            "evaluation_view": view_name,
-            "status": "used",
-            "test_rows": int(len(test_df)),
-            "test_training_target_positive_rows": int(y_test_training.sum()),
-            "test_positive_rows": int(y_test.sum()),
-            "test_positive_rate": float(y_test.mean()) if len(y_test) else np.nan,
-            "evaluation_target_col": eval_target_col,
-            "evaluation_target_mode": eval_target_mode,
-            "evaluation_horizon_days": eval_horizon_days,
-            "evaluation_path": path,
-        }
-        metric_row.update({f"threshold_free_{k}": v for k, v in free.items()})
-        metric_row.update({f"threshold_{str(threshold).replace('.', 'p')}_{k}": v for k, v in thresh.items()})
-        metric_row.update({f"lead_time_{k}": v for k, v in lead_summary.items()})
-        metric_rows.append(metric_row)
+        for requested_horizon in _evaluation_horizon_sweep():
+            y_test, eval_target_col, eval_target_mode, eval_horizon_days = get_evaluation_target(
+                test_df, config, horizon_days=requested_horizon
+            )
+            free = threshold_free_metrics(y_test, score)
+            thresh = metrics_at_threshold(y_test, score, threshold=threshold)
+            lead_summary = future_claim_lead_time_summary(test_df, y_test)
+            metric_row = {
+                "dataset_id": dataset_id,
+                "algorithm": algorithm,
+                "evaluation_view": view_name,
+                "status": "used",
+                "test_rows": int(len(test_df)),
+                "test_training_target_positive_rows": int(y_test_training.sum()),
+                "test_positive_rows": int(y_test.sum()),
+                "test_negative_rows": int(len(y_test) - y_test.sum()),
+                "test_positive_rate": float(y_test.mean()) if len(y_test) else np.nan,
+                "evaluation_target_col": eval_target_col,
+                "evaluation_target_mode": eval_target_mode,
+                "evaluation_horizon_days": eval_horizon_days,
+                "evaluation_path": path,
+            }
+            if "as_of_anchor_date" in test_df.columns:
+                anchors = pd.to_datetime(test_df["as_of_anchor_date"], errors="coerce").dropna().unique()
+                metric_row["as_of_anchor_date"] = (
+                    pd.Timestamp(anchors[0]).strftime("%Y-%m-%d") if len(anchors) == 1 else None
+                )
+            metric_row.update({f"threshold_free_{k}": v for k, v in free.items()})
+            metric_row.update({f"threshold_{str(threshold).replace('.', 'p')}_{k}": v for k, v in thresh.items()})
+            metric_row.update({f"lead_time_{k}": v for k, v in lead_summary.items()})
+            metric_rows.append(metric_row)
 
-        pred = test_df.copy()
-        pred.insert(0, "evaluation_target", y_test.to_numpy())
-        pred.insert(0, "evaluation_target_col", eval_target_col)
-        pred.insert(0, "evaluation_target_mode", eval_target_mode)
-        pred.insert(0, "evaluation_horizon_days", eval_horizon_days)
-        pred.insert(0, "evaluation_view", view_name)
-        pred.insert(0, "algorithm", algorithm)
-        pred.insert(0, "dataset_id", dataset_id)
-        pred = _add_prediction_columns(pred, score, threshold, top_k_rates)
-        pred = _select_output_columns(pred, include_features=include_features)
-        pred = pred.sort_values(
-            ["dataset_id", "algorithm", "evaluation_view", "score", "machine_key", "window_end"],
-            ascending=[True, True, True, False, True, True],
-            kind="mergesort",
-        )
-        pred.to_csv(output_dir / f"{dataset_id}__{algorithm}__{view_safe}__test_window_predictions.csv", index=False)
-        _select_output_columns(pred, include_features=False).to_csv(
-            output_dir / f"{dataset_id}__{algorithm}__{view_safe}__test_window_predictions_compact.csv",
-            index=False,
-        )
+            pred = test_df.copy()
+            pred.insert(0, "evaluation_target", y_test.to_numpy())
+            pred.insert(0, "evaluation_target_col", eval_target_col)
+            pred.insert(0, "evaluation_target_mode", eval_target_mode)
+            pred.insert(0, "evaluation_horizon_days", eval_horizon_days)
+            pred.insert(0, "evaluation_view", view_name)
+            pred.insert(0, "algorithm", algorithm)
+            pred.insert(0, "dataset_id", dataset_id)
+            pred = _add_prediction_columns(pred, score, threshold, top_k_rates)
+            pred = _select_output_columns(pred, include_features=include_features)
+            pred = pred.sort_values(
+                ["dataset_id", "algorithm", "evaluation_view", "score", "machine_key", "window_end"],
+                ascending=[True, True, True, False, True, True],
+                kind="mergesort",
+            )
+            horizon_slug = _horizon_slug(eval_horizon_days)
+            pred.to_csv(
+                output_dir / f"{dataset_id}__{algorithm}__{view_safe}__{horizon_slug}__test_window_predictions.csv",
+                index=False,
+            )
+            _select_output_columns(pred, include_features=False).to_csv(
+                output_dir / f"{dataset_id}__{algorithm}__{view_safe}__{horizon_slug}__test_window_predictions_compact.csv",
+                index=False,
+            )
 
-        topk = top_k_metrics(y_test, score, top_k_rates)
-        topk.insert(0, "evaluation_target_col", eval_target_col)
-        topk.insert(0, "evaluation_target_mode", eval_target_mode)
-        topk.insert(0, "evaluation_horizon_days", eval_horizon_days)
-        topk.insert(0, "evaluation_view", view_name)
-        topk.insert(0, "algorithm", algorithm)
-        topk.insert(0, "dataset_id", dataset_id)
-        topk_rows.append(topk)
+            topk = top_k_metrics(y_test, score, top_k_rates)
+            topk.insert(0, "evaluation_target_col", eval_target_col)
+            topk.insert(0, "evaluation_target_mode", eval_target_mode)
+            topk.insert(0, "evaluation_horizon_days", eval_horizon_days)
+            topk.insert(0, "evaluation_view", view_name)
+            topk.insert(0, "algorithm", algorithm)
+            topk.insert(0, "dataset_id", dataset_id)
+            topk_rows.append(topk)
     return metric_rows, topk_rows
 
 
