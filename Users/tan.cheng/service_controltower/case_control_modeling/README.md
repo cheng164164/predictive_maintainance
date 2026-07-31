@@ -5,13 +5,14 @@ This project builds machine-level case-control datasets for predictive maintenan
 - Fast `base` features and the historical `frozen` feature set.
 - Fixed machine-level train, validation, and test partitions.
 - Controlled, random, or mixed training negatives.
-- Controlled, random, or deployment-like shared-date validation/test cohorts.
+- Controlled, random, single-anchor deployment-like, or multi-anchor natural-prevalence validation/test cohorts.
 - Nested validation/test negative-to-positive ratios such as 1:1 through 5:1.
 - Bootstrap confidence intervals for ranking metrics.
 - Percentage-based Top-K and fixed-count Top-N operational metrics.
 - Fair comparison of multiple feature-window definitions on common holdout machines.
 - Actual next-claim date and days-to-claim in validation/test prediction outputs.
 - Separate ranking reports for every configured claim horizon.
+- Configurable filtering of inspection, adjustment, and routine-wear warranty claims before labels are created.
 
 There is no component-level feature mode and no 4,000-hour SMR exclusion rule.
 
@@ -49,9 +50,43 @@ The standard development workflow remains:
 python main.py
 ```
 
-`main.py` runs Steps 00 through 04 and does not score the test set. Steps 08 and 09 are intentionally separate because they include test-set sensitivity analysis.
+`main.py` runs Steps 00 through 04 and does not score the test set. Steps 08, 09, and 10 are intentionally separate because they include test-set sensitivity or deployment-style test evaluation.
 
 ## Configuration switches
+
+### Warranty claim cleaning
+
+```python
+WARRANTY_CLAIM_FILTER_MODE = "failure_focused"
+# Choices: "none" or "failure_focused"
+```
+
+The switch is applied before claim episodes, positive training cases, negative-case exclusion windows, validation/test labels, and next-claim timing are built. Therefore, the same cleaned claim definition is used consistently throughout the pipeline.
+
+`failure_focused` removes the following claim categories by default:
+
+- `Inspection Claim KF`: inspection or check activity.
+- `Policy Adjustment Claim`: policy/administrative adjustment.
+- `Commercial Adjustment Policy Claim`: commercial adjustment.
+- `Replacement Undercarriage`: routine wear-component replacement.
+
+It retains Standard Warranty, Advantage, Parts & Components, Product, and Remanufactured Components claims. Missing critical-part numbers are retained unless the separate `KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS` setting is explicitly enabled.
+
+Step 01 writes:
+
+```text
+output/01_claim_episodes/cleaned_warranty_claims.csv
+output/01_claim_episodes/warranty_claim_filter_audit.csv
+output/01_claim_episodes/warranty_claim_filter_summary.csv
+```
+
+The audit preserves every original claim row, whether it was retained, and the filtering reason. Fixed machine split assignments are stratified using raw date-eligible warranty claim history so changing this cleaning switch does not silently move machines between train, validation, and test. Holdout row locks and dataset folders are separated by claim-filter mode.
+
+To reproduce the unfiltered historical behavior:
+
+```python
+WARRANTY_CLAIM_FILTER_MODE = "none"
+```
 
 ### Feature set
 
@@ -369,6 +404,59 @@ Step 09 groups predictions by algorithm, split, requested ratio, and evaluation 
 
 This is the preferred table for selecting among 90-to-30, 90-to-7, and 90-to-1 designs.
 
+## Multi-anchor natural-prevalence fleet evaluation
+
+The additional deployment-style method is run with:
+
+```bash
+python 10_multi_anchor_fleet_evaluation.py
+```
+
+It is controlled independently from `HOLDOUT_NEGATIVE_SAMPLING_MODE`:
+
+```python
+MULTI_ANCHOR_FLEET_ENABLED = True
+
+# Leave empty for deterministic automatic selection.
+MULTI_ANCHOR_FLEET_VALIDATION_DATES = []
+MULTI_ANCHOR_FLEET_TEST_DATES = []
+
+MULTI_ANCHOR_FLEET_VALIDATION_ANCHOR_COUNT = 3
+MULTI_ANCHOR_FLEET_TEST_ANCHOR_COUNT = 2
+MULTI_ANCHOR_FLEET_MIN_POSITIVE_MACHINES = 5
+MULTI_ANCHOR_FLEET_MIN_ELIGIBLE_MACHINES = 50
+MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS = 60
+```
+
+For every selected anchor:
+
+- Every eligible machine in the fixed validation or test machine split receives one snapshot.
+- All machines share the same `window_end` and calendar feature interval.
+- The natural fleet prevalence is retained; negatives are not downsampled to a requested ratio.
+- Validation anchors come from the earlier feasible period and test anchors from the later feasible period.
+- The anchor must have complete observable follow-up for the largest configured claim horizon.
+- Rankings are calculated independently within each anchor date.
+- The same scored snapshots are relabeled for every value in `EVALUATION_CLAIM_HORIZON_DAYS`.
+
+Physical machines remain disjoint across train, validation, and test. A validation or test machine may appear at several anchors within its own split because deployment repeatedly rescoring the same installed machine is an intended use case. Each row has a unique `snapshot_id`.
+
+Important Step 10 outputs include:
+
+```text
+multi_anchor_metrics_by_anchor.csv
+multi_anchor_metrics_across_anchors.csv
+multi_anchor_percentage_top_k_by_anchor.csv
+multi_anchor_fixed_top_n_by_anchor.csv
+multi_anchor_top_selection_claim_timing.csv
+multi_anchor_top_selection_across_anchors.csv
+multi_anchor_top_n_machine_claim_details.csv
+multi_anchor_score_decile_claim_rates.csv
+```
+
+`multi_anchor_top_n_machine_claim_details.csv` contains the model score, within-anchor rank, actual next claim date, days to next claim, and all horizon labels for every selected Top-N machine. This is the most direct file for reviewing whether the highest-ranked machines experienced near-future claims.
+
+`MULTI_ANCHOR_FLEET_MAX_MACHINES_PER_ANCHOR` should remain `None` for the production evaluation. A positive value is only a smoke-test cap; all positives are retained first and deterministic negatives fill the remaining slots.
+
 ## Recommended model-selection practice
 
 - Use validation results to select a feature window and model design.
@@ -405,6 +493,7 @@ project_root/
         07_final_test_evaluation.py
         08_holdout_ratio_sensitivity.py
         09_compare_window_designs.py
+        10_multi_anchor_fleet_evaluation.py
         main.py
 ```
 
@@ -433,4 +522,84 @@ The regression suite covers:
 - Deterministic bootstrap confidence intervals.
 - Base and frozen feature behavior.
 - Dynamic future-claim horizon labels.
+- Multi-anchor natural-prevalence fleet snapshots with complete future follow-up.
+- Unique snapshot IDs with repeated rescoring allowed only inside one machine split.
 - Removal of the 4,000-hour SMR filter.
+
+## Exact validation/test prevalence separately for each claim horizon
+
+The project now supports two different horizon-ratio evaluation behaviors through one switch:
+
+```python
+EVALUATION_TARGET_MODE = "claim_within_horizon"
+EVALUATION_CLAIM_HORIZON_DAYS = [30, 60, 90, 180]
+
+HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS = [1, 2, 3, 4, 5]
+HOLDOUT_HORIZON_RATIO_MODE = "horizon_specific_random"
+```
+
+### Recommended: `horizon_specific_random`
+
+For every validation/test split and every configured horizon, Step 02:
+
+- Starts from the fixed outcome-independent machine snapshot cohort.
+- Recomputes the true future-claim label for that horizon.
+- Deterministically randomizes positive and negative machines separately.
+- Keeps one fixed positive set for all ratios within that horizon.
+- Creates nested 1:1, 2:1, 3:1, 4:1, and 5:1 cohorts by adding negatives.
+- Guarantees that the requested and actual negative-to-positive ratios are identical.
+- Allows samples to differ between horizons because the positive-class definition changes.
+
+The generated index is:
+
+```text
+output/02_case_control_datasets/<dataset_id>/horizon_specific_random_ratio_index.csv
+```
+
+Each horizon-ratio dataset is also saved separately, for example:
+
+```text
+case_control_validation_horizon_30d_ratio_5_to_1.csv
+case_control_test_horizon_90d_ratio_3_to_1.csv
+```
+
+Step 08 reads this index automatically and writes separate results for each horizon and ratio:
+
+```bash
+python 01_build_claim_episodes.py
+python 02_build_case_control_dataset.py
+python 08_holdout_ratio_sensitivity.py
+```
+
+Primary outputs include:
+
+```text
+holdout_ratio_metrics_all_datasets.csv
+holdout_ratio_top_k_all_datasets.csv
+holdout_ratio_fixed_top_n_all_datasets.csv
+holdout_ratio_sensitivity_for_review.csv
+validation_percentage_top_k_with_confidence_intervals.csv
+test_percentage_top_k_with_confidence_intervals.csv
+validation_fixed_top_n_with_confidence_intervals.csv
+test_fixed_top_n_with_confidence_intervals.csv
+```
+
+Machine prediction files retain the actual next claim date and days from `window_end` to that claim.
+
+### Backward-compatible: `reuse_same_rows`
+
+```python
+HOLDOUT_HORIZON_RATIO_MODE = "reuse_same_rows"
+```
+
+This reuses the same holdout machines for all horizons and only changes their labels. The realized class ratio is therefore allowed to change as the horizon grows. This option is useful when the goal is to compare horizons on exactly the same machines, but it is not appropriate when an exact prevalence ratio is required at every horizon.
+
+### Interpretation
+
+Within one horizon, the ratio cohorts are directly comparable because:
+
+- The same model is used.
+- The same positive machines are used.
+- Larger ratios only append negatives.
+
+Across different horizons, the cohorts may contain different machines. That is intentional: a machine can be negative at 30 days and positive at 90 days, so enforcing the same class-balanced cohort across horizons would conflict with the requested exact ratio.

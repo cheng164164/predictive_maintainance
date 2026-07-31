@@ -137,7 +137,112 @@ def _filter_event_dates(
 # -----------------------------------------------------------------------------
 # Source loading
 # -----------------------------------------------------------------------------
-def load_warranty(config) -> pd.DataFrame:
+def normalize_warranty_claim_filter_mode(value) -> str:
+    """Normalize the warranty-label cleaning mode used by all modeling steps."""
+    mode = str(value).strip().lower()
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "raw": "none",
+        "all": "none",
+        "failure_focused": "failure_focused",
+        "failure-focused": "failure_focused",
+        "failure": "failure_focused",
+        "clean": "failure_focused",
+        "cleaned": "failure_focused",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"Unsupported WARRANTY_CLAIM_FILTER_MODE={value!r}. "
+            "Use 'none' or 'failure_focused'."
+        )
+    return aliases[mode]
+
+
+def apply_warranty_claim_filter(
+    warranty: pd.DataFrame,
+    config,
+    mode: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply transparent claim-label cleaning and return filtered rows plus audit.
+
+    The failure-focused mode is intentionally conservative. It removes claim
+    categories that are explicitly inspection/adjustment/routine-wear oriented,
+    while retaining Standard Warranty, Advantage, Parts & Components, Product,
+    and Remanufactured Components claims. Missing critical-part numbers are not
+    removed unless KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS is separately enabled.
+    """
+    out = warranty.copy()
+    selected_mode = normalize_warranty_claim_filter_mode(
+        getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none") if mode is None else mode
+    )
+    claim_type = out.get(
+        "claim_type_description", pd.Series("", index=out.index, dtype=object)
+    ).fillna("").astype(str).str.strip()
+
+    keep = pd.Series(True, index=out.index, dtype=bool)
+    reason = pd.Series("kept", index=out.index, dtype=object)
+
+    if selected_mode == "failure_focused":
+        excluded = getattr(
+            config,
+            "WARRANTY_FAILURE_FOCUSED_EXCLUDED_CLAIM_TYPES",
+            {
+                "Inspection Claim KF": "inspection_or_check",
+                "Policy Adjustment Claim": "policy_adjustment",
+                "Commercial Adjustment Policy Claim": "commercial_adjustment",
+                "Replacement Undercarriage": "routine_wear_component_replacement",
+            },
+        )
+        if isinstance(excluded, Mapping):
+            excluded_map = {str(k).strip().lower(): str(v) for k, v in excluded.items()}
+        else:
+            excluded_map = {str(x).strip().lower(): "excluded_minor_claim_type" for x in excluded}
+        normalized_type = claim_type.str.lower()
+        excluded_mask = normalized_type.isin(excluded_map)
+        keep.loc[excluded_mask] = False
+        reason.loc[excluded_mask] = normalized_type.loc[excluded_mask].map(excluded_map)
+
+    if bool(getattr(config, "KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS", False)):
+        valid_part = out.get(
+            "has_valid_critical_part", pd.Series(False, index=out.index, dtype=bool)
+        ).fillna(False).astype(bool)
+        newly_removed = keep & ~valid_part
+        keep.loc[newly_removed] = False
+        reason.loc[newly_removed] = "missing_or_invalid_critical_part"
+
+    out["warranty_claim_filter_mode"] = selected_mode
+    out["warranty_claim_filter_keep"] = keep.astype(int)
+    out["warranty_claim_filter_reason"] = reason
+
+    audit_cols = [
+        c
+        for c in [
+            "machine_key",
+            "machine_id",
+            "claim_number",
+            "claim_date",
+            "local_date",
+            "claim_type_description",
+            "critical_fail_part_number",
+            "failure_smr",
+            "has_valid_critical_part",
+            "warranty_claim_filter_mode",
+            "warranty_claim_filter_keep",
+            "warranty_claim_filter_reason",
+        ]
+        if c in out.columns
+    ]
+    audit = out[audit_cols].copy()
+    filtered = out.loc[keep].copy().reset_index(drop=True)
+    return filtered, audit.reset_index(drop=True)
+
+
+def load_warranty(
+    config,
+    apply_filter: bool = True,
+    return_filter_audit: bool = False,
+):
     path = resolve_source_file(config.SOURCE_DIR, config.WARRANTY_FILE_CANDIDATES)
     cols = [
         "machine_id", "claim_number", "local_date", "claim_type_description",
@@ -159,9 +264,41 @@ def load_warranty(config) -> pd.DataFrame:
     )
     invalid = set(str(x).strip().lower() for x in getattr(config, "INVALID_CRITICAL_PART_VALUES", set()))
     df["has_valid_critical_part"] = ~df["critical_fail_part_number_clean"].isin(invalid)
-    if bool(getattr(config, "KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS", False)):
-        df = df[df["has_valid_critical_part"]].copy()
-    return df.reset_index(drop=True)
+
+    if apply_filter:
+        filtered, audit = apply_warranty_claim_filter(df, config)
+    else:
+        # True raw view used only for stable split stratification and diagnostics.
+        # It intentionally bypasses both the claim-type filter and the optional
+        # valid-critical-part requirement.
+        raw = df.copy()
+        raw["warranty_claim_filter_mode"] = "raw_unfiltered"
+        raw["warranty_claim_filter_keep"] = 1
+        raw["warranty_claim_filter_reason"] = "kept_raw_for_split_stratification"
+        audit_cols = [
+            c
+            for c in [
+                "machine_key",
+                "machine_id",
+                "claim_number",
+                "claim_date",
+                "local_date",
+                "claim_type_description",
+                "critical_fail_part_number",
+                "failure_smr",
+                "has_valid_critical_part",
+                "warranty_claim_filter_mode",
+                "warranty_claim_filter_keep",
+                "warranty_claim_filter_reason",
+            ]
+            if c in raw.columns
+        ]
+        filtered = raw.reset_index(drop=True)
+        audit = raw[audit_cols].copy().reset_index(drop=True)
+
+    if return_filter_audit:
+        return filtered, audit
+    return filtered
 
 
 def load_fault_codes(config) -> pd.DataFrame:
@@ -587,6 +724,19 @@ def configured_evaluation_horizons(config) -> List[int]:
     return sorted(set(horizons))
 
 
+def configured_multi_anchor_evaluation_horizons(config) -> List[int]:
+    """Return horizons used specifically by Step 10 anchor-fleet evaluation.
+
+    An explicit MULTI_ANCHOR_FLEET_EVALUATION_HORIZONS list decouples the
+    deployment-style fleet report from the ratio-sampled holdout experiment.
+    Empty or missing values fall back to EVALUATION_CLAIM_HORIZON_DAYS.
+    """
+    explicit = _clean_horizon_days(
+        getattr(config, "MULTI_ANCHOR_FLEET_EVALUATION_HORIZONS", None)
+    )
+    return sorted(set(explicit or configured_evaluation_horizons(config)))
+
+
 def future_claim_target_col(horizon_days: int) -> str:
     return f"eval_target_claim_within_next_{int(horizon_days)}d"
 
@@ -829,9 +979,13 @@ def controls_per_positive(config) -> int:
 
 def window_dataset_id(window_config: Mapping, config) -> str:
     lead_label = window_config_name(window_config)
+    claim_filter_mode = normalize_warranty_claim_filter_mode(
+        getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+    )
     base = (
         f"{lead_label}__neg_{negative_sampling_mode(config)}_"
         f"{negatives_per_positive(config)}__features_{str(config.FEATURE_SET).lower()}"
+        f"__claims_{claim_filter_mode}"
     )
     return re.sub(r"[^A-Za-z0-9_.=-]+", "_", base)
 
@@ -2786,11 +2940,16 @@ def _as_of_anchor_candidate_dates(
     episodes: pd.DataFrame,
     window_config: Mapping,
     config,
+    followup_days_override: Optional[int] = None,
 ) -> list[pd.Timestamp]:
     """Return deterministic daily anchor candidates near observed claim dates."""
     lead_min = int(window_config["lead_min_days"])
     observation_days = int(window_config["lead_max_days"]) - lead_min
-    followup_days = _as_of_anchor_followup_days(window_config, config)
+    followup_days = (
+        int(followup_days_override)
+        if followup_days_override is not None
+        else _as_of_anchor_followup_days(window_config, config)
+    )
     include_cutoff = bool(getattr(config, "EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END", True))
 
     claim_dates = pd.to_datetime(episodes.get("claim_date"), errors="coerce").dropna().drop_duplicates()
@@ -3192,14 +3351,17 @@ def select_multi_anchor_fleet_dates(
     size, and minimum positive count. Validation dates are selected from the
     earlier feasible period and test dates from the later feasible period.
     """
-    candidate_dates = _as_of_anchor_candidate_dates(episodes, window_config, config)
-    # Multi-anchor evaluation always reports every configured future-claim
-    # horizon, even when the main case-control evaluation mode is
-    # training_target. Therefore anchor eligibility must use the largest
-    # configured horizon rather than only lead_min_days.
-    configured_horizons = configured_evaluation_horizons(config)
+    # Multi-anchor evaluation has its own horizon list. Anchor eligibility must
+    # provide complete future follow-up through the largest configured value.
+    configured_horizons = configured_multi_anchor_evaluation_horizons(config)
     required_followup_days = max(
         [int(window_config["lead_min_days"]), *[int(x) for x in configured_horizons]]
+    )
+    candidate_dates = _as_of_anchor_candidate_dates(
+        episodes,
+        window_config,
+        config,
+        followup_days_override=required_followup_days,
     )
     latest_complete_anchor = _max_claim_observation_date(config) - pd.Timedelta(
         days=required_followup_days
@@ -3642,6 +3804,138 @@ def random_holdout_ratio_subset(
         split_name=split_name,
         negative_to_positive_ratio=negative_to_positive_ratio,
     )
+
+
+def build_horizon_specific_random_ratio_subsets(
+    evaluation_df: pd.DataFrame,
+    split_name: str,
+    horizon_days: int,
+    ratios: Sequence[int],
+    config,
+    random_state: Optional[int] = None,
+) -> Tuple[Dict[int, pd.DataFrame], dict]:
+    """Build exact, nested random ratio cohorts for one future-claim horizon.
+
+    The candidate rows are fixed machine snapshots with outcome-independent
+    feature windows. Truth is derived for ``horizon_days`` first. Positives and
+    negatives are then independently ranked by a stable hash. The same positive
+    machines are retained for every requested ratio, while larger ratios only
+    append lower-ranked negatives. This makes the requested prevalence exact at
+    each horizon without changing rows within that horizon across experiment runs.
+    """
+    cleaned_ratios = sorted({int(x) for x in ratios})
+    if not cleaned_ratios or any(x < 1 for x in cleaned_ratios):
+        raise ValueError("ratios must contain one or more integers >= 1.")
+    horizon = int(horizon_days)
+    if horizon < 1:
+        raise ValueError("horizon_days must be >= 1.")
+    split = str(split_name)
+    sub = evaluation_df[evaluation_df["split"].astype(str).eq(split)].copy()
+    if sub.empty:
+        raise ValueError(f"No candidate rows are available for split {split!r}.")
+    if "machine_key" not in sub.columns:
+        raise ValueError("Horizon ratio candidates must contain machine_key.")
+    if sub["machine_key"].astype(str).duplicated().any():
+        raise ValueError(
+            "Horizon-specific ratio sampling requires at most one row per machine "
+            f"within split {split!r}."
+        )
+
+    y_eval, target_col, target_mode, resolved_horizon = get_evaluation_target(
+        sub, config, horizon_days=horizon
+    )
+    if target_mode != "claim_within_horizon":
+        raise ValueError(
+            "Horizon-specific ratio sampling requires "
+            "EVALUATION_TARGET_MODE='claim_within_horizon'."
+        )
+    sub["target"] = y_eval.to_numpy(dtype=int)
+    sub["horizon_ratio_target_col"] = target_col
+    sub["horizon_ratio_evaluation_horizon_days"] = int(resolved_horizon)
+
+    seed = int(
+        getattr(config, "HOLDOUT_RANDOM_STATE", 42)
+        if random_state is None
+        else random_state
+    )
+    scope = f"horizon_specific_random|{split}|{horizon}"
+    sub["_horizon_ratio_hash"] = sub["machine_key"].astype(str).map(
+        lambda machine: _stable_hash_int(f"{scope}|{machine}", seed)
+    )
+    positives = sub[sub["target"].eq(1)].sort_values(
+        ["_horizon_ratio_hash", "machine_key"], kind="mergesort"
+    ).copy()
+    negatives = sub[sub["target"].eq(0)].sort_values(
+        ["_horizon_ratio_hash", "machine_key"], kind="mergesort"
+    ).copy()
+    max_ratio = int(max(cleaned_ratios))
+    selected_positive_count = min(len(positives), len(negatives) // max_ratio)
+    if selected_positive_count < 1:
+        raise ValueError(
+            f"Split {split!r}, horizon {horizon}d has {len(positives)} positives "
+            f"and {len(negatives)} negatives; ratio {max_ratio}:1 is not feasible."
+        )
+
+    selected_pos = positives.head(selected_positive_count).copy()
+    selected_neg = negatives.head(selected_positive_count * max_ratio).copy()
+    selected_pos["horizon_ratio_positive_rank"] = np.arange(1, len(selected_pos) + 1)
+    selected_pos["horizon_ratio_negative_rank"] = np.nan
+    selected_neg["horizon_ratio_positive_rank"] = np.nan
+    selected_neg["horizon_ratio_negative_rank"] = np.arange(1, len(selected_neg) + 1)
+    for frame in [selected_pos, selected_neg]:
+        frame["horizon_ratio_sampling_design"] = (
+            "fixed_random_machine_level_exact_ratio_per_horizon"
+        )
+        frame["horizon_ratio_random_state"] = seed
+        frame["horizon_ratio_max_negative_to_positive_ratio"] = max_ratio
+
+    subsets: Dict[int, pd.DataFrame] = {}
+    selected_positive_keys = set(selected_pos["machine_key"].astype(str))
+    for ratio in cleaned_ratios:
+        ratio_neg = selected_neg[
+            pd.to_numeric(
+                selected_neg["horizon_ratio_negative_rank"], errors="coerce"
+            ).le(selected_positive_count * int(ratio))
+        ].copy()
+        out = pd.concat([selected_pos, ratio_neg], ignore_index=True, sort=False)
+        out["holdout_negative_to_positive_ratio_requested"] = int(ratio)
+        out["holdout_positive_rows_in_ratio_dataset"] = selected_positive_count
+        out["holdout_negative_rows_in_ratio_dataset"] = selected_positive_count * int(ratio)
+        out["holdout_nested_negative_rule"] = (
+            "same horizon-specific positives; negatives with rank <= ratio * positive_count"
+        )
+        out = out.drop(columns=["_horizon_ratio_hash"], errors="ignore")
+        out = out.sort_values(
+            ["target", "machine_key"], ascending=[False, True], kind="mergesort"
+        ).reset_index(drop=True)
+        if out["machine_key"].astype(str).duplicated().any():
+            raise ValueError("A machine appears more than once in a horizon ratio cohort.")
+        actual_pos = int(out["target"].eq(1).sum())
+        actual_neg = int(out["target"].eq(0).sum())
+        if actual_neg != actual_pos * int(ratio):
+            raise ValueError(
+                f"Horizon {horizon}d ratio {ratio}:1 produced "
+                f"{actual_pos} positives and {actual_neg} negatives."
+            )
+        if set(out.loc[out["target"].eq(1), "machine_key"].astype(str)) != selected_positive_keys:
+            raise ValueError("Positive machines changed across nested horizon ratio cohorts.")
+        subsets[int(ratio)] = out
+
+    summary = {
+        "split": split,
+        "evaluation_horizon_days": horizon,
+        "evaluation_target_col": target_col,
+        "candidate_rows": int(len(sub)),
+        "candidate_positive_rows": int(len(positives)),
+        "candidate_negative_rows": int(len(negatives)),
+        "selected_positive_rows": int(selected_positive_count),
+        "selected_negative_rows_at_max_ratio": int(selected_positive_count * max_ratio),
+        "max_negative_to_positive_ratio": max_ratio,
+        "random_state": seed,
+        "sampling_design": "fixed_random_machine_level_exact_ratio_per_horizon",
+    }
+    return subsets, summary
+
 
 def _max_claim_observation_date(config) -> pd.Timestamp:
     for attr in ["MAX_CLAIM_DATE", "MAX_VALID_EVENT_DATE"]:

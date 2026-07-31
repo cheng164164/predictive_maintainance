@@ -1,0 +1,23 @@
+project_root/
+  enriched_data/
+    fault_codes.csv
+    fluid_samples.csv
+    maintenance.csv
+    operation.csv
+    warranty.csv
+    Physical Failure Events.csv
+  rolling_origin_model/
+    00_validate_configuration.py
+    00_prepare_operation_cache.py
+    01_build_snapshot_dataset.py
+    02_run_smoke_validation.py
+    03_train_final_xgboost.py
+    04_score_latest.py
+    10_multi_anchor_fleet_evaluation.py
+    11_compare_target_sources.py
+    config.py
+    modeling_utils.py
+    snapshot_builder.py
+    target_events.py
+    run_all.py
+    requirements.txt

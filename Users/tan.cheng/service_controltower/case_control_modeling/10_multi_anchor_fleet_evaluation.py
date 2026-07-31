@@ -28,7 +28,7 @@ from cc_utils import (
     build_machine_master,
     build_multi_anchor_fleet_base_rows,
     build_window_features,
-    configured_evaluation_horizons,
+    configured_multi_anchor_evaluation_horizons,
     ensure_dir,
     fit_model_pipeline,
     future_claim_target_col,
@@ -114,9 +114,12 @@ def _bootstrap_seed(*parts: object) -> int:
 
 
 def _configured_horizons() -> list[int]:
-    horizons = configured_evaluation_horizons(config)
+    horizons = configured_multi_anchor_evaluation_horizons(config)
     if not horizons:
-        raise ValueError("EVALUATION_CLAIM_HORIZON_DAYS must contain at least one positive horizon.")
+        raise ValueError(
+            "MULTI_ANCHOR_FLEET_EVALUATION_HORIZONS or "
+            "EVALUATION_CLAIM_HORIZON_DAYS must contain at least one horizon."
+        )
     return [int(x) for x in horizons]
 
 
@@ -416,6 +419,37 @@ def _evaluate_scored_snapshots(
     return metrics, topk_all, topn_all, timing, details, deciles, aggregate
 
 
+def _add_horizon_trend_columns(
+    frame: pd.DataFrame,
+    group_columns: list[str],
+    value_columns: list[str],
+) -> pd.DataFrame:
+    """Add prior-horizon and delta columns for stakeholder trend review."""
+    if frame is None or frame.empty:
+        return pd.DataFrame() if frame is None else frame.copy()
+    out = frame.copy()
+    out["evaluation_horizon_days"] = pd.to_numeric(
+        out["evaluation_horizon_days"], errors="coerce"
+    )
+    out = out.sort_values(
+        [*group_columns, "evaluation_horizon_days"], kind="mergesort"
+    ).reset_index(drop=True)
+    grouped = out.groupby(group_columns, dropna=False, sort=False)
+    out["previous_evaluation_horizon_days"] = grouped[
+        "evaluation_horizon_days"
+    ].shift(1)
+    for column in value_columns:
+        if column not in out.columns:
+            continue
+        numeric = pd.to_numeric(out[column], errors="coerce")
+        out[column] = numeric
+        out[f"previous_{column}"] = grouped[column].shift(1)
+        out[f"change_from_previous_horizon_{column}"] = (
+            out[column] - out[f"previous_{column}"]
+        )
+    return out
+
+
 def run(
     dataset_index_path: str | Path | None = None,
     step_dir: str | Path | None = None,
@@ -556,6 +590,47 @@ def run(
             aggregate_selection_rows.append(row)
     selection_across_anchors = pd.DataFrame(aggregate_selection_rows)
 
+    metrics_across = concat(all_aggregate)
+    horizon_metric_trend = _add_horizon_trend_columns(
+        metrics_across,
+        ["dataset_id", "algorithm", "split"],
+        [
+            "mean_positive_rate",
+            "mean_average_precision",
+            "median_average_precision",
+            "mean_roc_auc",
+            "median_roc_auc",
+        ],
+    )
+    horizon_top_k_trend = _add_horizon_trend_columns(
+        selection_across_anchors[
+            selection_across_anchors.get("selection_type", pd.Series(dtype=str)).eq("percentage_top_k")
+        ].copy(),
+        ["dataset_id", "algorithm", "split", "selection_type", "selection_value"],
+        [
+            "total_positive_machine_snapshots",
+            "total_true_positive_machine_snapshots",
+            "micro_precision",
+            "micro_recall",
+            "natural_positive_rate",
+            "micro_lift_vs_fleet",
+        ],
+    )
+    horizon_top_n_trend = _add_horizon_trend_columns(
+        selection_across_anchors[
+            selection_across_anchors.get("selection_type", pd.Series(dtype=str)).eq("fixed_top_n")
+        ].copy(),
+        ["dataset_id", "algorithm", "split", "selection_type", "selection_value"],
+        [
+            "total_positive_machine_snapshots",
+            "total_true_positive_machine_snapshots",
+            "micro_precision",
+            "micro_recall",
+            "natural_positive_rate",
+            "micro_lift_vs_fleet",
+        ],
+    )
+
     outputs = {
         "multi_anchor_metrics_by_anchor.csv": concat(all_metrics),
         "multi_anchor_percentage_top_k_by_anchor.csv": concat(all_topk),
@@ -564,7 +639,10 @@ def run(
         "multi_anchor_top_selection_across_anchors.csv": selection_across_anchors,
         "multi_anchor_top_n_machine_claim_details.csv": concat(all_details),
         "multi_anchor_score_decile_claim_rates.csv": concat(all_deciles),
-        "multi_anchor_metrics_across_anchors.csv": concat(all_aggregate),
+        "multi_anchor_metrics_across_anchors.csv": metrics_across,
+        "multi_anchor_horizon_trend_metrics.csv": horizon_metric_trend,
+        "multi_anchor_horizon_trend_top_k.csv": horizon_top_k_trend,
+        "multi_anchor_horizon_trend_top_n.csv": horizon_top_n_trend,
     }
     for filename, frame in outputs.items():
         frame.to_csv(output_dir / filename, index=False)
@@ -575,6 +653,9 @@ def run(
             "strategy": "fixed earlier validation anchors and later test anchors; all eligible machines; natural prevalence",
             "output_dir": str(output_dir),
             "evaluation_horizons": _configured_horizons(),
+            "warranty_claim_filter_mode": str(
+                getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+            ),
             "top_k_rates": _top_k_rates(),
             "top_n_counts": _top_n_counts(),
             "bootstrap_enabled": _bootstrap_enabled(),

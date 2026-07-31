@@ -4,9 +4,9 @@ The model is fitted once on the fixed training dataset. It is then scored on the
 nested fixed holdout cohorts created by Step 02, for example 1:1 through 5:1.
 Because every holdout row represents a different physical machine, row-level
 Top-K metrics are also machine-level Top-K metrics. When claim-within-horizon
-evaluation is active, the same fixed rows and scores are relabeled and reported
-separately for every configured horizon. Prediction files retain the actual next
-claim date and days from window_end to that claim.
+evaluation is active, the script supports either backward-compatible relabeling
+of the same rows or exact horizon-specific random prevalence cohorts. Prediction
+files retain the actual next claim date and days from window_end to that claim.
 
 This script intentionally scores the test ratio cohorts. Use it for prevalence
 sensitivity analysis after the model/data design is reasonably stable; do not use
@@ -79,6 +79,34 @@ def _load_dataset_index(dataset_index_path: str | Path | None = None) -> pd.Data
     return pd.read_csv(path, low_memory=False)
 
 
+def _horizon_ratio_mode() -> str:
+    mode = str(
+        getattr(config, "HOLDOUT_HORIZON_RATIO_MODE", "reuse_same_rows")
+    ).strip().lower()
+    aliases = {
+        "reuse": "reuse_same_rows",
+        "same_rows": "reuse_same_rows",
+        "reuse_same_rows": "reuse_same_rows",
+        "horizon_specific": "horizon_specific_random",
+        "per_horizon_random": "horizon_specific_random",
+        "horizon_specific_random": "horizon_specific_random",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            "HOLDOUT_HORIZON_RATIO_MODE must be 'reuse_same_rows' or "
+            "'horizon_specific_random'."
+        )
+    return aliases[mode]
+
+
+def _claim_horizon_mode_active() -> bool:
+    mode = str(getattr(config, "EVALUATION_TARGET_MODE", "training_target")).strip().lower()
+    return mode in {
+        "claim_within_horizon", "future_claim_horizon", "relaxed",
+        "relaxed_future_claim",
+    }
+
+
 def _load_ratio_index(dataset_row: pd.Series) -> pd.DataFrame:
     value = dataset_row.get("holdout_ratio_index_path")
     if value is None or pd.isna(value) or not str(value).strip():
@@ -108,6 +136,34 @@ def _load_ratio_index(dataset_row: pd.Series) -> pd.DataFrame:
     return ratio_index.sort_values(
         ["split", "negative_to_positive_ratio_requested"], kind="mergesort"
     ).reset_index(drop=True)
+
+def _load_horizon_ratio_index(dataset_row: pd.Series) -> pd.DataFrame:
+    value = dataset_row.get("horizon_specific_ratio_index_path")
+    if value is None or pd.isna(value) or not str(value).strip():
+        raise ValueError(
+            "Dataset index does not contain horizon_specific_ratio_index_path. "
+            "Re-run Step 02 with HOLDOUT_HORIZON_RATIO_MODE="
+            "'horizon_specific_random' and claim-within-horizon evaluation enabled."
+        )
+    path = Path(str(value))
+    if not path.exists():
+        raise FileNotFoundError(f"Horizon-specific ratio index not found: {path}")
+    index = pd.read_csv(path, low_memory=False)
+    required = {
+        "split", "evaluation_horizon_days",
+        "negative_to_positive_ratio_requested", "positive_rows",
+        "negative_rows", "dataset_path",
+    }
+    missing = sorted(required - set(index.columns))
+    if missing:
+        raise ValueError(f"Horizon-specific ratio index is missing columns: {missing}")
+    for col in ["evaluation_horizon_days", "negative_to_positive_ratio_requested"]:
+        index[col] = pd.to_numeric(index[col], errors="raise").astype(int)
+    return index.sort_values(
+        ["split", "evaluation_horizon_days", "negative_to_positive_ratio_requested"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
 
 def _top_k_rates() -> list[float]:
     values = getattr(config, "VALIDATION_TOP_K_RATES", [0.01, 0.05, 0.10, 0.20])
@@ -489,9 +545,13 @@ def _run_one_dataset(
     dataset_id = str(dataset_row["dataset_id"])
     train_df = _read_dataset(dataset_row["training_dataset_path"])
     validate_dataset_features(train_df, config)
-    ratio_index = _load_ratio_index(dataset_row)
+    base_ratio_index = _load_ratio_index(dataset_row)
+    if _claim_horizon_mode_active() and _horizon_ratio_mode() == "horizon_specific_random":
+        evaluation_index = _load_horizon_ratio_index(dataset_row)
+    else:
+        evaluation_index = base_ratio_index
 
-    validation_rows = ratio_index[ratio_index["split"].eq("validation")]
+    validation_rows = base_ratio_index[base_ratio_index["split"].eq("validation")]
     if validation_rows.empty:
         raise ValueError("Holdout ratio index has no validation datasets.")
     reference = validation_rows.sort_values(
@@ -538,7 +598,7 @@ def _run_one_dataset(
             ),
         )
 
-        for _, ratio_row in ratio_index.iterrows():
+        for _, ratio_row in evaluation_index.iterrows():
             split_name = str(ratio_row["split"])
             ratio = int(ratio_row["negative_to_positive_ratio_requested"])
             holdout_mode = str(
@@ -550,11 +610,21 @@ def _run_one_dataset(
             eval_df = _read_dataset(ratio_row["dataset_path"])
             validate_dataset_features(eval_df, config)
             X_eval = eval_df[feature_cols]
-            # Scores depend only on the machine features, so compute them once and
-            # reuse them while the same fixed cohort is relabeled by horizon.
+            # Scores depend only on machine features. Horizon-specific ratio files
+            # already contain one fixed cohort for one horizon, while the legacy
+            # mode reuses the same scored rows across the full horizon sweep.
             score = predict_score(model, X_eval, algorithm)
+            row_horizon = pd.to_numeric(
+                pd.Series([ratio_row.get("evaluation_horizon_days")]),
+                errors="coerce",
+            ).iloc[0]
+            requested_horizons = (
+                [int(row_horizon)]
+                if pd.notna(row_horizon)
+                else _evaluation_horizon_sweep()
+            )
 
-            for requested_horizon in _evaluation_horizon_sweep():
+            for requested_horizon in requested_horizons:
                 y_eval, target_col, target_mode, horizon_days = get_evaluation_target(
                     eval_df, config, horizon_days=requested_horizon
                 )
@@ -599,6 +669,7 @@ def _run_one_dataset(
                     "status": "used",
                     "split": split_name,
                     "holdout_negative_sampling_mode": holdout_mode,
+                    "holdout_horizon_ratio_mode": _horizon_ratio_mode(),
                     "negative_to_positive_ratio_requested": ratio,
                     "design_positive_rows": int(
                         pd.to_numeric(eval_df["target"], errors="coerce").fillna(0).eq(1).sum()
@@ -688,9 +759,10 @@ def _run_one_dataset(
                     reference["negative_to_positive_ratio_requested"]
                 ),
                 "ratios_scored": sorted(
-                    ratio_index["negative_to_positive_ratio_requested"].unique().tolist()
+                    evaluation_index["negative_to_positive_ratio_requested"].unique().tolist()
                 ),
-                "splits_scored": sorted(ratio_index["split"].unique().tolist()),
+                "splits_scored": sorted(evaluation_index["split"].unique().tolist()),
+                "horizon_ratio_mode": _horizon_ratio_mode(),
                 "bootstrap_enabled": _bootstrap_enabled(),
                 "bootstrap_n_resamples": (
                     _bootstrap_n_resamples() if _bootstrap_enabled() else 0
@@ -793,6 +865,7 @@ def run(
                 getattr(config, "HOLDOUT_BOOTSTRAP_RANDOM_STATE", 20260727)
             ),
             "prediction_threshold": _threshold(),
+            "holdout_horizon_ratio_mode": _horizon_ratio_mode(),
             "metrics_path": str(metrics_path),
             "top_k_path": str(topk_path),
             "fixed_top_n_path": str(topn_path),
@@ -806,7 +879,8 @@ def run(
                 "Bootstrap resampling is stratified by class and therefore preserves each evaluated prevalence ratio.",
                 "Percentage Top-K and fixed-count Top-N confidence intervals are machine-level percentile intervals.",
                 "Fixed Top 10/20/50 comparisons keep maintenance workload constant across prevalence ratios.",
-                "Claim-within-horizon mode reuses the same rows and scores and recomputes truth separately for every configured horizon.",
+                "With horizon_specific_random mode, each horizon has an exact nested ratio cohort with fixed random machine identities.",
+                "With reuse_same_rows mode, the same rows are relabeled and the realized ratio may change by horizon.",
                 "Machine prediction files include the actual next claim date and days from window_end when a later claim exists.",
                 "Test-ratio results are sensitivity analysis and should not be repeatedly used for tuning.",
             ],

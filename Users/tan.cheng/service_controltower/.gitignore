@@ -55,18 +55,24 @@ data_preparation/output/
 feature_selection/output/**
 /feature_selection/output/**
 
-/machine_learning/output/**
-machine_learning/output/
-machine_learning/output/**
+/snapshot_window_model/output/**
+snapshot_window_model/output/
+snapshot_window_model/output/**
 
 /case_control_modeling/output/**
 case_control_modeling/output/
 case_control_modeling/output/**
 
-/failure_risk_model/output/**
-failure_risk_model/output/**
-/machine_health_score_model/output/**
-machine_health_score_model/output/**
+/rolling_origin_model/outputs/**
+rolling_origin_model/outputs/**
+/rolling_origin_model/models/**
+rolling_origin_model/models/**
+
+/non_overlap_window_model/outputs/**
+non_overlap_window_model/outputs/**
+non_overlap_window_model/artifacts/**
+/non_overlap_window_model/artifacts/**
+
 ###############################################################################
 # JSON outputs
 ###############################################################################

@@ -27,20 +27,24 @@ import config
 from cc_utils import (
     annotate_future_claim_outcomes,
     build_case_control_base_rows,
+    build_claim_episodes,
     build_fixed_horizon_evaluation_base_rows,
     build_machine_master,
     build_or_load_fixed_machine_split_assignments,
     build_holdout_ratio_base_pool,
+    build_horizon_specific_random_ratio_subsets,
     build_window_features,
     configured_evaluation_horizons,
     configured_holdout_negative_ratios,
     ensure_dir,
     future_claim_target_col,
     load_sources,
+    load_warranty,
     holdout_negative_sampling_mode,
     holdout_machine_selection_scope,
     negative_sampling_mode,
     negatives_per_positive,
+    normalize_warranty_claim_filter_mode,
     holdout_ratio_subset,
     read_json,
     select_positive_claims_for_window_config,
@@ -344,7 +348,14 @@ def _build_or_load_fixed_random_holdout_rows(
     """
     mode = holdout_negative_sampling_mode(config)
     window_name = window_config_name(window_config)
-    lock_dir = Path(config.FIXED_SPLIT_ASSET_DIR) / window_name
+    claim_filter_mode = normalize_warranty_claim_filter_mode(
+        getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+    )
+    lock_dir = (
+        Path(config.FIXED_SPLIT_ASSET_DIR)
+        / window_name
+        / f"claims_{claim_filter_mode}"
+    )
     ensure_dir(lock_dir)
     prefix = f"fixed_{mode}_validation_test"
     rows_path = lock_dir / f"{prefix}_master_base_rows.csv"
@@ -533,7 +544,14 @@ def _build_or_load_fixed_horizon_rows(
     minimum_followup_days: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, bool, Path]:
     window_name = window_config_name(window_config)
-    lock_dir = Path(config.FIXED_SPLIT_ASSET_DIR) / window_name
+    claim_filter_mode = normalize_warranty_claim_filter_mode(
+        getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+    )
+    lock_dir = (
+        Path(config.FIXED_SPLIT_ASSET_DIR)
+        / window_name
+        / f"claims_{claim_filter_mode}"
+    )
     ensure_dir(lock_dir)
     rows_path = lock_dir / "fixed_validation_test_horizon_base_rows.csv"
     audit_path = lock_dir / "fixed_validation_test_horizon_sampling_audit.csv"
@@ -646,6 +664,91 @@ def _ratio_slug(ratio: int) -> str:
     return f"ratio_{int(ratio)}_to_1"
 
 
+def _horizon_ratio_mode() -> str:
+    mode = str(
+        getattr(config, "HOLDOUT_HORIZON_RATIO_MODE", "reuse_same_rows")
+    ).strip().lower()
+    aliases = {
+        "reuse": "reuse_same_rows",
+        "same_rows": "reuse_same_rows",
+        "reuse_same_rows": "reuse_same_rows",
+        "horizon_specific": "horizon_specific_random",
+        "per_horizon_random": "horizon_specific_random",
+        "horizon_specific_random": "horizon_specific_random",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            "HOLDOUT_HORIZON_RATIO_MODE must be 'reuse_same_rows' or "
+            "'horizon_specific_random'."
+        )
+    return aliases[mode]
+
+
+def _materialize_horizon_specific_ratio_datasets(
+    candidate_df: pd.DataFrame,
+    dataset_dir: Path,
+    dataset_id: str,
+    horizons: list[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Create exact nested random prevalence cohorts separately by horizon."""
+    ratios = configured_holdout_negative_ratios(config)
+    index_rows: list[dict] = []
+    summary_rows: list[dict] = []
+    for split_name in ["validation", "test"]:
+        for horizon in sorted({int(x) for x in horizons}):
+            subsets, summary = build_horizon_specific_random_ratio_subsets(
+                evaluation_df=candidate_df,
+                split_name=split_name,
+                horizon_days=horizon,
+                ratios=ratios,
+                config=config,
+                random_state=int(config.HOLDOUT_RANDOM_STATE),
+            )
+            summary_rows.append({"dataset_id": dataset_id, **summary})
+            for ratio in ratios:
+                subset = subsets[int(ratio)]
+                path = dataset_dir / (
+                    f"case_control_{split_name}_horizon_{int(horizon)}d_"
+                    f"{_ratio_slug(int(ratio))}.csv"
+                )
+                subset.to_csv(path, index=False)
+                positive_rows = int(subset["target"].eq(1).sum())
+                negative_rows = int(subset["target"].eq(0).sum())
+                index_rows.append(
+                    {
+                        "dataset_id": dataset_id,
+                        "split": split_name,
+                        "holdout_negative_sampling_mode": "horizon_specific_random",
+                        "horizon_ratio_mode": "horizon_specific_random",
+                        "evaluation_horizon_days": int(horizon),
+                        "evaluation_target_col": future_claim_target_col(int(horizon)),
+                        "negative_to_positive_ratio_requested": int(ratio),
+                        "rows": int(len(subset)),
+                        "positive_rows": positive_rows,
+                        "negative_rows": negative_rows,
+                        "actual_negative_to_positive_ratio": (
+                            float(negative_rows / positive_rows) if positive_rows else np.nan
+                        ),
+                        "machines": int(subset["machine_key"].nunique(dropna=True)),
+                        "dataset_path": str(path),
+                        "nested_negative_rule": (
+                            "same horizon-specific positives; larger ratios append "
+                            "deterministically ranked negatives"
+                        ),
+                    }
+                )
+    index = pd.DataFrame(index_rows).sort_values(
+        ["split", "evaluation_horizon_days", "negative_to_positive_ratio_requested"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    summary = pd.DataFrame(summary_rows).sort_values(
+        ["split", "evaluation_horizon_days"], kind="mergesort"
+    ).reset_index(drop=True)
+    index.to_csv(dataset_dir / "horizon_specific_random_ratio_index.csv", index=False)
+    summary.to_csv(dataset_dir / "horizon_specific_random_ratio_pool_summary.csv", index=False)
+    return index, summary
+
+
 def _materialize_holdout_ratio_datasets(
     holdout_master_df: pd.DataFrame,
     dataset_dir: Path,
@@ -748,10 +851,22 @@ def run() -> None:
     machine_master = build_machine_master(sources)
     machine_master.to_csv(step_dir / "machine_master_source_coverage.csv", index=False)
 
+    # Keep machine split assignments stable when the warranty-cleaning switch is
+    # changed. Stratification uses date-eligible raw warranty claim history, while
+    # model labels and future-claim outcomes continue to use the cleaned episodes.
+    raw_warranty_for_split = load_warranty(config, apply_filter=False)
+    raw_split_episodes = build_claim_episodes(
+        raw_warranty_for_split,
+        gap_days=config.CLAIM_EPISODE_GAP_DAYS,
+    )
+    split_sources = dict(sources)
+    split_sources["warranty"] = raw_warranty_for_split
+    split_machine_master = build_machine_master(split_sources)
+
     assignment_path = Path(config.FIXED_SPLIT_ASSET_DIR) / "fixed_machine_split_assignments.csv"
     split_assignments, machine_split_summary = build_or_load_fixed_machine_split_assignments(
-        machine_master=machine_master,
-        claim_history_episodes=episodes,
+        machine_master=split_machine_master,
+        claim_history_episodes=raw_split_episodes,
         config=config,
         assignment_path=assignment_path,
     )
@@ -916,6 +1031,10 @@ def run() -> None:
         horizon_rows = 0
         horizon_validation_rows = 0
         horizon_test_rows = 0
+        horizon_ratio_index_path = ""
+        horizon_ratio_pool_summary_path = ""
+        horizon_ratio_index_rows = 0
+        horizon_ratio_candidate_df: pd.DataFrame | None = None
         if evaluation_mode == "claim_within_horizon" and holdout_mode == "as_of_anchor":
             # The active as-of holdout is already an outcome-reviewable fleet
             # snapshot. Reuse its fixed rows and dynamically relabel them for
@@ -932,6 +1051,7 @@ def run() -> None:
             horizon_rows = int(len(holdout_master_df))
             horizon_validation_rows = int(holdout_master_df["split"].eq("validation").sum())
             horizon_test_rows = int(holdout_master_df["split"].eq("test").sum())
+            horizon_ratio_candidate_df = holdout_master_df.copy()
         elif evaluation_mode == "claim_within_horizon":
             horizons = configured_evaluation_horizons(config)
             if not horizons:
@@ -1006,6 +1126,32 @@ def run() -> None:
             horizon_rows = int(len(horizon_df))
             horizon_validation_rows = int(len(horizon_validation_df))
             horizon_test_rows = int(len(horizon_test_df))
+            horizon_ratio_candidate_df = horizon_df.copy()
+
+        if (
+            evaluation_mode == "claim_within_horizon"
+            and _horizon_ratio_mode() == "horizon_specific_random"
+        ):
+            if horizon_ratio_candidate_df is None or horizon_ratio_candidate_df.empty:
+                raise ValueError(
+                    "Horizon-specific ratio mode requires a non-empty fixed horizon "
+                    "evaluation candidate dataset."
+                )
+            horizon_ratio_index, horizon_ratio_summary = (
+                _materialize_horizon_specific_ratio_datasets(
+                    candidate_df=horizon_ratio_candidate_df,
+                    dataset_dir=dataset_dir,
+                    dataset_id=dataset_id,
+                    horizons=configured_evaluation_horizons(config),
+                )
+            )
+            horizon_ratio_index_path = str(
+                dataset_dir / "horizon_specific_random_ratio_index.csv"
+            )
+            horizon_ratio_pool_summary_path = str(
+                dataset_dir / "horizon_specific_random_ratio_pool_summary.csv"
+            )
+            horizon_ratio_index_rows = int(len(horizon_ratio_index))
 
         group_split = (
             full_df[["case_control_group_id", "case_machine_key", "split"]]
@@ -1085,8 +1231,15 @@ def run() -> None:
             "random_holdout_master_dataset_path": str(holdout_master_path),
             "random_holdout_ratio_index_path": str(ratio_index_path),
             "feature_set": config.FEATURE_SET,
+            "warranty_claim_filter_mode": normalize_warranty_claim_filter_mode(
+                getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+            ),
             "evaluation_target_mode": config.EVALUATION_TARGET_MODE,
             "evaluation_claim_horizon_days": list(config.EVALUATION_CLAIM_HORIZON_DAYS),
+            "holdout_horizon_ratio_mode": _horizon_ratio_mode(),
+            "horizon_specific_ratio_index_path": horizon_ratio_index_path,
+            "horizon_specific_ratio_pool_summary_path": horizon_ratio_pool_summary_path,
+            "horizon_specific_ratio_index_rows": horizon_ratio_index_rows,
             "fixed_horizon_evaluation_base_rows_path": horizon_base_lock_path,
             "fixed_horizon_evaluation_base_rows_reused": bool(horizon_base_reused),
             "fixed_horizon_evaluation_dataset_path": horizon_full_path,
@@ -1144,6 +1297,9 @@ def run() -> None:
             "training_negative_sampling_mode": negative_sampling_mode(config),
             "training_negatives_per_positive_case_requested": negatives_per_positive(config),
             "feature_set": config.FEATURE_SET,
+            "warranty_claim_filter_mode": normalize_warranty_claim_filter_mode(
+                getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+            ),
             "rows": int(len(full_df)),
             "positive_rows": positive_rows,
             "negative_rows": negative_rows,
@@ -1176,6 +1332,10 @@ def run() -> None:
             "evaluation_claim_horizon_days": ",".join(
                 str(int(x)) for x in config.EVALUATION_CLAIM_HORIZON_DAYS
             ),
+            "holdout_horizon_ratio_mode": _horizon_ratio_mode(),
+            "horizon_specific_ratio_index_path": horizon_ratio_index_path,
+            "horizon_specific_ratio_pool_summary_path": horizon_ratio_pool_summary_path,
+            "horizon_specific_ratio_index_rows": horizon_ratio_index_rows,
             "fixed_horizon_evaluation_base_rows_path": horizon_base_lock_path,
             "fixed_horizon_evaluation_base_rows_reused": bool(horizon_base_reused),
             "fixed_horizon_evaluation_dataset_path": horizon_full_path,
@@ -1234,6 +1394,9 @@ def run() -> None:
             "holdout_random_state": int(config.HOLDOUT_RANDOM_STATE),
             "fixed_split_asset_dir": str(config.FIXED_SPLIT_ASSET_DIR),
             "feature_set": config.FEATURE_SET,
+            "warranty_claim_filter_mode": normalize_warranty_claim_filter_mode(
+                getattr(config, "WARRANTY_CLAIM_FILTER_MODE", "none")
+            ),
             "evaluation_target_mode": config.EVALUATION_TARGET_MODE,
             "evaluation_claim_horizon_days": list(config.EVALUATION_CLAIM_HORIZON_DAYS),
             "positive_claim_selection_mode": config.POSITIVE_CLAIM_SELECTION_MODE,

@@ -37,8 +37,6 @@ from feature_definitions import (
 # =============================================================================
 PROJECT_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = PROJECT_DIR.parent / "enriched_data"
-if not SOURCE_DIR.exists() and Path("/mnt/data").exists():
-    SOURCE_DIR = Path("/mnt/data")
 
 OUTPUT_DIR = PROJECT_DIR / "output"
 
@@ -69,6 +67,24 @@ MIN_CLAIM_DATE = None
 MAX_CLAIM_DATE = "2026-06-26"
 
 CLAIM_EPISODE_GAP_DAYS = 30
+
+# One switch controls whether warranty rows are filtered before claim episodes,
+# training labels, validation labels, and future-claim timing are created:
+#   "none"            - keep every date-eligible warranty row.
+#   "failure_focused" - remove claim categories that are most likely to reflect
+#                       inspections, administrative adjustments, or routine wear
+#                       replacement rather than an unexpected machine failure.
+WARRANTY_CLAIM_FILTER_MODE = "failure_focused"
+WARRANTY_FAILURE_FOCUSED_EXCLUDED_CLAIM_TYPES = {
+    "Inspection Claim KF": "inspection_or_check",
+    "Policy Adjustment Claim": "policy_adjustment",
+    "Commercial Adjustment Policy Claim": "commercial_adjustment",
+    "Replacement Undercarriage": "routine_wear_component_replacement",
+}
+
+# This older optional rule remains independent of the claim-type filter. Keep it
+# False unless the project explicitly requires every retained claim to identify a
+# valid critical part number.
 KEEP_ONLY_VALID_CRITICAL_PART_CLAIMS = False
 INVALID_CRITICAL_PART_VALUES = {"", "0", "0000", "000000", "nan", "none", "null"}
 
@@ -176,8 +192,24 @@ HOLDOUT_AS_OF_MIN_POSITIVE_MACHINES = 10
 # The 1:1 and 5:1 cohorts use exactly the same positives; larger ratios only add
 # negatives. The largest ratio is the reference validation/test dataset used by
 # Steps 04 and 07.
-HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS = [1, 3, 5, 10]
+HOLDOUT_NEGATIVE_TO_POSITIVE_RATIOS = [3]
 HOLDOUT_RANDOM_STATE = 42
+
+# When EVALUATION_TARGET_MODE="claim_within_horizon", Step 08 can handle the
+# prevalence-ratio experiment in either of two ways:
+#
+#   "horizon_specific_random"
+#       Recommended for prevalence sensitivity. For each split and each claim
+#       horizon, randomly select a fixed positive set and a nested negative pool
+#       large enough for every configured ratio. Thus 1:1, 2:1, ..., N:1 are
+#       exact at every horizon. Samples may differ between horizons because the
+#       true class definition changes with the horizon.
+#
+#   "reuse_same_rows"
+#       Backward-compatible behavior. Reuse the same holdout rows for every
+#       horizon and only recompute labels. The realized negative:positive ratio
+#       is then allowed to change as the horizon grows.
+HOLDOUT_HORIZON_RATIO_MODE = "reuse_same_rows"
 
 # Step 08 ranking diagnostics. Percentage cutoffs show operational performance
 # at a fixed fraction of the population. Fixed counts make the workload identical
@@ -227,9 +259,84 @@ MULTI_ANCHOR_FLEET_MAX_MACHINES_PER_ANCHOR = None
 # Step 10 reports ranking and actual claim timing at these fixed workloads.
 MULTI_ANCHOR_FLEET_TOP_K_RATES = [0.01, 0.05, 0.10, 0.20]
 MULTI_ANCHOR_FLEET_TOP_N_COUNTS = [10, 20, 50]
+
+# Anchor-fleet horizons are independently configurable. Leave empty to reuse
+# EVALUATION_CLAIM_HORIZON_DAYS. Step 10 scores each snapshot once, then reports
+# Top-K and Top-N trends separately for every horizon listed here.
+MULTI_ANCHOR_FLEET_EVALUATION_HORIZONS = [30]
+
 MULTI_ANCHOR_FLEET_BOOTSTRAP_ENABLED = True
-MULTI_ANCHOR_FLEET_BOOTSTRAP_N_RESAMPLES = 1000
+MULTI_ANCHOR_FLEET_BOOTSTRAP_N_RESAMPLES = 200
 MULTI_ANCHOR_FLEET_BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
+
+
+
+
+# =============================================================================
+# 5C. Negative-only score-distribution validation
+# =============================================================================
+# This optional diagnostic scores a validation/test cohort containing no positive
+# rows under the design horizon (lead_min_days). It is intended to reveal whether
+# the model assigns near-zero scores to ordinary negatives and how often it assigns
+# high risk to machines whose claims occur only after the design horizon.
+NEGATIVE_ONLY_EVALUATION_ENABLED = True
+NEGATIVE_ONLY_EVALUATION_SPLITS = ["validation"]
+
+# Random machine snapshots retained per split. Each machine contributes at most
+# one row. Set to None to use the largest feasible balanced cohort.
+NEGATIVE_ONLY_SAMPLE_SIZE_PER_SPLIT = 500
+
+# Portion that must satisfy the full NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END rule.
+# The remaining rows are design-horizon negatives whose next claim occurs after
+# lead_min_days but no later than NEGATIVE_NO_CLAIM_DAYS_AFTER_WINDOW_END.
+NEGATIVE_ONLY_STRICT_FRACTION = 0.50
+
+# Delayed-claim negatives are distributed as evenly as feasible across lead-time
+# intervals such as 31-60, 61-90, ..., 151-180 days.
+NEGATIVE_ONLY_DELAYED_CLAIM_BIN_WIDTH_DAYS = 30
+NEGATIVE_ONLY_RANDOM_STATE = 20260729
+NEGATIVE_ONLY_SCORE_THRESHOLD = 0.50
+NEGATIVE_ONLY_SCORE_HISTOGRAM_BINS = 20
+NEGATIVE_ONLY_SCORE_REVIEW_THRESHOLDS = [0.10, 0.25, 0.50, 0.75, 0.90]
+
+# Empty means reuse EVALUATION_CLAIM_HORIZON_DAYS. These columns show when a row
+# that is negative at lead_min_days becomes positive under a relaxed horizon.
+NEGATIVE_ONLY_EVALUATION_HORIZONS = [30, 60, 90]
+
+
+# =============================================================================
+# 5D. Positive-only score-distribution and threshold diagnostics
+# =============================================================================
+# Step 13 scores every positive row in the fixed validation/test evaluation
+# cohorts for each configured future-claim horizon. It reports score
+# distributions, actual days to claim, and the share of positives captured at
+# candidate thresholds. No existing training or holdout design is changed.
+POSITIVE_ONLY_EVALUATION_ENABLED = True
+POSITIVE_ONLY_EVALUATION_SPLITS = ["validation", "test"]
+
+# Empty means reuse EVALUATION_CLAIM_HORIZON_DAYS. The same model score is reused
+# and only the true future-claim label changes by horizon.
+POSITIVE_ONLY_EVALUATION_HORIZONS = [30, 60, 90]
+
+# Thresholds used to show how many known positive machines would be captured.
+POSITIVE_ONLY_SCORE_THRESHOLD = 0.50
+POSITIVE_ONLY_SCORE_REVIEW_THRESHOLDS = [0.25, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+POSITIVE_ONLY_SCORE_HISTOGRAM_BINS = 20
+
+# When Step 12 outputs are available, Step 13 combines the positive and negative
+# score distributions. It proposes threshold candidates that keep the empirical
+# negative false-positive rate below these levels. The 5% and 1% rows are useful
+# starting candidates for high-risk and critical-risk tiers, respectively.
+POSITIVE_ONLY_THRESHOLD_FALSE_POSITIVE_TARGETS = [0.10, 0.05, 0.01]
+
+# Because a case-control validation sample does not necessarily have production
+# prevalence, Step 13 also estimates threshold precision at these hypothetical
+# deployment positive rates using the observed TPR and FPR.
+POSITIVE_ONLY_ASSUMED_DEPLOYMENT_PREVALENCES = [0.01, 0.05, 0.10, 0.20]
+
+# None uses OUTPUT_DIR/12_negative_only_score_diagnostics. Set a directory only
+# when Step 12 results were written elsewhere.
+POSITIVE_ONLY_NEGATIVE_DIAGNOSTICS_DIR = None
 
 
 # =============================================================================
@@ -256,8 +363,8 @@ MULTI_ANCHOR_FLEET_BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 # and any required horizon cohort are materialized. Changing the horizon list
 # afterward does not change locked sample identities; metric code derives every
 # label directly from days-to-next-claim.
-EVALUATION_TARGET_MODE = "training_target"  # or "claim_within_horizon"
-EVALUATION_CLAIM_HORIZON_DAYS = [30, 60, 90, 120, 180, 365]
+EVALUATION_TARGET_MODE = "training_target"
+EVALUATION_CLAIM_HORIZON_DAYS = [30, 60, 90]
 EVALUATION_INCLUDE_CLAIM_ON_WINDOW_END = True
 
 VALIDATION_TOP_K_RATES = [0.01, 0.05, 0.10, 0.20]
@@ -291,7 +398,7 @@ RANDOM_FOREST_PARAMS = {
     "n_jobs": 1,
 }
 XGBOOST_PARAMS = {
-    "n_estimators": 300,
+    "n_estimators": 120,
     "max_depth": 3,
     "learning_rate": 0.05,
     "subsample": 0.85,
@@ -303,7 +410,7 @@ XGBOOST_PARAMS = {
     "n_jobs": 1,
 }
 
-XGBOOST_ENABLE_LEARNING_CURVE = True
+XGBOOST_ENABLE_LEARNING_CURVE = False
 XGBOOST_LEARNING_CURVE_EVAL_VIEW = "validation"
 XGBOOST_USE_EARLY_STOPPING = False
 XGBOOST_EARLY_STOPPING_ROUNDS = 0
@@ -315,7 +422,7 @@ XGBOOST_CLASS_IMPORTANCE_MODE = "none"
 XGBOOST_FIXED_SCALE_POS_WEIGHT = 1.0
 
 SAVE_FEATURE_IMPORTANCE = True
-SAVE_SHAP_VALUES = True
+SAVE_SHAP_VALUES = False
 SHAP_EVALUATION_VIEWS = ["validation"]
 SHAP_MAX_ROWS = 1000
 SHAP_TOP_SCORE_ROWS = 500
