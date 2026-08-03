@@ -159,10 +159,10 @@ def run_xgboost_variant_comparison(dataframe: pd.DataFrame) -> None:
             x_val = validation[features].astype(float)
             y_val = validation[config.TARGET_COLUMN].astype(int).to_numpy()
 
-            model = make_algorithm('xgboost')
+            model = make_algorithm('xgboost_note')
             started = time.time()
             model, best_iteration = fit_algorithm(
-                'xgboost',
+                'xgboost_note',
                 model,
                 x_fit,
                 y_fit,

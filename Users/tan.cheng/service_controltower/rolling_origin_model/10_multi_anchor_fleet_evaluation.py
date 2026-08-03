@@ -472,15 +472,17 @@ def _report_markdown(
     anchor_metrics: pd.DataFrame,
     fold_summary: pd.DataFrame,
     overall_summary: pd.DataFrame,
+    report_title: str = "Multi-Anchor Fleet Evaluation",
 ) -> str:
     lines = [
-        "# Multi-Anchor Fleet Evaluation",
+        f"# {report_title}",
         "",
         "## Design",
         "",
         f"- Feature lookback: {config.LOOKBACK_DAYS} days before each anchor.",
         f"- Outcome horizon: {config.HORIZON_DAYS} days after each anchor.",
         f"- Target source: {config.TARGET_SOURCE} ({config.TARGET_DISPLAY_NAME}).",
+        f"- Algorithms: {', '.join(config.MULTI_ANCHOR_FLEET_ALGORITHMS)}.",
         f"- Anchors per fold: {config.MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD} unless fixed dates are configured.",
         "- Every reconstructed fleet machine is scored at every anchor; no negative sampling is used.",
         "- Models are fitted on older monthly snapshots. The reserved calibration months are used for early stopping, Platt calibration, and threshold selection only.",
@@ -491,11 +493,15 @@ def _report_markdown(
         manifest[["fold", "anchor_id", "anchor_date", "outcome_window_end_exclusive", "outcome_window_complete"]]
         .to_markdown(index=False),
         "",
-        "## Threshold-free metrics by variant and fold",
+        "## Threshold-free metrics by algorithm, variant, and fold",
         "",
     ]
+    if anchor_metrics.empty:
+        lines.append("No completed algorithm results were available.")
+        return "\n".join(lines)
+
     metric_summary = (
-        anchor_metrics.groupby(["variant", "fold"], as_index=False)
+        anchor_metrics.groupby(["algorithm", "variant", "fold"], as_index=False)
         .agg(
             anchor_count=("anchor_id", "nunique"),
             mean_positive_rate=("positive_rate", "mean"),
@@ -507,6 +513,7 @@ def _report_markdown(
     lines.append(metric_summary.to_markdown(index=False, floatfmt=".4f"))
     lines.extend(["", "## Top-K and Top-N results by fold", ""])
     selected_columns = [
+        "algorithm",
         "variant",
         "fold",
         "selection_type",
@@ -518,9 +525,13 @@ def _report_markdown(
         "minimum_anchor_precision",
         "maximum_anchor_precision",
     ]
-    lines.append(fold_summary[selected_columns].to_markdown(index=False, floatfmt=".4f"))
+    if fold_summary.empty:
+        lines.append("No fold-level selection results were available.")
+    else:
+        lines.append(fold_summary[selected_columns].to_markdown(index=False, floatfmt=".4f"))
     lines.extend(["", "## Overall results across all forward anchors", ""])
     overall_columns = [
+        "algorithm",
         "variant",
         "selection_type",
         "selection_value",
@@ -529,13 +540,27 @@ def _report_markdown(
         "micro_precision_ci95_low",
         "micro_precision_ci95_high",
         "micro_recall",
+        "micro_recall_ci95_low",
+        "micro_recall_ci95_high",
         "micro_lift_vs_fleet",
         "minimum_anchor_precision",
         "maximum_anchor_precision",
     ]
-    lines.append(overall_summary[overall_columns].to_markdown(index=False, floatfmt=".4f"))
+    if overall_summary.empty:
+        lines.append("No overall selection results were available.")
+    else:
+        lines.append(overall_summary[overall_columns].to_markdown(index=False, floatfmt=".4f"))
     lines.extend(
         [
+            "",
+            "## Output-file guide",
+            "",
+            "- `multi_anchor_top_k_by_anchor.csv`: Top-K precision and recall for every algorithm, variant, fold, and anchor date.",
+            "- `multi_anchor_top_n_by_anchor.csv`: fixed Top-N precision and recall for every algorithm, variant, fold, and anchor date.",
+            "- `multi_anchor_top_k_by_fold.csv` and `multi_anchor_top_n_by_fold.csv`: pooled fold-level micro precision and recall.",
+            "- `multi_anchor_top_k_overall.csv` and `multi_anchor_top_n_overall.csv`: pooled results across all configured anchors.",
+            "- `by_algorithm/<algorithm>/`: the same result tables restricted to one algorithm.",
+            "- `predictions_by_anchor/<algorithm>/<variant>/`: full fleet files sorted by risk for each anchor date.",
             "",
             "## Interpretation cautions",
             "",
@@ -548,6 +573,147 @@ def _report_markdown(
     return "\n".join(lines)
 
 
+def _result_frames(
+    anchor_metric_rows: list[dict],
+    selection_rows: list[dict],
+    training_rows: list[dict],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build sorted result tables from completed algorithm runs."""
+    anchor_metrics = pd.DataFrame(anchor_metric_rows)
+    selections = pd.DataFrame(selection_rows)
+    training = pd.DataFrame(training_rows)
+
+    if not anchor_metrics.empty:
+        anchor_metrics = anchor_metrics.sort_values(
+            ["algorithm", "variant", "fold", "anchor_date"], kind="mergesort"
+        ).reset_index(drop=True)
+    if not selections.empty:
+        selections = selections.sort_values(
+            [
+                "algorithm",
+                "variant",
+                "fold",
+                "anchor_date",
+                "selection_type",
+                "selection_value",
+            ],
+            kind="mergesort",
+        ).reset_index(drop=True)
+    if not training.empty:
+        training = training.sort_values(
+            ["algorithm", "variant", "fold"], kind="mergesort"
+        ).reset_index(drop=True)
+
+    if selections.empty:
+        fold_summary = pd.DataFrame()
+        overall_summary = pd.DataFrame()
+    else:
+        fold_summary = aggregate_selection_metrics(
+            selections,
+            ["algorithm", "variant", "fold", "selection_type", "selection_value"],
+        )
+        overall_summary = aggregate_selection_metrics(
+            selections,
+            ["algorithm", "variant", "selection_type", "selection_value"],
+        )
+    return anchor_metrics, selections, training, fold_summary, overall_summary
+
+
+def _write_result_tables(
+    base_dir: Path,
+    anchor_metrics: pd.DataFrame,
+    selections: pd.DataFrame,
+    training: pd.DataFrame,
+    fold_summary: pd.DataFrame,
+    overall_summary: pd.DataFrame,
+) -> None:
+    """Write combined and separate Top-K/Top-N result tables."""
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    anchor_metrics.to_csv(base_dir / "multi_anchor_metrics_by_anchor.csv", index=False)
+    selections.to_csv(base_dir / "multi_anchor_top_k_top_n_by_anchor.csv", index=False)
+    fold_summary.to_csv(base_dir / "multi_anchor_top_k_top_n_by_fold.csv", index=False)
+    overall_summary.to_csv(base_dir / "multi_anchor_top_k_top_n_overall.csv", index=False)
+    training.to_csv(base_dir / "multi_anchor_training_audit.csv", index=False)
+
+    if selections.empty:
+        top_k_anchor = selections.copy()
+        top_n_anchor = selections.copy()
+    else:
+        top_k_anchor = selections[selections["selection_type"].eq("top_k_fraction")].copy()
+        top_n_anchor = selections[selections["selection_type"].eq("top_n")].copy()
+    if fold_summary.empty:
+        top_k_fold = fold_summary.copy()
+        top_n_fold = fold_summary.copy()
+    else:
+        top_k_fold = fold_summary[fold_summary["selection_type"].eq("top_k_fraction")].copy()
+        top_n_fold = fold_summary[fold_summary["selection_type"].eq("top_n")].copy()
+    if overall_summary.empty:
+        top_k_overall = overall_summary.copy()
+        top_n_overall = overall_summary.copy()
+    else:
+        top_k_overall = overall_summary[
+            overall_summary["selection_type"].eq("top_k_fraction")
+        ].copy()
+        top_n_overall = overall_summary[
+            overall_summary["selection_type"].eq("top_n")
+        ].copy()
+
+    top_k_anchor.to_csv(base_dir / "multi_anchor_top_k_by_anchor.csv", index=False)
+    top_n_anchor.to_csv(base_dir / "multi_anchor_top_n_by_anchor.csv", index=False)
+    top_k_fold.to_csv(base_dir / "multi_anchor_top_k_by_fold.csv", index=False)
+    top_n_fold.to_csv(base_dir / "multi_anchor_top_n_by_fold.csv", index=False)
+    top_k_overall.to_csv(base_dir / "multi_anchor_top_k_overall.csv", index=False)
+    top_n_overall.to_csv(base_dir / "multi_anchor_top_n_overall.csv", index=False)
+
+
+def _checkpoint_metric_outputs(
+    manifest: pd.DataFrame,
+    anchor_metric_rows: list[dict],
+    selection_rows: list[dict],
+    training_rows: list[dict],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Checkpoint completed algorithms so later failures do not erase results."""
+    frames = _result_frames(anchor_metric_rows, selection_rows, training_rows)
+    anchor_metrics, selections, training, fold_summary, overall_summary = frames
+    _write_result_tables(
+        OUTPUT_DIR,
+        anchor_metrics,
+        selections,
+        training,
+        fold_summary,
+        overall_summary,
+    )
+
+    if not anchor_metrics.empty:
+        for algorithm in anchor_metrics["algorithm"].drop_duplicates().tolist():
+            algorithm_dir = OUTPUT_DIR / "by_algorithm" / _safe_token(algorithm)
+            metric_subset = anchor_metrics[anchor_metrics["algorithm"].eq(algorithm)].copy()
+            selection_subset = selections[selections["algorithm"].eq(algorithm)].copy()
+            training_subset = training[training["algorithm"].eq(algorithm)].copy()
+            fold_subset = fold_summary[fold_summary["algorithm"].eq(algorithm)].copy()
+            overall_subset = overall_summary[overall_summary["algorithm"].eq(algorithm)].copy()
+            _write_result_tables(
+                algorithm_dir,
+                metric_subset,
+                selection_subset,
+                training_subset,
+                fold_subset,
+                overall_subset,
+            )
+            report = _report_markdown(
+                manifest,
+                metric_subset,
+                fold_subset,
+                overall_subset,
+                report_title=f"Multi-Anchor Fleet Evaluation - {algorithm}",
+            )
+            (algorithm_dir / "MULTI_ANCHOR_VALIDATION_REPORT.md").write_text(
+                report, encoding="utf-8"
+            )
+    return frames
+
+
 def main() -> None:
     if not bool(config.MULTI_ANCHOR_FLEET_ENABLED):
         print("Multi-anchor evaluation skipped: MULTI_ANCHOR_FLEET_ENABLED=False")
@@ -557,10 +723,9 @@ def main() -> None:
         Path(directory).mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     PREDICTION_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "by_algorithm").mkdir(parents=True, exist_ok=True)
     started = time.time()
 
-    # Load and process raw sources before the monthly training table to keep
-    # peak memory lower on constrained smoke-run environments.
     print("Loading raw sources and selecting random anchors...", flush=True)
     sources = load_sources(include_operation_features=False)
     fleet_size = int(len(sources.machine_index))
@@ -592,13 +757,8 @@ def main() -> None:
         compression="gzip",
     )
 
-    # Raw event tables are no longer needed after all random-anchor features and
-    # future outcomes have been materialized. Releasing them avoids holding the
-    # large fault/operation tables alongside the monthly training table.
     del sources
     gc.collect()
-    # Import XGBoost/modeling utilities only after releasing the large raw event
-    # tables. This keeps peak memory lower while parsing source CSVs.
     from modeling_utils import (
         choose_f2_threshold,
         feature_list_for_variant,
@@ -616,109 +776,184 @@ def main() -> None:
     anchor_metric_rows: list[dict] = []
     selection_rows: list[dict] = []
     training_rows: list[dict] = []
+    algorithm_error_rows: list[dict] = []
 
     for fold in config.VALIDATION_FOLDS:
         fold_name, fit, calibration, _ = rolling_origin_split(monthly, fold)
         fold_anchors = anchor_base[anchor_base["fold"].eq(fold_name)].copy()
         for variant in config.MULTI_ANCHOR_FLEET_MODEL_VARIANTS:
-            print(f"\nTraining {variant} for {fold_name}...", flush=True)
             features, top_code_detail = feature_list_for_variant(monthly, fit, variant)
             x_fit = fit[features].astype(float)
             y_fit = fit[config.TARGET_COLUMN].astype(int).to_numpy()
             x_cal = calibration[features].astype(float)
             y_cal = calibration[config.TARGET_COLUMN].astype(int).to_numpy()
 
-            model = make_algorithm("xgboost")
-            model, best_iteration = fit_algorithm(
-                "xgboost", model, x_fit, y_fit, x_cal, y_cal
-            )
-            raw_cal = model.predict_proba(x_cal)[:, 1]
-            platt = fit_platt_calibration(y_cal, raw_cal)
-            calibrated_cal = platt.apply(raw_cal)
-            threshold, calibration_f2 = choose_f2_threshold(y_cal, calibrated_cal)
-
-            raw_anchor = model.predict_proba(fold_anchors[features].astype(float))[:, 1]
-            calibrated_anchor = platt.apply(raw_anchor)
-            scored = fold_anchors.copy()
-            scored["variant"] = variant
-            scored["raw_score"] = raw_anchor
-            scored["calibrated_probability"] = calibrated_anchor
-            scored["calibration_threshold"] = threshold
-            scored["prediction_label_at_calibration_threshold"] = (
-                calibrated_anchor >= threshold
-            ).astype("int8")
-            scored["true_label_90d"] = scored[config.TARGET_COLUMN].astype("int8")
-            scored["prediction_correct_at_threshold"] = (
-                scored["prediction_label_at_calibration_threshold"]
-                == scored["true_label_90d"]
-            ).astype("int8")
-
-            ranked_parts: list[pd.DataFrame] = []
-            for anchor_id, anchor in scored.groupby("anchor_id", sort=True):
-                ranked = _rank_anchor(anchor)
-                metric, selections = evaluate_anchor(ranked)
-                common = {
-                    "variant": variant,
-                    "fold": fold_name,
-                    "evaluation_role": "forward_validation",
-                    "anchor_id": anchor_id,
-                    "anchor_date": ranked["snapshot_date"].iloc[0],
-                    "outcome_window_complete": bool(
-                        ranked["outcome_window_complete"].iloc[0]
-                    ),
-                }
-                anchor_metric_rows.append({**common, **metric})
-                selection_rows.extend({**common, **row} for row in selections)
-                ranked_parts.append(ranked)
-
-                if config.MULTI_ANCHOR_FLEET_WRITE_PER_ANCHOR_FILES:
-                    filename = (
-                        f"{variant}__{fold_name}__"
-                        f"{pd.Timestamp(ranked['snapshot_date'].iloc[0]).strftime('%Y-%m-%d')}"
-                        "__fleet_scores_sorted.csv.gz"
+            for algorithm in config.MULTI_ANCHOR_FLEET_ALGORITHMS:
+                print(
+                    f"\nTraining algorithm={algorithm}, variant={variant}, fold={fold_name}...",
+                    flush=True,
+                )
+                try:
+                    model = make_algorithm(algorithm)
+                    model, best_iteration = fit_algorithm(
+                        algorithm, model, x_fit, y_fit, x_cal, y_cal
                     )
-                    ranked.to_csv(
-                        PREDICTION_DIR / filename,
-                        index=False,
-                        compression="gzip",
+                    raw_cal = model.predict_proba(x_cal)[:, 1]
+                    platt = fit_platt_calibration(y_cal, raw_cal)
+                    calibrated_cal = platt.apply(raw_cal)
+                    threshold, calibration_f2 = choose_f2_threshold(
+                        y_cal, calibrated_cal
                     )
 
-            ranked_fold = pd.concat(ranked_parts, ignore_index=True)
-            all_prediction_parts.append(ranked_fold)
-            training_rows.append(
-                {
-                    "variant": variant,
-                    "fold": fold_name,
-                    "fit_rows": int(len(fit)),
-                    "fit_snapshot_dates": int(fit["snapshot_date"].nunique()),
-                    "calibration_rows": int(len(calibration)),
-                    "calibration_snapshot_dates": int(
-                        calibration["snapshot_date"].nunique()
-                    ),
-                    "random_anchor_count": int(ranked_fold["anchor_id"].nunique()),
-                    "random_anchor_rows": int(len(ranked_fold)),
-                    "feature_count": int(len(features)),
-                    "features": "|".join(features),
-                    "top_failure_code_features": "|".join(
-                        item["feature"] for item in top_code_detail
-                    ),
-                    "best_iteration": int(best_iteration),
-                    "platt_coefficient": float(platt.coefficient),
-                    "platt_intercept": float(platt.intercept),
-                    "calibration_threshold": float(threshold),
-                    "calibration_f2": float(calibration_f2),
-                }
-            )
-            print(
-                f"  anchors={ranked_fold['anchor_id'].nunique()}, "
-                f"rows={len(ranked_fold):,}, threshold={threshold:.4f}, "
-                f"best_iteration={best_iteration}",
-                flush=True,
-            )
+                    raw_anchor = model.predict_proba(
+                        fold_anchors[features].astype(float)
+                    )[:, 1]
+                    calibrated_anchor = platt.apply(raw_anchor)
+                    scored = fold_anchors.copy()
+                    scored["algorithm"] = algorithm
+                    scored["variant"] = variant
+                    scored["raw_score"] = raw_anchor
+                    scored["calibrated_probability"] = calibrated_anchor
+                    scored["calibration_threshold"] = threshold
+                    scored["prediction_label_at_calibration_threshold"] = (
+                        calibrated_anchor >= threshold
+                    ).astype("int8")
+                    scored["true_label_90d"] = scored[config.TARGET_COLUMN].astype(
+                        "int8"
+                    )
+                    scored["prediction_correct_at_threshold"] = (
+                        scored["prediction_label_at_calibration_threshold"]
+                        == scored["true_label_90d"]
+                    ).astype("int8")
+
+                    ranked_parts: list[pd.DataFrame] = []
+                    for anchor_id, anchor in scored.groupby("anchor_id", sort=True):
+                        ranked = _rank_anchor(anchor)
+                        metric, selections = evaluate_anchor(ranked)
+                        common = {
+                            "algorithm": algorithm,
+                            "variant": variant,
+                            "fold": fold_name,
+                            "evaluation_role": "forward_validation",
+                            "anchor_id": anchor_id,
+                            "anchor_date": ranked["snapshot_date"].iloc[0],
+                            "outcome_window_complete": bool(
+                                ranked["outcome_window_complete"].iloc[0]
+                            ),
+                        }
+                        anchor_metric_rows.append({**common, **metric})
+                        selection_rows.extend({**common, **row} for row in selections)
+                        ranked_parts.append(ranked)
+
+                        if config.MULTI_ANCHOR_FLEET_WRITE_PER_ANCHOR_FILES:
+                            prediction_dir = (
+                                PREDICTION_DIR
+                                / _safe_token(algorithm)
+                                / _safe_token(variant)
+                            )
+                            prediction_dir.mkdir(parents=True, exist_ok=True)
+                            filename = (
+                                f"{algorithm}__{variant}__{fold_name}__"
+                                f"{pd.Timestamp(ranked['snapshot_date'].iloc[0]).strftime('%Y-%m-%d')}"
+                                "__fleet_scores_sorted.csv.gz"
+                            )
+                            ranked.to_csv(
+                                prediction_dir / filename,
+                                index=False,
+                                compression="gzip",
+                            )
+
+                    ranked_fold = pd.concat(ranked_parts, ignore_index=True)
+                    all_prediction_parts.append(ranked_fold)
+                    training_rows.append(
+                        {
+                            "algorithm": algorithm,
+                            "variant": variant,
+                            "fold": fold_name,
+                            "fit_rows": int(len(fit)),
+                            "fit_snapshot_dates": int(fit["snapshot_date"].nunique()),
+                            "calibration_rows": int(len(calibration)),
+                            "calibration_snapshot_dates": int(
+                                calibration["snapshot_date"].nunique()
+                            ),
+                            "random_anchor_count": int(
+                                ranked_fold["anchor_id"].nunique()
+                            ),
+                            "random_anchor_rows": int(len(ranked_fold)),
+                            "feature_count": int(len(features)),
+                            "features": "|".join(features),
+                            "top_failure_code_features": "|".join(
+                                item["feature"] for item in top_code_detail
+                            ),
+                            "best_iteration": int(best_iteration),
+                            "platt_coefficient": float(platt.coefficient),
+                            "platt_intercept": float(platt.intercept),
+                            "calibration_threshold": float(threshold),
+                            "calibration_f2": float(calibration_f2),
+                        }
+                    )
+                    _checkpoint_metric_outputs(
+                        manifest,
+                        anchor_metric_rows,
+                        selection_rows,
+                        training_rows,
+                    )
+                    print(
+                        f"  algorithm={algorithm}, anchors={ranked_fold['anchor_id'].nunique()}, "
+                        f"rows={len(ranked_fold):,}, threshold={threshold:.4f}, "
+                        f"best_iteration={best_iteration}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    error_row = {
+                        "algorithm": algorithm,
+                        "variant": variant,
+                        "fold": fold_name,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                    algorithm_error_rows.append(error_row)
+                    pd.DataFrame(algorithm_error_rows).to_csv(
+                        OUTPUT_DIR / "multi_anchor_algorithm_errors.csv", index=False
+                    )
+                    print(
+                        f"ERROR for algorithm={algorithm}, variant={variant}, "
+                        f"fold={fold_name}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    if not bool(
+                        getattr(
+                            config,
+                            "MULTI_ANCHOR_FLEET_CONTINUE_ON_ALGORITHM_ERROR",
+                            True,
+                        )
+                    ):
+                        raise
+
+    if not anchor_metric_rows:
+        raise RuntimeError(
+            "No anchor-validation algorithm completed successfully. See "
+            f"{OUTPUT_DIR / 'multi_anchor_algorithm_errors.csv'} for details."
+        )
+
+    anchor_metrics, selections, training, fold_summary, overall_summary = (
+        _checkpoint_metric_outputs(
+            manifest,
+            anchor_metric_rows,
+            selection_rows,
+            training_rows,
+        )
+    )
 
     predictions = pd.concat(all_prediction_parts, ignore_index=True)
     predictions = predictions.sort_values(
-        ["variant", "fold", "snapshot_date", "risk_rank_within_anchor"],
+        [
+            "algorithm",
+            "variant",
+            "fold",
+            "snapshot_date",
+            "risk_rank_within_anchor",
+        ],
         kind="mergesort",
     ).reset_index(drop=True)
     predictions.to_csv(
@@ -727,56 +962,61 @@ def main() -> None:
         compression="gzip",
     )
 
-    anchor_metrics = pd.DataFrame(anchor_metric_rows).sort_values(
-        ["variant", "fold", "anchor_date"], kind="mergesort"
-    )
-    selections = pd.DataFrame(selection_rows).sort_values(
-        ["variant", "fold", "anchor_date", "selection_type", "selection_value"],
-        kind="mergesort",
-    )
-    training = pd.DataFrame(training_rows).sort_values(
-        ["variant", "fold"], kind="mergesort"
-    )
-
-    fold_summary = aggregate_selection_metrics(
-        selections,
-        ["variant", "fold", "selection_type", "selection_value"],
-    )
-    overall_summary = aggregate_selection_metrics(
-        selections,
-        ["variant", "selection_type", "selection_value"],
-    )
-
+    max_top_n = max(int(value) for value in config.MULTI_ANCHOR_FLEET_TOP_N_COUNTS)
     top_machine_details = predictions[
-        predictions["risk_rank_within_anchor"].le(
-            max(int(value) for value in config.MULTI_ANCHOR_FLEET_TOP_N_COUNTS)
-        )
+        predictions["risk_rank_within_anchor"].le(max_top_n)
     ].copy()
-
-    anchor_metrics.to_csv(OUTPUT_DIR / "multi_anchor_metrics_by_anchor.csv", index=False)
-    selections.to_csv(
-        OUTPUT_DIR / "multi_anchor_top_k_top_n_by_anchor.csv", index=False
-    )
-    fold_summary.to_csv(
-        OUTPUT_DIR / "multi_anchor_top_k_top_n_by_fold.csv", index=False
-    )
-    overall_summary.to_csv(
-        OUTPUT_DIR / "multi_anchor_top_k_top_n_overall.csv", index=False
-    )
-    training.to_csv(OUTPUT_DIR / "multi_anchor_training_audit.csv", index=False)
     top_machine_details.to_csv(
-        OUTPUT_DIR / "multi_anchor_top_20_machine_details.csv.gz",
+        OUTPUT_DIR / "multi_anchor_top_n_machine_details.csv.gz",
         index=False,
         compression="gzip",
     )
+    if max_top_n == 20:
+        top_machine_details.to_csv(
+            OUTPUT_DIR / "multi_anchor_top_20_machine_details.csv.gz",
+            index=False,
+            compression="gzip",
+        )
 
-    report = _report_markdown(manifest, anchor_metrics, fold_summary, overall_summary)
+    for algorithm in predictions["algorithm"].drop_duplicates().tolist():
+        algorithm_dir = OUTPUT_DIR / "by_algorithm" / _safe_token(algorithm)
+        algorithm_predictions = predictions[
+            predictions["algorithm"].eq(algorithm)
+        ].copy()
+        algorithm_predictions.to_csv(
+            algorithm_dir / "multi_anchor_all_fleet_scores_sorted.csv.gz",
+            index=False,
+            compression="gzip",
+        )
+        algorithm_top = top_machine_details[
+            top_machine_details["algorithm"].eq(algorithm)
+        ].copy()
+        algorithm_top.to_csv(
+            algorithm_dir / "multi_anchor_top_n_machine_details.csv.gz",
+            index=False,
+            compression="gzip",
+        )
+
+    report = _report_markdown(
+        manifest,
+        anchor_metrics,
+        fold_summary,
+        overall_summary,
+    )
     (OUTPUT_DIR / "MULTI_ANCHOR_VALIDATION_REPORT.md").write_text(
         report, encoding="utf-8"
     )
+    if algorithm_error_rows:
+        pd.DataFrame(algorithm_error_rows).to_csv(
+            OUTPUT_DIR / "multi_anchor_algorithm_errors.csv", index=False
+        )
+
     run_summary = {
         "step": "10_multi_anchor_fleet_evaluation",
         "strategy": "fixed/common or reproducible forward-validation anchor days; all fleet machines; natural prevalence; rank within anchor",
+        "algorithms_requested": list(config.MULTI_ANCHOR_FLEET_ALGORITHMS),
+        "algorithms_completed": sorted(anchor_metrics["algorithm"].unique().tolist()),
+        "algorithm_error_count": len(algorithm_error_rows),
         "model_variants": list(config.MULTI_ANCHOR_FLEET_MODEL_VARIANTS),
         "fold_count": len(config.VALIDATION_FOLDS),
         "anchors_per_fold": int(config.MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD),
@@ -784,17 +1024,25 @@ def main() -> None:
         "fleet_machines_per_anchor": fleet_size,
         "lookback_days": int(config.LOOKBACK_DAYS),
         "outcome_horizon_days": int(config.HORIZON_DAYS),
-        "top_k_rates": [float(value) for value in config.MULTI_ANCHOR_FLEET_TOP_K_RATES],
-        "top_n_counts": [int(value) for value in config.MULTI_ANCHOR_FLEET_TOP_N_COUNTS],
+        "top_k_rates": [
+            float(value) for value in config.MULTI_ANCHOR_FLEET_TOP_K_RATES
+        ],
+        "top_n_counts": [
+            int(value) for value in config.MULTI_ANCHOR_FLEET_TOP_N_COUNTS
+        ],
         "random_state": int(config.MULTI_ANCHOR_FLEET_RANDOM_STATE),
         "target_source": config.TARGET_SOURCE,
         "target_display_name": config.TARGET_DISPLAY_NAME,
-        "fixed_anchor_dates_used": bool(getattr(config, "MULTI_ANCHOR_FLEET_FIXED_DATES", None)),
+        "fixed_anchor_dates_used": bool(
+            getattr(config, "MULTI_ANCHOR_FLEET_FIXED_DATES", None)
+        ),
         "elapsed_seconds": float(time.time() - started),
         "notes": [
             "The calibration set is used for early stopping, Platt calibration, and threshold selection, not headline anchor metrics.",
             "Each anchor ranking includes all reconstructed machines at natural prevalence.",
             "Each per-anchor prediction file is sorted from highest to lowest raw model score.",
+            "Top-K and Top-N precision/recall are exported separately at anchor, fold, and overall levels.",
+            "Completed algorithms are checkpointed so a later optional-algorithm failure does not erase earlier results.",
             "Consecutive anchors may share machines and overlapping 90-day outcome windows.",
         ],
     }
@@ -806,6 +1054,7 @@ def main() -> None:
     print(
         overall_summary[
             [
+                "algorithm",
                 "variant",
                 "selection_type",
                 "selection_value",

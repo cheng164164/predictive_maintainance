@@ -38,6 +38,13 @@ def main() -> None:
     print(f"  target max event date: {data_through_proxy.date()}")
     print(f"  output directory:  {config.OUTPUT_DIR}")
     print(f"  model directory:   {config.MODEL_DIR}")
+    print(f"  model variants:    {config.MODEL_VARIANTS}")
+    print(f"  production variant:{config.PRODUCTION_VARIANT}")
+    print(
+        f"  anchor variants:   {config.MULTI_ANCHOR_FLEET_MODEL_VARIANTS}"
+    )
+    print(f"  algorithms:        {config.ALGORITHMS}")
+    print(f"  anchor algorithms: {config.MULTI_ANCHOR_FLEET_ALGORITHMS}")
 
     if data_through_proxy < required_training_through:
         print(

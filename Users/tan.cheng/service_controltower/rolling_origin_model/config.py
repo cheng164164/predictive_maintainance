@@ -14,16 +14,14 @@ Expected local layout::
         config.py
         ...scripts...
 
-Set ``TARGET_SOURCE`` below to ``"physical_failure"`` or ``"warranty"``.
-It can also be overridden without editing this file by setting the environment
-variable ``RISK_TARGET_SOURCE`` or by using ``run_all.py --target-source ...``.
-All artifacts are written to target-specific folders so one run cannot overwrite
-another.
+All user-controlled settings are kept in this file. Set ``TARGET_SOURCE`` to
+``"physical_failure"`` or ``"warranty"``. Feature variants may be configured as
+one string or as multiple strings; both forms are normalized automatically.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
+from typing import Iterable
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PROJECT_DIR.parent
@@ -31,11 +29,7 @@ DATA_DIR = PROJECT_ROOT / "enriched_data"
 
 
 def _first_existing(*names: str) -> Path:
-    """Return the first existing candidate under enriched_data.
-
-    The first name is the preferred local filename. The additional names keep
-    compatibility with the uploaded smoke-run filenames.
-    """
+    """Return the first existing candidate under enriched_data."""
     candidates = [DATA_DIR / name for name in names]
     for path in candidates:
         if path.exists():
@@ -57,13 +51,14 @@ WARRANTY_FILE = _first_existing("warranty.csv", "warranty(9).csv")
 PHYSICAL_FAILURE_FILE = _first_existing(
     "Physical Failure Events.csv",
     "physical_failure_events.csv",
+    "physical_failure_event.csv",
 )
 
 # ---------------------------------------------------------------------------
 # Target switch.
 # ---------------------------------------------------------------------------
 SUPPORTED_TARGET_SOURCES = ("physical_failure", "warranty")
-TARGET_SOURCE = os.getenv("RISK_TARGET_SOURCE", "physical_failure").strip().lower()
+TARGET_SOURCE = "physical_failure"
 if TARGET_SOURCE not in SUPPORTED_TARGET_SOURCES:
     raise ValueError(
         f"TARGET_SOURCE must be one of {SUPPORTED_TARGET_SOURCES}; got {TARGET_SOURCE!r}."
@@ -85,8 +80,6 @@ TARGET_FILE = Path(TARGET_SOURCE_CONFIG[TARGET_SOURCE]["file"])
 TARGET_DISPLAY_NAME = str(TARGET_SOURCE_CONFIG[TARGET_SOURCE]["display_name"])
 TARGET_HISTORY_NOUN = str(TARGET_SOURCE_CONFIG[TARGET_SOURCE]["history_noun"])
 
-# The same generic column names are used for both targets. Since artifacts are
-# isolated by target source, this makes the training/evaluation code identical.
 TARGET_COLUMN = "target_event_0_90"
 FUTURE_TARGET_COUNT_COLUMN = "future_target_event_count_90d"
 HISTORY_FEATURES = (
@@ -154,17 +147,141 @@ XGB_PARAMS = {
 RANDOM_SEED = 20260731
 N_JOBS = 8
 
-MODEL_VARIANTS = (
+# ---------------------------------------------------------------------------
+# Feature/model variant selection.
+#
+# ONE option:     MODEL_VARIANTS = "base27_plus_history"
+# MULTIPLE:       MODEL_VARIANTS = ("base27", "base27_plus_history")
+# Lists also work: MODEL_VARIANTS = ["base27", "base27_plus_history"]
+# ---------------------------------------------------------------------------
+SUPPORTED_MODEL_VARIANTS = (
     "base27",
     "base27_plus_history",
+    "base27_plus_history_liveness",
+    "enhanced_condition",
+    "enhanced_plus_history",
 )
+
+
+def normalize_model_variants(
+    value: str | Iterable[str],
+    setting_name: str,
+) -> tuple[str, ...]:
+    """Normalize a single variant or a collection into a validated tuple.
+
+    A plain string is treated as one complete model-variant name. This prevents
+    Python from iterating over the characters in ``"base27_plus_history"``.
+    """
+    if isinstance(value, str):
+        raw_values = (value,)
+    else:
+        try:
+            raw_values = tuple(value)
+        except TypeError as exc:
+            raise TypeError(
+                f"{setting_name} must be a variant string or an iterable of strings."
+            ) from exc
+
+    cleaned: list[str] = []
+    for item in raw_values:
+        if not isinstance(item, str):
+            raise TypeError(
+                f"{setting_name} contains a non-string value: {item!r}."
+            )
+        variant = item.strip().lower()
+        if not variant:
+            raise ValueError(f"{setting_name} contains an empty variant name.")
+        if variant not in cleaned:
+            cleaned.append(variant)
+
+    if not cleaned:
+        raise ValueError(f"{setting_name} cannot be empty.")
+
+    unknown = [name for name in cleaned if name not in SUPPORTED_MODEL_VARIANTS]
+    if unknown:
+        raise ValueError(
+            f"{setting_name} contains unsupported variants {unknown}. "
+            f"Supported variants are {SUPPORTED_MODEL_VARIANTS}."
+        )
+    return tuple(cleaned)
+
+
+# Select one string or multiple strings here.
+MODEL_VARIANTS = "base27_plus_history"
+MODEL_VARIANTS = normalize_model_variants(MODEL_VARIANTS, "MODEL_VARIANTS")
+
+# Used by final scoring when multiple variants are trained.
 PRODUCTION_VARIANT = "base27_plus_history"
-ALGORITHMS = (
+PRODUCTION_VARIANT = PRODUCTION_VARIANT.strip().lower()
+if PRODUCTION_VARIANT not in SUPPORTED_MODEL_VARIANTS:
+    raise ValueError(
+        f"PRODUCTION_VARIANT must be one of {SUPPORTED_MODEL_VARIANTS}; "
+        f"got {PRODUCTION_VARIANT!r}."
+    )
+if PRODUCTION_VARIANT not in MODEL_VARIANTS:
+    raise ValueError(
+        "PRODUCTION_VARIANT must also be included in MODEL_VARIANTS. "
+        f"MODEL_VARIANTS={MODEL_VARIANTS}, PRODUCTION_VARIANT={PRODUCTION_VARIANT!r}."
+    )
+
+SUPPORTED_ALGORITHMS = (
     "xgboost",
+    "xgboost_note",
     "lightgbm",
+    "catboost",
     "hist_gradient_boosting",
     "logistic_regression",
 )
+
+
+def normalize_algorithms(
+    value: str | Iterable[str],
+    setting_name: str,
+) -> tuple[str, ...]:
+    """Normalize one algorithm name or an iterable into a validated tuple."""
+    if isinstance(value, str):
+        raw_values = (value,)
+    else:
+        try:
+            raw_values = tuple(value)
+        except TypeError as exc:
+            raise TypeError(
+                f"{setting_name} must be an algorithm string or an iterable of strings."
+            ) from exc
+
+    cleaned: list[str] = []
+    for item in raw_values:
+        if not isinstance(item, str):
+            raise TypeError(
+                f"{setting_name} contains a non-string value: {item!r}."
+            )
+        algorithm = item.strip().lower()
+        if not algorithm:
+            raise ValueError(f"{setting_name} contains an empty algorithm name.")
+        if algorithm not in cleaned:
+            cleaned.append(algorithm)
+
+    if not cleaned:
+        raise ValueError(f"{setting_name} cannot be empty.")
+
+    unknown = [name for name in cleaned if name not in SUPPORTED_ALGORITHMS]
+    if unknown:
+        raise ValueError(
+            f"{setting_name} contains unsupported algorithms {unknown}. "
+            f"Supported algorithms are {SUPPORTED_ALGORITHMS}."
+        )
+    return tuple(cleaned)
+
+
+# Algorithms used by the regular rolling-origin validation.
+ALGORITHMS = (
+    "xgboost",
+    # "lightgbm",
+    # "catboost",
+    # "hist_gradient_boosting",
+    "logistic_regression",
+)
+ALGORITHMS = normalize_algorithms(ALGORITHMS, "ALGORITHMS")
 
 WRITE_PICKLE = True
 WRITE_COMPRESSED_CSV = True
@@ -176,7 +293,36 @@ RUN_SHUFFLED_LABEL_NULL = True
 # Deployment-style multi-anchor fleet evaluation.
 # ---------------------------------------------------------------------------
 MULTI_ANCHOR_FLEET_ENABLED = True
-MULTI_ANCHOR_FLEET_MODEL_VARIANTS = ("base27", "base27_plus_history")
+
+# None means: automatically use exactly MODEL_VARIANTS.
+# You may also set one string or multiple strings independently, for example:
+# MULTI_ANCHOR_FLEET_MODEL_VARIANTS = "base27_plus_history"
+# MULTI_ANCHOR_FLEET_MODEL_VARIANTS = ("base27", "base27_plus_history")
+MULTI_ANCHOR_FLEET_MODEL_VARIANTS = None
+if MULTI_ANCHOR_FLEET_MODEL_VARIANTS is None:
+    MULTI_ANCHOR_FLEET_MODEL_VARIANTS = MODEL_VARIANTS
+else:
+    MULTI_ANCHOR_FLEET_MODEL_VARIANTS = normalize_model_variants(
+        MULTI_ANCHOR_FLEET_MODEL_VARIANTS,
+        "MULTI_ANCHOR_FLEET_MODEL_VARIANTS",
+    )
+
+# None means use the same algorithms as ALGORITHMS. A single string or a tuple/list
+# can also be configured independently for anchor validation.
+# Example: MULTI_ANCHOR_FLEET_ALGORITHMS = ("xgboost", "lightgbm")
+MULTI_ANCHOR_FLEET_ALGORITHMS = None
+if MULTI_ANCHOR_FLEET_ALGORITHMS is None:
+    MULTI_ANCHOR_FLEET_ALGORITHMS = ALGORITHMS
+else:
+    MULTI_ANCHOR_FLEET_ALGORITHMS = normalize_algorithms(
+        MULTI_ANCHOR_FLEET_ALGORITHMS,
+        "MULTI_ANCHOR_FLEET_ALGORITHMS",
+    )
+
+# Continue to the next configured algorithm if an optional dependency is missing
+# or one algorithm fails. Completed algorithms are checkpointed to disk.
+MULTI_ANCHOR_FLEET_CONTINUE_ON_ALGORITHM_ERROR = True
+
 MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD = 3
 MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS = 30
 MULTI_ANCHOR_FLEET_RANDOM_STATE = 20260731
@@ -186,12 +332,6 @@ MULTI_ANCHOR_FLEET_OUTPUT_SUBDIR = "10_multi_anchor_fleet_evaluation"
 MULTI_ANCHOR_FLEET_WRITE_PER_ANCHOR_FILES = True
 MULTI_ANCHOR_FLEET_EVALUATE_CALIBRATION_PERIOD = False
 
-# Use the exact same deployment anchors for both target-source runs. Set this
-# to None to return to reproducible random date sampling inside each fold.
-# The original warranty extract ends on 2026-06-26, so its 2026-04-28
-# anchor is right-censored before the complete 90-day outcome horizon. Keeping
-# this True reproduces the prior same-date comparison, while every output row is
-# marked with outcome_window_complete. Set False for strict production validation.
 MULTI_ANCHOR_ALLOW_INCOMPLETE_FIXED_DATES = True
 MULTI_ANCHOR_FLEET_FIXED_DATES = {
     "2024H1": ("2024-02-03", "2024-04-17", "2024-06-01"),
@@ -202,3 +342,10 @@ MULTI_ANCHOR_FLEET_FIXED_DATES = {
 }
 
 OPERATION_CACHE_FORCE_REBUILD = False
+
+# ---------------------------------------------------------------------------
+# Pipeline runner controls. ``run_all.py`` accepts no command-line arguments.
+# ---------------------------------------------------------------------------
+RUN_OPERATION_CACHE_STEP = True
+RUN_LATEST_SCORING_STEP = True
+RUN_MULTI_ANCHOR_FLEET_STEP = True

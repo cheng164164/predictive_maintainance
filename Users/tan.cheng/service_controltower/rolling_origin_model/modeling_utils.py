@@ -199,6 +199,11 @@ def feature_list_for_variant(
     fit_dataframe: pd.DataFrame,
     variant: str,
 ) -> tuple[list[str], list[dict]]:
+    if not isinstance(variant, str):
+        raise TypeError(
+            f'Model variant must be a string, got {type(variant).__name__}.'
+        )
+    variant = variant.strip().lower()
     top_codes, top_code_detail = select_top_failure_codes(fit_dataframe)
     if variant == 'base27':
         features = BASE_STATIC_FEATURES + top_codes
@@ -222,7 +227,13 @@ def feature_list_for_variant(
             column for column in numeric if column not in TARGET_AND_LEAKAGE_COLUMNS
         ]
     else:
-        raise ValueError(f'Unknown model variant: {variant}')
+        supported = getattr(config, 'SUPPORTED_MODEL_VARIANTS', ())
+        raise ValueError(
+            f'Unknown model variant: {variant!r}. Supported variants: {supported}. '
+            'In config.py, a single option may be written as '
+            'MODEL_VARIANTS = "base27_plus_history"; multiple options may be '
+            'written as a tuple or list.'
+        )
 
     # Remove duplicates while preserving order and remove columns that contain no
     # usable variation in the actual fit data.
@@ -274,7 +285,7 @@ def _xgboost_model() -> XGBClassifier:
 
 
 def make_algorithm(name: str):
-    if name == 'xgboost':
+    if name in {'xgboost_note', 'xgboost'}:
         return _xgboost_model()
     if name == 'lightgbm':
         try:
@@ -359,7 +370,7 @@ def fit_algorithm(
     y_calibration: np.ndarray,
 ):
     """Fit one algorithm and return the fitted model and effective iteration."""
-    if name == 'xgboost':
+    if name in {'xgboost_note', 'xgboost'}:
         model.fit(
             x_fit,
             y_fit,

@@ -40,9 +40,9 @@ def main() -> None:
         features, top_code_detail = feature_list_for_variant(
             dataframe, fit, variant
         )
-        model = make_algorithm('xgboost')
+        model = make_algorithm('xgboost_note')
         model, best_iteration = fit_algorithm(
-            'xgboost',
+            'xgboost_note',
             model,
             fit[features],
             fit[config.TARGET_COLUMN].astype(int).to_numpy(),
