@@ -11,12 +11,15 @@ import config
 
 @dataclass(frozen=True)
 class TargetEventTables:
+    """Standardized raw events, machine-day events, and source profile metadata."""
+
     raw: pd.DataFrame
     by_machine_day: pd.DataFrame
     profile: dict
 
 
 def normalize_machine_key(series: pd.Series) -> pd.Series:
+    """Normalize machine identifiers to the canonical ``MODEL-SERIAL`` form."""
     return (
         series.astype("string")
         .str.strip()
@@ -26,6 +29,7 @@ def normalize_machine_key(series: pd.Series) -> pd.Series:
 
 
 def _load_physical_failure(path: Path) -> pd.DataFrame:
+    """Load physical-failure events and map them to the standard event schema."""
     raw = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
     required = {"machine", "event_date"}
     missing = sorted(required.difference(raw.columns))
@@ -45,6 +49,7 @@ def _load_physical_failure(path: Path) -> pd.DataFrame:
 
 
 def _load_warranty(path: Path) -> pd.DataFrame:
+    """Load warranty claims and map them to the standard event schema."""
     raw = pd.read_csv(path, low_memory=False)
     required = {"machine_id", "local_date"}
     missing = sorted(required.difference(raw.columns))
@@ -63,8 +68,22 @@ def _load_warranty(path: Path) -> pd.DataFrame:
     return out
 
 
-def load_target_events() -> TargetEventTables:
-    path = Path(config.TARGET_FILE)
+def load_target_events(path: Path | None = None) -> TargetEventTables:
+    """Load the configured target source from ``path`` or ``config.TARGET_FILE``.
+
+    Parameters
+    ----------
+    path:
+        Optional target-source override used by the production incoming-data
+        pipeline after it prepares a merged historical source bundle.
+
+    Returns
+    -------
+    TargetEventTables
+        Raw standardized events, one-row-per-machine-day events, and a source
+        profile suitable for audit logging.
+    """
+    path = Path(path or config.TARGET_FILE)
     if not path.exists():
         raise FileNotFoundError(
             f"Target source file not found for TARGET_SOURCE={config.TARGET_SOURCE!r}: {path}"

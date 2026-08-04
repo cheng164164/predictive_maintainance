@@ -78,10 +78,13 @@ TARGET_AND_LEAKAGE_COLUMNS = {
 
 @dataclass
 class PlattCalibration:
+    """Fitted one-dimensional logistic calibration applied to model scores."""
+
     coefficient: float
     intercept: float
 
     def apply(self, probabilities: Sequence[float]) -> np.ndarray:
+        """Apply the fitted identity or Platt calibration transformation."""
         raw = np.asarray(probabilities, dtype=float)
         eps = 1e-6
         clipped = np.clip(raw, eps, 1.0 - eps)
@@ -92,6 +95,7 @@ class PlattCalibration:
 
 
 def ensure_directories() -> None:
+    """Create configured output, model, and chart directories when absent."""
     for directory in [config.OUTPUT_DIR, config.MODEL_DIR, config.CHART_DIR]:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
@@ -127,19 +131,8 @@ def load_snapshot_dataframe(path: Path | None = None) -> pd.DataFrame:
     return dataframe
 
 
-def load_latest_snapshot_dataframe() -> pd.DataFrame:
-    pickle_path = config.OUTPUT_DIR / 'latest_snapshot_features.pkl'
-    csv_path = config.OUTPUT_DIR / 'latest_snapshot_features.csv.gz'
-    if pickle_path.exists():
-        return load_snapshot_dataframe(pickle_path)
-    if csv_path.exists():
-        return load_snapshot_dataframe(csv_path)
-    raise FileNotFoundError(
-        'Latest snapshot dataset not found. Run 01_build_snapshot_dataset.py first.'
-    )
-
-
 def fault_code_feature_columns(dataframe: pd.DataFrame) -> list[str]:
+    """Return sorted generated fault-code feature columns from a dataframe."""
     return sorted(
         column for column in dataframe.columns if column.startswith('fault_code_')
     )
@@ -199,6 +192,7 @@ def feature_list_for_variant(
     fit_dataframe: pd.DataFrame,
     variant: str,
 ) -> tuple[list[str], list[dict]]:
+    """Build the leakage-safe usable feature list for one model variant."""
     if not isinstance(variant, str):
         raise TypeError(
             f'Model variant must be a string, got {type(variant).__name__}.'
@@ -276,15 +270,16 @@ def rolling_origin_split(
 
 
 def _xgboost_model() -> XGBClassifier:
-    parameters = dict(config.XGB_PARAMS)
+    """Create an XGBoost classifier from the configured development parameters."""
     return XGBClassifier(
-        **parameters,
+        **dict(config.XGB_PARAMS),
         n_jobs=config.N_JOBS,
         random_state=config.RANDOM_SEED,
     )
 
 
 def make_algorithm(name: str):
+    """Instantiate one configured classification algorithm by name."""
     if name in {'xgboost_note', 'xgboost'}:
         return _xgboost_model()
     if name == 'lightgbm':
@@ -374,7 +369,12 @@ def fit_algorithm(
         model.fit(
             x_fit,
             y_fit,
-            eval_set=[(x_calibration, y_calibration)],
+            # Training is included for learning-curve diagnostics; the reserved
+            # calibration set remains last so XGBoost early stopping monitors it.
+            eval_set=[
+                (x_fit, y_fit),
+                (x_calibration, y_calibration),
+            ],
             verbose=False,
         )
         return model, int(getattr(model, 'best_iteration', -1))
@@ -404,6 +404,7 @@ def fit_algorithm(
 def fit_platt_calibration(
     labels: Sequence[int], probabilities: Sequence[float]
 ) -> PlattCalibration:
+    """Fit Platt scaling on a reserved calibration set only."""
     labels_array = np.asarray(labels, dtype=int)
     if np.unique(labels_array).size < 2:
         return PlattCalibration(1.0, 0.0)
@@ -418,32 +419,218 @@ def fit_platt_calibration(
     )
 
 
+def fit_probability_calibration(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    method: str | None = None,
+) -> PlattCalibration:
+    """Fit the configured calibration transform.
+
+    ``none`` returns an identity transform in probability space. Platt scaling
+    is represented by ``PlattCalibration`` so it can be serialized with only a
+    coefficient and intercept.
+    """
+    if not bool(getattr(config, 'PROBABILITY_CALIBRATION_ENABLED', True)):
+        method = 'none'
+    method = (method or getattr(config, 'PROBABILITY_CALIBRATION_METHOD', 'platt')).lower()
+    if method == 'none':
+        return PlattCalibration(1.0, 0.0)
+    if method == 'platt':
+        return fit_platt_calibration(labels, probabilities)
+    raise ValueError(f'Unsupported probability calibration method: {method!r}')
+
+
+def expected_calibration_error(
+    labels: Sequence[int], probabilities: Sequence[float], bins: int | None = None
+) -> float:
+    """Return equal-width expected calibration error."""
+    labels_array = np.asarray(labels, dtype=int)
+    probability_array = np.clip(np.asarray(probabilities, dtype=float), 0.0, 1.0)
+    if len(labels_array) == 0:
+        return float('nan')
+    bins = int(bins or getattr(config, 'CALIBRATION_ECE_BINS', 10))
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    assignments = np.minimum(np.digitize(probability_array, edges[1:-1]), bins - 1)
+    error = 0.0
+    for index in range(bins):
+        mask = assignments == index
+        if not np.any(mask):
+            continue
+        error += float(mask.mean()) * abs(
+            float(probability_array[mask].mean()) - float(labels_array[mask].mean())
+        )
+    return float(error)
+
+
+def probability_calibration_bins(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    bins: int | None = None,
+) -> pd.DataFrame:
+    """Return calibration-bin diagnostics suitable for reliability plots."""
+    labels_array = np.asarray(labels, dtype=int)
+    probability_array = np.clip(np.asarray(probabilities, dtype=float), 0.0, 1.0)
+    bins = int(bins or getattr(config, 'CALIBRATION_ECE_BINS', 10))
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    assignments = np.minimum(np.digitize(probability_array, edges[1:-1]), bins - 1)
+    rows: list[dict] = []
+    for index in range(bins):
+        mask = assignments == index
+        rows.append(
+            {
+                'bin_number': index + 1,
+                'bin_lower': float(edges[index]),
+                'bin_upper': float(edges[index + 1]),
+                'rows': int(mask.sum()),
+                'mean_probability': float(probability_array[mask].mean()) if np.any(mask) else np.nan,
+                'observed_positive_rate': float(labels_array[mask].mean()) if np.any(mask) else np.nan,
+                'absolute_calibration_gap': (
+                    abs(float(probability_array[mask].mean()) - float(labels_array[mask].mean()))
+                    if np.any(mask) else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def calibration_quality_metrics(
+    labels: Sequence[int], probabilities: Sequence[float]
+) -> dict:
+    """Return probability-quality metrics for raw or calibrated scores."""
+    labels_array = np.asarray(labels, dtype=int)
+    probability_array = np.clip(np.asarray(probabilities, dtype=float), 1e-12, 1.0 - 1e-12)
+    metrics = {
+        'brier': float(brier_score_loss(labels_array, probability_array)),
+        'log_loss': float(log_loss(labels_array, probability_array, labels=[0, 1])),
+        'ece': expected_calibration_error(labels_array, probability_array),
+        'mean_probability': float(probability_array.mean()),
+        'observed_positive_rate': float(labels_array.mean()),
+    }
+    if np.unique(labels_array).size >= 2:
+        metrics['roc_auc'] = float(roc_auc_score(labels_array, probability_array))
+        metrics['average_precision'] = float(average_precision_score(labels_array, probability_array))
+    else:
+        metrics['roc_auc'] = np.nan
+        metrics['average_precision'] = np.nan
+    return metrics
+
+
+def threshold_search_table(
+    labels: Sequence[int],
+    calibrated_probabilities: Sequence[float],
+    metric: str | None = None,
+) -> pd.DataFrame:
+    """Evaluate candidate operating thresholds on the calibration set."""
+    labels_array = np.asarray(labels, dtype=int)
+    probabilities = np.asarray(calibrated_probabilities, dtype=float)
+    metric = (metric or getattr(config, 'THRESHOLD_SELECTION_METRIC', 'f1')).lower()
+    if metric not in {'f1', 'f2'}:
+        raise ValueError(f'Unsupported threshold metric: {metric!r}')
+    grid_size = max(3, int(getattr(config, 'THRESHOLD_GRID_SIZE', 1001)))
+    minimum = float(getattr(config, 'THRESHOLD_MIN', 0.0))
+    maximum = float(getattr(config, 'THRESHOLD_MAX', 1.0))
+    quantiles = np.quantile(probabilities, np.linspace(0.0, 1.0, grid_size))
+    candidates = np.unique(np.clip(np.r_[minimum, quantiles, maximum], minimum, maximum))
+    positive_total = int(labels_array.sum())
+    negative_total = int(len(labels_array) - positive_total)
+    rows: list[dict] = []
+    for threshold in candidates:
+        predictions = probabilities >= threshold
+        tp = int(np.sum(predictions & (labels_array == 1)))
+        fp = int(np.sum(predictions & (labels_array == 0)))
+        fn = positive_total - tp
+        tn = negative_total - fp
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / positive_total if positive_total else 0.0
+        f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+        beta2 = 4.0
+        f2 = (1.0 + beta2) * precision * recall / (beta2 * precision + recall) if beta2 * precision + recall else 0.0
+        rows.append(
+            {
+                'threshold': float(threshold),
+                'selected_metric': metric,
+                'selected_metric_value': float(f1 if metric == 'f1' else f2),
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1': float(f1),
+                'f2': float(f2),
+                'flagged_rows': int(tp + fp),
+                'flagged_rate': float((tp + fp) / len(labels_array)) if len(labels_array) else np.nan,
+                'true_positive': tp,
+                'false_positive': fp,
+                'true_negative': tn,
+                'false_negative': fn,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def select_operating_threshold(
+    labels: Sequence[int],
+    calibrated_probabilities: Sequence[float],
+    metric: str | None = None,
+) -> tuple[float, float, pd.DataFrame]:
+    """Select a threshold on the calibration set and return its full curve."""
+    labels_array = np.asarray(labels, dtype=int)
+    if np.unique(labels_array).size < 2:
+        curve = threshold_search_table(labels_array, calibrated_probabilities, metric)
+        return 0.5, 0.0, curve
+    curve = threshold_search_table(labels_array, calibrated_probabilities, metric)
+    tie_breaker = str(getattr(config, 'THRESHOLD_TIE_BREAKER', 'higher_precision')).lower()
+    sort_columns = ['selected_metric_value']
+    ascending = [False]
+    if tie_breaker == 'higher_precision':
+        sort_columns += ['precision', 'recall', 'threshold']
+        ascending += [False, False, False]
+    elif tie_breaker == 'higher_recall':
+        sort_columns += ['recall', 'precision', 'threshold']
+        ascending += [False, False, True]
+    elif tie_breaker == 'lower_threshold':
+        sort_columns += ['threshold']
+        ascending += [True]
+    else:
+        sort_columns += ['threshold']
+        ascending += [False]
+    best = curve.sort_values(sort_columns, ascending=ascending, kind='mergesort').iloc[0]
+    curve['is_selected'] = np.isclose(curve['threshold'], float(best['threshold']))
+    return float(best['threshold']), float(best['selected_metric_value']), curve
+
+
+def choose_f1_threshold(
+    labels: Sequence[int], calibrated_probabilities: Sequence[float]
+) -> tuple[float, float]:
+    """Select the probability threshold maximizing F1 with stable tie-breaking."""
+    threshold, score, _ = select_operating_threshold(
+        labels, calibrated_probabilities, metric='f1'
+    )
+    return threshold, score
+
+
 def choose_f2_threshold(
     labels: Sequence[int], calibrated_probabilities: Sequence[float]
 ) -> tuple[float, float]:
-    labels_array = np.asarray(labels, dtype=int)
-    probabilities = np.asarray(calibrated_probabilities, dtype=float)
-    if np.unique(labels_array).size < 2:
-        return 0.5, 0.0
-    candidates = np.unique(np.quantile(probabilities, np.linspace(0, 1, 401)))
-    best_threshold = 0.5
-    best_score = -1.0
-    for threshold in candidates:
-        score = fbeta_score(
-            labels_array,
-            probabilities >= threshold,
-            beta=2,
-            zero_division=0,
-        )
-        if score > best_score:
-            best_threshold = float(threshold)
-            best_score = float(score)
-    return best_threshold, best_score
+    """Backward-compatible wrapper for the previous F2 behavior."""
+    threshold, score, _ = select_operating_threshold(
+        labels, calibrated_probabilities, metric='f2'
+    )
+    return threshold, score
+
+
+def choose_configured_threshold(
+    labels: Sequence[int], calibrated_probabilities: Sequence[float]
+) -> tuple[float, float, pd.DataFrame]:
+    """Select the operating threshold using the configured F1 or F2 objective."""
+    return select_operating_threshold(
+        labels,
+        calibrated_probabilities,
+        metric=getattr(config, 'THRESHOLD_SELECTION_METRIC', 'f1'),
+    )
 
 
 def top_k_metrics(
     labels: Sequence[int], scores: Sequence[float], top_fraction: float
 ) -> dict:
+    """Calculate precision, recall, and lift for the highest-risk fraction."""
     labels_array = np.asarray(labels, dtype=int)
     scores_array = np.asarray(scores, dtype=float)
     review_count = max(1, int(np.ceil(len(labels_array) * top_fraction)))
@@ -467,6 +654,7 @@ def evaluate_predictions(
     calibrated_probabilities: Sequence[float],
     threshold: float,
 ) -> dict:
+    """Calculate ranking, classification, and calibration metrics for predictions."""
     labels_array = np.asarray(labels, dtype=int)
     raw_scores_array = np.asarray(raw_scores, dtype=float)
     calibrated_array = np.asarray(calibrated_probabilities, dtype=float)
@@ -499,6 +687,7 @@ def summarize_oof_predictions(
     predictions: pd.DataFrame,
     grouping_column: str,
 ) -> pd.DataFrame:
+    """Aggregate out-of-fold predictions into one summary metric dictionary."""
     rows: list[dict] = []
     for group_name, group in predictions.groupby(grouping_column, sort=False):
         labels = group[config.TARGET_COLUMN].astype(int).to_numpy()
@@ -541,6 +730,7 @@ def summarize_oof_predictions(
 def risk_decile_table(
     predictions: pd.DataFrame, grouping_column: str = 'variant'
 ) -> pd.DataFrame:
+    """Summarize observed outcomes by descending calibrated-risk decile."""
     rows: list[dict] = []
     for group_name, group in predictions.groupby(grouping_column, sort=False):
         scores = group['score'].to_numpy()
@@ -569,6 +759,7 @@ def top_k_table(
     grouping_column: str = 'variant',
     fractions: Iterable[float] = (0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30),
 ) -> pd.DataFrame:
+    """Build a table of ranking metrics at configured Top-K rates."""
     rows: list[dict] = []
     for group_name, group in predictions.groupby(grouping_column, sort=False):
         labels = group[config.TARGET_COLUMN].astype(int).to_numpy()
@@ -582,6 +773,7 @@ def top_k_table(
 
 
 def friendly_feature_name(column: str) -> str:
+    """Convert a technical feature name into a readable explanation label."""
     history_noun = config.TARGET_HISTORY_NOUN
     exact = {
         'days_since_prior_target_event': f'days since prior {history_noun}',
@@ -614,6 +806,7 @@ def friendly_feature_name(column: str) -> str:
 
 
 def _series(frame: pd.DataFrame, name: str, default: float = 0.0) -> pd.Series:
+    """Return a numeric dataframe column or an aligned default-valued series."""
     if name in frame.columns:
         return pd.to_numeric(frame[name], errors='coerce').fillna(default)
     return pd.Series(default, index=frame.index, dtype=float)

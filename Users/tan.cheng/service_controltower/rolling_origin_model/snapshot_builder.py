@@ -22,8 +22,37 @@ import config
 from target_events import load_target_events
 
 
+@dataclass(frozen=True)
+class SourceFileSet:
+    """Paths for one complete snapshot-building source bundle.
+
+    The default training pipeline uses :meth:`from_config`. Production scoring
+    may instead supply temporary, deduplicated files prepared from the newest
+    three-month refresh plus retained historical state.
+    """
+
+    fault: Path
+    fluid: Path
+    maintenance: Path
+    operation: Path
+    target: Path
+
+    @classmethod
+    def from_config(cls) -> "SourceFileSet":
+        """Construct source paths from the active values in ``config.py``."""
+        return cls(
+            fault=Path(config.FAULT_FILE),
+            fluid=Path(config.FLUID_FILE),
+            maintenance=Path(config.MAINTENANCE_FILE),
+            operation=Path(config.OPERATION_FILE),
+            target=Path(config.TARGET_FILE),
+        )
+
+
 @dataclass
 class SnapshotSources:
+    """Normalized source tables and lookup state used to build snapshots."""
+
     target_events: pd.DataFrame
     target_event_day: pd.DataFrame
     fault: pd.DataFrame
@@ -39,12 +68,14 @@ class SnapshotSources:
 
 
 def machine_key_from_model_serial(model: pd.Series, serial: pd.Series) -> pd.Series:
+    """Create canonical machine keys from separate model and serial columns."""
     model_text = model.astype('string').str.strip().str.upper()
     serial_text = serial.astype('string').str.extract(r'(\d+)', expand=False)
     return model_text + '-' + serial_text
 
 
 def normalize_machine_key(series: pd.Series) -> pd.Series:
+    """Normalize existing machine identifiers to uppercase ``MODEL-SERIAL`` keys."""
     return (
         series.astype('string')
         .str.strip()
@@ -54,6 +85,7 @@ def normalize_machine_key(series: pd.Series) -> pd.Series:
 
 
 def as_bool(series: pd.Series) -> pd.Series:
+    """Convert common textual and numeric boolean encodings to ``bool``."""
     if series.dtype == bool:
         return series.fillna(False)
     return (
@@ -67,29 +99,60 @@ def as_bool(series: pd.Series) -> pd.Series:
 
 
 def safe_name(value: str) -> str:
+    """Return an ASCII-safe token for generated feature-column names."""
     return re.sub(r'[^A-Za-z0-9]+', '_', str(value)).strip('_')
 
 
-def _require_files() -> None:
+def _require_files(source_files: SourceFileSet) -> None:
+    """Raise a clear error when any required source bundle file is missing."""
     required = [
-        config.FAULT_FILE,
-        config.FLUID_FILE,
-        config.MAINTENANCE_FILE,
-        config.OPERATION_FILE,
-        config.TARGET_FILE,
+        source_files.fault,
+        source_files.fluid,
+        source_files.maintenance,
+        source_files.operation,
+        source_files.target,
     ]
     missing = [str(path) for path in required if not Path(path).exists()]
     if missing:
         raise FileNotFoundError('Missing required source files:\n' + '\n'.join(missing))
 
 
-def load_sources(include_operation_features: bool = True) -> SnapshotSources:
-    """Load and normalize all sources once."""
-    _require_files()
+def load_sources(
+    include_operation_features: bool = True,
+    source_files: SourceFileSet | None = None,
+    candidate_serious_codes: Iterable[str] | None = None,
+    machine_roster: Iterable[str] | None = None,
+) -> SnapshotSources:
+    """Load and normalize all source tables for snapshot construction.
+
+    Parameters
+    ----------
+    include_operation_features:
+        When false, load only the operation roster and emit stable zero-valued
+        operation features. This is useful for condition-only model variants.
+    source_files:
+        Optional path bundle. Omit it for the normal training pipeline; provide
+        it for incoming-data scoring after source preparation.
+    candidate_serious_codes:
+        Optional fixed fault-code list. Production scoring should pass the code
+        features stored in the trained model metadata so the scoring schema is
+        identical to training even when the incoming extract is only 90 days.
+    machine_roster:
+        Optional complete fleet roster. Values are normalized and unioned with
+        machines observed in the source tables so inactive machines remain in
+        a production scoring snapshot even when they have no recent events.
+
+    Returns
+    -------
+    SnapshotSources
+        Normalized tables, fleet roster, and reusable lookup information.
+    """
+    source_files = source_files or SourceFileSet.from_config()
+    _require_files(source_files)
     load_started = time.time()
     print('[sources] starting source normalization', flush=True)
 
-    target_tables = load_target_events()
+    target_tables = load_target_events(source_files.target)
     target_events = target_tables.raw
     target_event_day = target_tables.by_machine_day
     print(
@@ -105,7 +168,7 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
         'failure_code_evidence_score', 'failure_code_evidence_group',
         'action_level_num',
     ]
-    fault = pd.read_csv(config.FAULT_FILE, usecols=fault_columns, low_memory=False)
+    fault = pd.read_csv(source_files.fault, usecols=fault_columns, low_memory=False)
     fault['machine_key'] = machine_key_from_model_serial(
         fault['full_model'], fault['serial_number']
     )
@@ -162,13 +225,18 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
         .sort_values(['event_date', 'machine_key'])
         .reset_index(drop=True)
     )
-    candidate_serious_codes = (
-        fault.loc[fault['is_serious'].eq(1), 'fault_code']
-        .astype('string')
-        .value_counts()
-        .head(config.TOP_CODE_CANDIDATE_COUNT)
-        .index.tolist()
-    )
+    if candidate_serious_codes is None:
+        candidate_serious_codes = (
+            fault.loc[fault['is_serious'].eq(1), 'fault_code']
+            .astype('string')
+            .value_counts()
+            .head(config.TOP_CODE_CANDIDATE_COUNT)
+            .index.tolist()
+        )
+    else:
+        candidate_serious_codes = [
+            str(code).strip() for code in candidate_serious_codes if str(code).strip()
+        ]
     candidate_code_names = {
         code: f'fault_code_{safe_name(code)}_90d'
         for code in candidate_serious_codes
@@ -182,7 +250,7 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
         'Fuel_Fuel_PERCENT', 'Si_Silicon_PPM', 'Fe_Iron_PPM',
         'Cu_Copper_PPM', 'TELEMETRY_SMR_NUMERIC',
     ]
-    fluid = pd.read_csv(config.FLUID_FILE, usecols=fluid_columns, low_memory=False)
+    fluid = pd.read_csv(source_files.fluid, usecols=fluid_columns, low_memory=False)
     fluid['machine_key'] = machine_key_from_model_serial(fluid['FULL_MODEL'], fluid['SERIAL'])
     fluid['event_date'] = pd.to_datetime(fluid['sample_drawn_date'], errors='coerce')
     fluid = fluid[
@@ -237,7 +305,7 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
         'remaining_hours', 'INTERVAL_HOURS',
     ]
     maintenance = pd.read_csv(
-        config.MAINTENANCE_FILE,
+        source_files.maintenance,
         usecols=maintenance_columns,
         low_memory=False,
     )
@@ -263,7 +331,7 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
     ]
     if include_operation_features:
         operation = pd.read_csv(
-            config.OPERATION_FILE,
+            source_files.operation,
             usecols=operation_columns,
             low_memory=False,
         )
@@ -302,7 +370,7 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
             )
         else:
             operation_roster = pd.read_csv(
-                config.OPERATION_FILE,
+                source_files.operation,
                 usecols=['full_model', 'SERIAL'],
                 low_memory=False,
             ).dropna(subset=['full_model', 'SERIAL'])
@@ -329,8 +397,18 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
     fluid_machines = set(fluid['machine_key'].dropna().unique().tolist())
     maintenance_machines = set(maintenance['machine_key'].dropna().unique().tolist())
     operation_machines = operation_roster_machines
+    supplied_roster = set()
+    if machine_roster is not None:
+        roster_series = pd.Series(list(machine_roster), dtype='string')
+        supplied_roster = set(
+            normalize_machine_key(roster_series).dropna().unique().tolist()
+        )
     all_machines = sorted(
-        fault_machines | fluid_machines | maintenance_machines | operation_machines
+        fault_machines
+        | fluid_machines
+        | maintenance_machines
+        | operation_machines
+        | supplied_roster
     )
     print(f'[sources] fleet roster complete={len(all_machines):,}: {time.time() - load_started:.1f}s', flush=True)
     machine_index = pd.Index(all_machines, name='machine_key')
@@ -348,6 +426,7 @@ def load_sources(include_operation_features: bool = True) -> SnapshotSources:
         'operation_features_loaded': bool(include_operation_features),
         'operation_machines': int(len(operation_roster_machines)),
         'fleet_roster_machines': int(len(machine_index)),
+        'supplied_roster_machines': int(len(supplied_roster)),
         'candidate_serious_codes': candidate_serious_codes,
         'raw_warranty_csv_used': config.TARGET_SOURCE == 'warranty',
     }
@@ -580,7 +659,12 @@ def build_snapshot_dataframe(
             )
             staleness = (snapshot_date - latest_known['event_date']).dt.days
             active = staleness.le(config.FLUID_LOCF_EXPIRY_DAYS)
-            active_aligned = active.reindex(machine_index).fillna(False)
+            active_aligned = (
+                active.reindex(machine_index)
+                .astype('boolean')
+                .fillna(False)
+                .astype(bool)
+            )
             feature['fluid_current_severity'] = (
                 latest_known['severity_known']
                 .reindex(machine_index)
@@ -621,7 +705,12 @@ def build_snapshot_dataframe(
             )
             any_staleness = (snapshot_date - latest_fluid['event_date']).dt.days
             any_active = any_staleness.le(config.FLUID_LOCF_EXPIRY_DAYS)
-            any_active_aligned = any_active.reindex(machine_index).fillna(False)
+            any_active_aligned = (
+                any_active.reindex(machine_index)
+                .astype('boolean')
+                .fillna(False)
+                .astype(bool)
+            )
             feature['fluid_contaminant_flag'] = (
                 latest_fluid['contaminant_flag']
                 .reindex(machine_index)

@@ -1,4 +1,4 @@
-"""Step 10: deployment-style multi-anchor natural-prevalence fleet evaluation.
+"""Run deployment-style multi-anchor natural-prevalence fleet validation.
 
 For each rolling-origin fold, this script:
 
@@ -41,6 +41,7 @@ from sklearn.metrics import (
 )
 
 import config
+from risk_tier_utils import calibrated_probability_to_risk_index
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
@@ -53,6 +54,7 @@ PREDICTION_DIR = OUTPUT_DIR / "predictions_by_anchor"
 
 
 def _stable_seed(*parts: object) -> int:
+    """Derive a deterministic random seed from reproducible input parts."""
     payload = "|".join(
         [str(config.MULTI_ANCHOR_FLEET_RANDOM_STATE), *[str(part) for part in parts]]
     )
@@ -62,6 +64,7 @@ def _stable_seed(*parts: object) -> int:
 
 
 def _safe_token(value: object) -> str:
+    """Convert arbitrary text into a stable filename-safe token."""
     return (
         str(value)
         .replace("%", "pct")
@@ -121,6 +124,39 @@ def _random_spread_dates(
             "MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS."
         )
     return fallback
+
+
+def _evenly_spaced_dates(
+    start: pd.Timestamp,
+    end_exclusive: pd.Timestamp,
+    count: int,
+    minimum_spacing_days: int,
+) -> list[pd.Timestamp]:
+    """Select deterministic dates spanning the full eligible interval."""
+    candidates = pd.date_range(
+        start.normalize(),
+        end_exclusive.normalize() - pd.Timedelta(days=1),
+        freq="D",
+    )
+    if len(candidates) < count:
+        raise ValueError(
+            f"Only {len(candidates)} eligible anchor days are available, but "
+            f"{count} were requested."
+        )
+    positions = np.rint(np.linspace(0, len(candidates) - 1, count)).astype(int)
+    anchors = [pd.Timestamp(candidates[position]) for position in positions]
+    if len(set(anchors)) != count:
+        raise ValueError("Evenly spaced anchor generation produced duplicate dates.")
+    if any(
+        (right - left).days < minimum_spacing_days
+        for left, right in zip(anchors, anchors[1:])
+    ):
+        raise ValueError(
+            "The fold is too short for the requested evenly spaced anchor count "
+            "and minimum spacing. Reduce MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD or "
+            "MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS."
+        )
+    return anchors
 
 
 def build_anchor_manifest(sources) -> pd.DataFrame:
@@ -186,16 +222,37 @@ def build_anchor_manifest(sources) -> pd.DataFrame:
                     )
             anchor_mode = "fixed_common_dates"
         else:
-            anchors = _random_spread_dates(
-                start=fold_start,
-                end_exclusive=mature_end,
-                count=int(config.MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD),
-                minimum_spacing_days=int(
-                    config.MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS
-                ),
-                seed=_stable_seed(fold_name, "forward_validation"),
-            )
-            anchor_mode = "reproducible_random_dates"
+            anchor_mode = str(
+                getattr(
+                    config,
+                    "MULTI_ANCHOR_FLEET_ANCHOR_MODE",
+                    "reproducible_random_dates",
+                )
+            ).lower()
+            if anchor_mode == "evenly_spaced":
+                anchors = _evenly_spaced_dates(
+                    start=fold_start,
+                    end_exclusive=mature_end,
+                    count=int(config.MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD),
+                    minimum_spacing_days=int(
+                        config.MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS
+                    ),
+                )
+            elif anchor_mode == "reproducible_random_dates":
+                anchors = _random_spread_dates(
+                    start=fold_start,
+                    end_exclusive=mature_end,
+                    count=int(config.MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD),
+                    minimum_spacing_days=int(
+                        config.MULTI_ANCHOR_FLEET_MIN_DAYS_BETWEEN_ANCHORS
+                    ),
+                    seed=_stable_seed(fold_name, "forward_validation"),
+                )
+            else:
+                raise ValueError(
+                    "Unsupported MULTI_ANCHOR_FLEET_ANCHOR_MODE: "
+                    f"{anchor_mode!r}."
+                )
 
         for index, anchor_date in enumerate(anchors, start=1):
             rows.append(
@@ -273,6 +330,7 @@ def annotate_next_target_event(scored_base: pd.DataFrame, sources) -> pd.DataFra
 
 
 def _wilson_interval(successes: int, trials: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Calculate a two-sided Wilson interval for a binomial proportion."""
     if trials <= 0:
         return np.nan, np.nan
     proportion = successes / trials
@@ -290,6 +348,7 @@ def _wilson_interval(successes: int, trials: int, z: float = 1.959963984540054) 
 
 
 def _rank_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
+    """Rank all machines for one anchor date by calibrated model risk."""
     out = anchor.sort_values(
         ["raw_score", "machine_key"],
         ascending=[False, True],
@@ -297,12 +356,9 @@ def _rank_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
     out["risk_rank_within_anchor"] = np.arange(1, len(out) + 1, dtype=int)
     out["eligible_machines_at_anchor"] = int(len(out))
-    if len(out) > 1:
-        out["risk_index"] = 100.0 * (
-            len(out) - out["risk_rank_within_anchor"]
-        ) / (len(out) - 1)
-    else:
-        out["risk_index"] = 100.0
+    out["risk_index"] = calibrated_probability_to_risk_index(
+        out["calibrated_probability"]
+    )
     out["score_top_fraction_within_anchor"] = (
         out["risk_rank_within_anchor"] / len(out)
     )
@@ -322,6 +378,7 @@ def _selection_row(
     selection_type: str,
     selection_value: float | int,
 ) -> dict:
+    """Create one Top-K or Top-N performance row for an anchor ranking."""
     n_rows = len(anchor)
     if selection_type == "top_k_fraction":
         requested_count = max(1, int(math.ceil(n_rows * float(selection_value))))
@@ -372,6 +429,7 @@ def _selection_row(
 
 
 def evaluate_anchor(anchor: pd.DataFrame) -> tuple[dict, list[dict]]:
+    """Train on historical data and evaluate one deployment-style anchor date."""
     labels = anchor["true_label_90d"].astype(int).to_numpy()
     raw_scores = anchor["raw_score"].to_numpy(dtype=float)
     probabilities = anchor["calibrated_probability"].to_numpy(dtype=float)
@@ -414,7 +472,76 @@ def evaluate_anchor(anchor: pd.DataFrame) -> tuple[dict, list[dict]]:
     return metric, selections
 
 
+def _resume_completed_fold(
+    algorithm: str,
+    variant: str,
+    fold_name: str,
+    fold_anchors: pd.DataFrame,
+    existing_training: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict], list[dict], dict] | None:
+    """Load a fully checkpointed fold instead of retraining it."""
+    if not bool(getattr(config, "MULTI_ANCHOR_FLEET_RESUME", True)):
+        return None
+    prediction_dir = (
+        PREDICTION_DIR / _safe_token(algorithm) / _safe_token(variant)
+    )
+    ranked_parts: list[pd.DataFrame] = []
+    metric_rows: list[dict] = []
+    selection_rows: list[dict] = []
+    for anchor_id, anchor in fold_anchors.groupby("anchor_id", sort=True):
+        anchor_date = pd.Timestamp(anchor["snapshot_date"].iloc[0])
+        filename = (
+            f"{algorithm}__{variant}__{fold_name}__"
+            f"{anchor_date.strftime('%Y-%m-%d')}__fleet_scores_sorted.csv.gz"
+        )
+        path = prediction_dir / filename
+        if not path.exists():
+            return None
+        ranked = pd.read_csv(path, low_memory=False)
+        for column in (
+            "snapshot_date",
+            "anchor_date",
+            "next_target_event_date",
+            "feature_window_start",
+            "feature_window_end_exclusive",
+            "outcome_window_start",
+            "outcome_window_end_exclusive",
+        ):
+            if column in ranked.columns:
+                ranked[column] = pd.to_datetime(ranked[column], errors="coerce")
+        metric, selections = evaluate_anchor(ranked)
+        common = {
+            "algorithm": algorithm,
+            "variant": variant,
+            "fold": fold_name,
+            "evaluation_role": "forward_validation",
+            "anchor_id": anchor_id,
+            "anchor_date": anchor_date,
+            "outcome_window_complete": bool(
+                ranked["outcome_window_complete"].iloc[0]
+            ),
+        }
+        metric_rows.append({**common, **metric})
+        selection_rows.extend({**common, **row} for row in selections)
+        ranked_parts.append(ranked)
+
+    audit = existing_training[
+        existing_training["algorithm"].eq(algorithm)
+        & existing_training["variant"].eq(variant)
+        & existing_training["fold"].eq(fold_name)
+    ]
+    if audit.empty:
+        return None
+    return (
+        pd.concat(ranked_parts, ignore_index=True),
+        metric_rows,
+        selection_rows,
+        audit.iloc[0].to_dict(),
+    )
+
+
 def aggregate_selection_metrics(per_anchor: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
+    """Aggregate anchor-level ranking metrics across folds and algorithms."""
     rows: list[dict] = []
     for keys, group in per_anchor.groupby(group_columns, dropna=False, sort=True):
         if not isinstance(keys, tuple):
@@ -465,112 +592,6 @@ def aggregate_selection_metrics(per_anchor: pd.DataFrame, group_columns: list[st
         )
         rows.append(row)
     return pd.DataFrame(rows)
-
-
-def _report_markdown(
-    manifest: pd.DataFrame,
-    anchor_metrics: pd.DataFrame,
-    fold_summary: pd.DataFrame,
-    overall_summary: pd.DataFrame,
-    report_title: str = "Multi-Anchor Fleet Evaluation",
-) -> str:
-    lines = [
-        f"# {report_title}",
-        "",
-        "## Design",
-        "",
-        f"- Feature lookback: {config.LOOKBACK_DAYS} days before each anchor.",
-        f"- Outcome horizon: {config.HORIZON_DAYS} days after each anchor.",
-        f"- Target source: {config.TARGET_SOURCE} ({config.TARGET_DISPLAY_NAME}).",
-        f"- Algorithms: {', '.join(config.MULTI_ANCHOR_FLEET_ALGORITHMS)}.",
-        f"- Anchors per fold: {config.MULTI_ANCHOR_FLEET_ANCHORS_PER_FOLD} unless fixed dates are configured.",
-        "- Every reconstructed fleet machine is scored at every anchor; no negative sampling is used.",
-        "- Models are fitted on older monthly snapshots. The reserved calibration months are used for early stopping, Platt calibration, and threshold selection only.",
-        "- Headline ranking results use later forward-validation anchors, not calibration anchors.",
-        "",
-        "## Anchor dates",
-        "",
-        manifest[["fold", "anchor_id", "anchor_date", "outcome_window_end_exclusive", "outcome_window_complete"]]
-        .to_markdown(index=False),
-        "",
-        "## Threshold-free metrics by algorithm, variant, and fold",
-        "",
-    ]
-    if anchor_metrics.empty:
-        lines.append("No completed algorithm results were available.")
-        return "\n".join(lines)
-
-    metric_summary = (
-        anchor_metrics.groupby(["algorithm", "variant", "fold"], as_index=False)
-        .agg(
-            anchor_count=("anchor_id", "nunique"),
-            mean_positive_rate=("positive_rate", "mean"),
-            mean_roc_auc=("roc_auc", "mean"),
-            minimum_roc_auc=("roc_auc", "min"),
-            mean_average_precision=("average_precision", "mean"),
-        )
-    )
-    lines.append(metric_summary.to_markdown(index=False, floatfmt=".4f"))
-    lines.extend(["", "## Top-K and Top-N results by fold", ""])
-    selected_columns = [
-        "algorithm",
-        "variant",
-        "fold",
-        "selection_type",
-        "selection_value",
-        "anchor_count",
-        "micro_precision",
-        "micro_recall",
-        "micro_lift_vs_fleet",
-        "minimum_anchor_precision",
-        "maximum_anchor_precision",
-    ]
-    if fold_summary.empty:
-        lines.append("No fold-level selection results were available.")
-    else:
-        lines.append(fold_summary[selected_columns].to_markdown(index=False, floatfmt=".4f"))
-    lines.extend(["", "## Overall results across all forward anchors", ""])
-    overall_columns = [
-        "algorithm",
-        "variant",
-        "selection_type",
-        "selection_value",
-        "anchor_count",
-        "micro_precision",
-        "micro_precision_ci95_low",
-        "micro_precision_ci95_high",
-        "micro_recall",
-        "micro_recall_ci95_low",
-        "micro_recall_ci95_high",
-        "micro_lift_vs_fleet",
-        "minimum_anchor_precision",
-        "maximum_anchor_precision",
-    ]
-    if overall_summary.empty:
-        lines.append("No overall selection results were available.")
-    else:
-        lines.append(overall_summary[overall_columns].to_markdown(index=False, floatfmt=".4f"))
-    lines.extend(
-        [
-            "",
-            "## Output-file guide",
-            "",
-            "- `multi_anchor_top_k_by_anchor.csv`: Top-K precision and recall for every algorithm, variant, fold, and anchor date.",
-            "- `multi_anchor_top_n_by_anchor.csv`: fixed Top-N precision and recall for every algorithm, variant, fold, and anchor date.",
-            "- `multi_anchor_top_k_by_fold.csv` and `multi_anchor_top_n_by_fold.csv`: pooled fold-level micro precision and recall.",
-            "- `multi_anchor_top_k_overall.csv` and `multi_anchor_top_n_overall.csv`: pooled results across all configured anchors.",
-            "- `by_algorithm/<algorithm>/`: the same result tables restricted to one algorithm.",
-            "- `predictions_by_anchor/<algorithm>/<variant>/`: full fleet files sorted by risk for each anchor date.",
-            "",
-            "## Interpretation cautions",
-            "",
-            "- Consecutive anchors can share machines and overlapping 90-day outcome windows. The aggregate rows therefore summarize deployment opportunities, not independent observations.",
-            "- Wilson intervals describe binomial uncertainty for the pooled selected machine-snapshots. They do not fully adjust for repeated machines across anchors.",
-            "- The F2 threshold is recall-oriented and is not the recommended inspection-capacity rule. Top-K/Top-N ranking is the operational decision layer evaluated here.",
-            "",
-        ]
-    )
-    return "\n".join(lines)
 
 
 def _result_frames(
@@ -668,7 +689,6 @@ def _write_result_tables(
 
 
 def _checkpoint_metric_outputs(
-    manifest: pd.DataFrame,
     anchor_metric_rows: list[dict],
     selection_rows: list[dict],
     training_rows: list[dict],
@@ -701,20 +721,11 @@ def _checkpoint_metric_outputs(
                 fold_subset,
                 overall_subset,
             )
-            report = _report_markdown(
-                manifest,
-                metric_subset,
-                fold_subset,
-                overall_subset,
-                report_title=f"Multi-Anchor Fleet Evaluation - {algorithm}",
-            )
-            (algorithm_dir / "MULTI_ANCHOR_VALIDATION_REPORT.md").write_text(
-                report, encoding="utf-8"
-            )
     return frames
 
 
 def main() -> None:
+    """Run multi-anchor fleet evaluation and build the risk-tier policy inputs."""
     if not bool(config.MULTI_ANCHOR_FLEET_ENABLED):
         print("Multi-anchor evaluation skipped: MULTI_ANCHOR_FLEET_ENABLED=False")
         return
@@ -726,7 +737,7 @@ def main() -> None:
     (OUTPUT_DIR / "by_algorithm").mkdir(parents=True, exist_ok=True)
     started = time.time()
 
-    print("Loading raw sources and selecting random anchors...", flush=True)
+    print("Loading raw sources and selecting anchor dates...", flush=True)
     sources = load_sources(include_operation_features=False)
     fleet_size = int(len(sources.machine_index))
     manifest = build_anchor_manifest(sources)
@@ -734,7 +745,7 @@ def main() -> None:
     print(manifest[["fold", "anchor_id", "anchor_date"]].to_string(index=False))
 
     print(
-        f"Building features for {len(manifest)} random anchor days x "
+        f"Building features for {len(manifest)} anchor days x "
         f"{len(sources.machine_index):,} machines...",
         flush=True,
     )
@@ -751,19 +762,20 @@ def main() -> None:
         validate="many_to_one",
     )
     anchor_base = annotate_next_target_event(anchor_base, sources)
-    anchor_base.to_csv(
-        OUTPUT_DIR / "multi_anchor_feature_dataset.csv.gz",
-        index=False,
-        compression="gzip",
-    )
+    if bool(getattr(config, "MULTI_ANCHOR_FLEET_WRITE_FEATURE_DATASET", True)):
+        anchor_base.to_csv(
+            OUTPUT_DIR / "multi_anchor_feature_dataset.csv.gz",
+            index=False,
+            compression="gzip",
+        )
 
     del sources
     gc.collect()
     from modeling_utils import (
-        choose_f2_threshold,
+        choose_configured_threshold,
         feature_list_for_variant,
         fit_algorithm,
-        fit_platt_calibration,
+        fit_probability_calibration,
         load_snapshot_dataframe,
         make_algorithm,
         rolling_origin_split,
@@ -777,18 +789,45 @@ def main() -> None:
     selection_rows: list[dict] = []
     training_rows: list[dict] = []
     algorithm_error_rows: list[dict] = []
+    training_audit_path = OUTPUT_DIR / "multi_anchor_training_audit.csv"
+    existing_training = (
+        pd.read_csv(training_audit_path, low_memory=False)
+        if training_audit_path.exists()
+        else pd.DataFrame()
+    )
 
     for fold in config.VALIDATION_FOLDS:
         fold_name, fit, calibration, _ = rolling_origin_split(monthly, fold)
+        fit_training = fit
         fold_anchors = anchor_base[anchor_base["fold"].eq(fold_name)].copy()
         for variant in config.MULTI_ANCHOR_FLEET_MODEL_VARIANTS:
             features, top_code_detail = feature_list_for_variant(monthly, fit, variant)
-            x_fit = fit[features].astype(float)
-            y_fit = fit[config.TARGET_COLUMN].astype(int).to_numpy()
+            x_fit = fit_training[features].astype(float)
+            y_fit = fit_training[config.TARGET_COLUMN].astype(int).to_numpy()
             x_cal = calibration[features].astype(float)
             y_cal = calibration[config.TARGET_COLUMN].astype(int).to_numpy()
 
             for algorithm in config.MULTI_ANCHOR_FLEET_ALGORITHMS:
+                resumed = _resume_completed_fold(
+                    algorithm, variant, fold_name, fold_anchors, existing_training
+                )
+                if resumed is not None:
+                    ranked_fold, resumed_metrics, resumed_selections, resumed_training = resumed
+                    all_prediction_parts.append(ranked_fold)
+                    anchor_metric_rows.extend(resumed_metrics)
+                    selection_rows.extend(resumed_selections)
+                    training_rows.append(resumed_training)
+                    _checkpoint_metric_outputs(
+                        anchor_metric_rows, selection_rows, training_rows
+                    )
+                    print(
+                        f"\nResumed algorithm={algorithm}, variant={variant}, "
+                        f"fold={fold_name} from {ranked_fold['anchor_id'].nunique()} "
+                        "checkpointed anchor files.",
+                        flush=True,
+                    )
+                    continue
+
                 print(
                     f"\nTraining algorithm={algorithm}, variant={variant}, fold={fold_name}...",
                     flush=True,
@@ -799,22 +838,31 @@ def main() -> None:
                         algorithm, model, x_fit, y_fit, x_cal, y_cal
                     )
                     raw_cal = model.predict_proba(x_cal)[:, 1]
-                    platt = fit_platt_calibration(y_cal, raw_cal)
-                    calibrated_cal = platt.apply(raw_cal)
-                    threshold, calibration_f2 = choose_f2_threshold(
+                    calibrator = fit_probability_calibration(y_cal, raw_cal)
+                    calibrated_cal = calibrator.apply(raw_cal)
+                    threshold, calibration_threshold_score, threshold_curve = choose_configured_threshold(
                         y_cal, calibrated_cal
                     )
 
                     raw_anchor = model.predict_proba(
                         fold_anchors[features].astype(float)
                     )[:, 1]
-                    calibrated_anchor = platt.apply(raw_anchor)
+                    calibrated_anchor = calibrator.apply(raw_anchor)
                     scored = fold_anchors.copy()
                     scored["algorithm"] = algorithm
                     scored["variant"] = variant
                     scored["raw_score"] = raw_anchor
                     scored["calibrated_probability"] = calibrated_anchor
+                    scored["calibration_method"] = (
+                        config.PROBABILITY_CALIBRATION_METHOD
+                        if config.PROBABILITY_CALIBRATION_ENABLED
+                        else "none"
+                    )
+                    scored["threshold_metric"] = config.THRESHOLD_SELECTION_METRIC
                     scored["calibration_threshold"] = threshold
+                    scored["calibration_threshold_score"] = (
+                        calibration_threshold_score
+                    )
                     scored["prediction_label_at_calibration_threshold"] = (
                         calibrated_anchor >= threshold
                     ).astype("int8")
@@ -870,8 +918,8 @@ def main() -> None:
                             "algorithm": algorithm,
                             "variant": variant,
                             "fold": fold_name,
-                            "fit_rows": int(len(fit)),
-                            "fit_snapshot_dates": int(fit["snapshot_date"].nunique()),
+                            "fit_rows": int(len(fit_training)),
+                            "fit_snapshot_dates": int(fit_training["snapshot_date"].nunique()),
                             "calibration_rows": int(len(calibration)),
                             "calibration_snapshot_dates": int(
                                 calibration["snapshot_date"].nunique()
@@ -886,14 +934,41 @@ def main() -> None:
                                 item["feature"] for item in top_code_detail
                             ),
                             "best_iteration": int(best_iteration),
-                            "platt_coefficient": float(platt.coefficient),
-                            "platt_intercept": float(platt.intercept),
+                            "calibration_method": (
+                                config.PROBABILITY_CALIBRATION_METHOD
+                                if config.PROBABILITY_CALIBRATION_ENABLED
+                                else "none"
+                            ),
+                            "platt_coefficient": float(calibrator.coefficient),
+                            "platt_intercept": float(calibrator.intercept),
                             "calibration_threshold": float(threshold),
-                            "calibration_f2": float(calibration_f2),
+                            "threshold_metric": config.THRESHOLD_SELECTION_METRIC,
+                            "calibration_threshold_score": float(
+                                calibration_threshold_score
+                            ),
+                            "calibration_precision_at_threshold": float(
+                                threshold_curve.loc[
+                                    threshold_curve["is_selected"], "precision"
+                                ].iloc[0]
+                            ),
+                            "calibration_recall_at_threshold": float(
+                                threshold_curve.loc[
+                                    threshold_curve["is_selected"], "recall"
+                                ].iloc[0]
+                            ),
+                            "calibration_f1_at_threshold": float(
+                                threshold_curve.loc[
+                                    threshold_curve["is_selected"], "f1"
+                                ].iloc[0]
+                            ),
+                            "calibration_f2_at_threshold": float(
+                                threshold_curve.loc[
+                                    threshold_curve["is_selected"], "f2"
+                                ].iloc[0]
+                            ),
                         }
                     )
                     _checkpoint_metric_outputs(
-                        manifest,
                         anchor_metric_rows,
                         selection_rows,
                         training_rows,
@@ -938,7 +1013,6 @@ def main() -> None:
 
     anchor_metrics, selections, training, fold_summary, overall_summary = (
         _checkpoint_metric_outputs(
-            manifest,
             anchor_metric_rows,
             selection_rows,
             training_rows,
@@ -997,22 +1071,13 @@ def main() -> None:
             compression="gzip",
         )
 
-    report = _report_markdown(
-        manifest,
-        anchor_metrics,
-        fold_summary,
-        overall_summary,
-    )
-    (OUTPUT_DIR / "MULTI_ANCHOR_VALIDATION_REPORT.md").write_text(
-        report, encoding="utf-8"
-    )
     if algorithm_error_rows:
         pd.DataFrame(algorithm_error_rows).to_csv(
             OUTPUT_DIR / "multi_anchor_algorithm_errors.csv", index=False
         )
 
     run_summary = {
-        "step": "10_multi_anchor_fleet_evaluation",
+        "step": "06_multi_anchor_validation",
         "strategy": "fixed/common or reproducible forward-validation anchor days; all fleet machines; natural prevalence; rank within anchor",
         "algorithms_requested": list(config.MULTI_ANCHOR_FLEET_ALGORITHMS),
         "algorithms_completed": sorted(anchor_metrics["algorithm"].unique().tolist()),
@@ -1035,6 +1100,9 @@ def main() -> None:
         "target_display_name": config.TARGET_DISPLAY_NAME,
         "fixed_anchor_dates_used": bool(
             getattr(config, "MULTI_ANCHOR_FLEET_FIXED_DATES", None)
+        ),
+        "anchor_mode": str(
+            getattr(config, "MULTI_ANCHOR_FLEET_ANCHOR_MODE", "fixed_common_dates")
         ),
         "elapsed_seconds": float(time.time() - started),
         "notes": [

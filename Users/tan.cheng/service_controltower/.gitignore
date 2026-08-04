@@ -67,6 +67,8 @@ case_control_modeling/output/**
 rolling_origin_model/outputs/**
 /rolling_origin_model/models/**
 rolling_origin_model/models/**
+/rolling_origin_model/charts/**
+rolling_origin_model/charts/**
 
 /non_overlap_window_model/outputs/**
 non_overlap_window_model/outputs/**

@@ -1,8 +1,8 @@
-"""Prepare compact operation caches for faster repeated model runs.
+"""Prepare a compact operation file and complete machine roster.
 
-The uploaded partial operation CSV may contain a long blank tail. This step
-streams the source once, writes only rows with a populated LOCAL_DATE, and
-creates a tiny unique machine-roster file. All settings come from config.py.
+The source may contain rows without a usable observation date. This stage
+streams the operation CSV, retains dated records, and writes a unique machine
+roster used by the dense snapshot builder.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import config
 
 
 def _machine_key(model: str, serial: str) -> str | None:
+    """Build a canonical machine key from raw model and serial values."""
     model_text = str(model).strip().upper()
     match = re.search(r"(\d+)", str(serial))
     if not model_text or match is None:
@@ -24,6 +25,7 @@ def _machine_key(model: str, serial: str) -> str | None:
 
 
 def main() -> None:
+    """Stream the raw operation CSV into compact clean and fleet-roster caches."""
     raw_path = Path(config.OPERATION_RAW_FILE)
     clean_path = Path(config.OPERATION_CLEAN_FILE)
     roster_path = Path(config.OPERATION_ROSTER_FILE)
