@@ -46,6 +46,16 @@ class PreparedScoringBundle:
     work_dir: Path
 
 
+@dataclass(frozen=True)
+class MockedIncomingBundle:
+    """Canonical mocked incoming files generated from retained source history."""
+
+    score_date: pd.Timestamp
+    incoming_dir: Path
+    manifest_path: Path
+    source_paths: dict[str, Path]
+
+
 FAULT_COLUMNS = (
     "serial_number",
     "full_model",
@@ -354,10 +364,202 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _latest_source_date(path: Path, date_column: str) -> pd.Timestamp:
+    """Return the latest valid date in a CSV without loading the full source."""
+    latest: pd.Timestamp | None = None
+    for chunk in pd.read_csv(
+        path,
+        usecols=[date_column],
+        chunksize=250_000,
+        low_memory=False,
+        encoding="utf-8-sig",
+    ):
+        parsed = pd.to_datetime(chunk[date_column], errors="coerce", format="mixed")
+        if not parsed.notna().any():
+            continue
+        chunk_latest = pd.Timestamp(parsed.max()).normalize()
+        if latest is None or chunk_latest > latest:
+            latest = chunk_latest
+    if latest is None:
+        raise ValueError(f"No valid {date_column!r} values were found in {path}.")
+    return latest
+
+
+def infer_mocked_score_date(score_date: pd.Timestamp | str | None = None) -> pd.Timestamp:
+    """Choose the mocked inference date from config or retained operation data.
+
+    When no explicit date is supplied, the latest date present in the retained
+    operation source is used as the snapshot cutoff. Feature construction is
+    left-closed and right-open, so records on that cutoff date are excluded;
+    this avoids treating a potentially partial latest day as complete history.
+    """
+    configured = score_date or getattr(config, "MOCKED_INCOMING_SCORE_DATE", None)
+    if configured is not None:
+        resolved = pd.Timestamp(configured).normalize()
+    else:
+        operation_spec = source_specs()["operation"]
+        resolved = _latest_source_date(
+            _base_source_path("operation"), operation_spec.date_column
+        )
+    if pd.isna(resolved):
+        raise ValueError("Could not determine a valid mocked scoring date.")
+    return resolved
+
+
+def _read_mocked_window(
+    path: Path,
+    spec: SourceSpec,
+    score_date: pd.Timestamp,
+    history_days: int,
+    chunk_size: int = 250_000,
+) -> pd.DataFrame:
+    """Read only the trailing mocked refresh window before ``score_date``.
+
+    The returned dataframe contains the same required/optional columns consumed
+    by production preprocessing. Records on or after the score date are always
+    excluded, including future target events.
+    """
+    usecols = _validate_source_schema(path, spec)
+    start_date = score_date - pd.Timedelta(days=int(history_days))
+    frames: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(
+        path,
+        usecols=list(usecols),
+        chunksize=chunk_size,
+        low_memory=False,
+        encoding="utf-8-sig",
+    ):
+        parsed = pd.to_datetime(chunk[spec.date_column], errors="coerce", format="mixed")
+        mask = parsed.notna() & parsed.ge(start_date) & parsed.lt(score_date)
+        if not mask.any():
+            continue
+        selected = chunk.loc[mask].copy()
+        selected[spec.date_column] = parsed.loc[mask].dt.strftime("%Y-%m-%d")
+        frames.append(selected)
+    if not frames:
+        return pd.DataFrame(columns=usecols)
+    return pd.concat(frames, ignore_index=True)
+
+
+def _canonical_incoming_name(source_key: str) -> str:
+    """Return the canonical first filename configured for one logical source."""
+    aliases = tuple(config.INCOMING_SOURCE_FILE_ALIASES[source_key])
+    if not aliases:
+        raise ValueError(f"No incoming filename aliases configured for {source_key!r}.")
+    return str(aliases[0])
+
+
+def generate_mocked_incoming_data(
+    incoming_dir: Path | None = None,
+    score_date: pd.Timestamp | str | None = None,
+) -> MockedIncomingBundle:
+    """Generate a deterministic three-month incoming refresh from retained data.
+
+    This helper is intended only to exercise the deployment inference path before
+    a genuine new extract is available. It does not evaluate future outcomes.
+    The full retained machine roster is still passed to snapshot construction,
+    so every known machine receives a score even when it has no event rows in
+    the trailing source window.
+    """
+    resolved_date = infer_mocked_score_date(score_date)
+    history_days = int(config.MOCKED_INCOMING_HISTORY_DAYS)
+    if history_days < int(config.LOOKBACK_DAYS):
+        raise ValueError(
+            "MOCKED_INCOMING_HISTORY_DAYS must be at least LOOKBACK_DAYS so all "
+            "approved short-window features can be reconstructed."
+        )
+    destination = Path(incoming_dir or config.INCOMING_DATA_DIR)
+    destination.mkdir(parents=True, exist_ok=True)
+    specs = source_specs()
+    target_key = str(config.TARGET_SOURCE)
+    source_paths: dict[str, Path] = {}
+    manifest_sources: dict[str, dict[str, object]] = {}
+    window_start = resolved_date - pd.Timedelta(days=history_days)
+
+    for source_key in ("fault", "fluid", "maintenance", "operation", target_key):
+        source_path = _base_source_path(source_key)
+        if not source_path.exists():
+            if source_key == target_key and bool(config.INCOMING_ALLOW_MISSING_TARGET_REFRESH):
+                continue
+            raise FileNotFoundError(
+                f"Retained source required for mocked incoming data is missing: {source_path}"
+            )
+        output_path = destination / _canonical_incoming_name(source_key)
+        if output_path.exists() and not bool(config.MOCKED_INCOMING_OVERWRITE):
+            raise FileExistsError(
+                f"Mocked incoming file already exists and overwrite is disabled: {output_path}"
+            )
+        frame = _read_mocked_window(
+            source_path,
+            specs[source_key],
+            resolved_date,
+            history_days,
+        )
+        if source_key == "operation" and frame.empty:
+            raise ValueError(
+                f"No operation rows exist in the mocked window ending {resolved_date.date()}."
+            )
+        frame.to_csv(output_path, index=False)
+        source_paths[source_key] = output_path
+        dates = pd.to_datetime(frame[specs[source_key].date_column], errors="coerce")
+        manifest_sources[source_key] = {
+            "retained_source": str(source_path),
+            "generated_file": str(output_path),
+            "rows": int(len(frame)),
+            "date_min": str(dates.min().date()) if dates.notna().any() else None,
+            "date_max": str(dates.max().date()) if dates.notna().any() else None,
+            "sha256": _sha256(output_path),
+        }
+
+    operation_frame = pd.read_csv(
+        source_paths["operation"],
+        usecols=["full_model", "SERIAL"],
+        low_memory=False,
+    )
+    operation_machines = _machine_keys(operation_frame, "full_model", "SERIAL")
+    retained_roster = set(load_retained_machine_roster())
+    missing_operation_history = sorted(retained_roster.difference(operation_machines))
+    manifest = {
+        "input_mode": "mocked_data",
+        "score_date": str(resolved_date.date()),
+        "history_window_start_inclusive": str(window_start.date()),
+        "history_window_end_exclusive": str(resolved_date.date()),
+        "history_days": history_days,
+        "future_target_rows_included": False,
+        "retained_machine_roster_count": len(retained_roster),
+        "machines_with_operation_rows_in_window": len(operation_machines),
+        "machines_without_operation_rows_in_window": len(missing_operation_history),
+        "machines_without_operation_rows_examples": missing_operation_history[:20],
+        "sources": manifest_sources,
+    }
+    manifest_path = destination / str(config.MOCKED_INCOMING_MANIFEST_NAME)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return MockedIncomingBundle(
+        score_date=resolved_date,
+        incoming_dir=destination,
+        manifest_path=manifest_path,
+        source_paths=source_paths,
+    )
+
+
+
+
+def _validate_input_mode(input_mode: str) -> str:
+    """Normalize and validate a production scoring input-mode value."""
+    normalized = str(input_mode).strip().lower()
+    supported = tuple(config.SUPPORTED_SCORING_INPUT_MODES)
+    if normalized not in supported:
+        raise ValueError(
+            f"input_mode must be one of {supported}; got {input_mode!r}."
+        )
+    return normalized
+
+
 def prepare_scoring_bundle(
     incoming_dir: Path,
     score_date: pd.Timestamp | str,
     work_dir: Path | None = None,
+    input_mode: str = "new_data",
 ) -> PreparedScoringBundle:
     """Prepare deduplicated source files for one incoming production score date.
 
@@ -365,6 +567,7 @@ def prepare_scoring_bundle(
     maintenance, and target events are merged with retained historical sources
     so long-memory production features remain consistent with model training.
     """
+    input_mode = _validate_input_mode(input_mode)
     score_date = pd.Timestamp(score_date).normalize()
     if pd.isna(score_date):
         raise ValueError("A valid production score date is required.")
@@ -473,7 +676,17 @@ def prepare_scoring_bundle(
         operation=prepared_paths["operation"],
         target=prepared_paths[target_key],
     )
+    mocked_manifest_path = Path(incoming_dir) / str(config.MOCKED_INCOMING_MANIFEST_NAME)
+    mocked_manifest = (
+        json.loads(mocked_manifest_path.read_text(encoding="utf-8"))
+        if input_mode == "mocked_data" and mocked_manifest_path.exists()
+        else None
+    )
     manifest = {
+        "input_mode": str(input_mode),
+        "mocked_incoming_manifest": (
+            str(mocked_manifest_path) if mocked_manifest else None
+        ),
         "score_date": str(score_date.date()),
         "target_source": config.TARGET_SOURCE,
         "incoming_history_days": int(config.INCOMING_SOURCE_HISTORY_DAYS),
@@ -522,9 +735,12 @@ def run_incoming_scoring(
     score_date: pd.Timestamp | str,
     output_dir: Path | None = None,
     include_explanations: bool = True,
+    input_mode: str = "new_data",
 ) -> tuple[pd.DataFrame, dict[str, object], PreparedScoringBundle]:
     """Prepare incoming sources, score the fleet, assign tiers, and save outputs."""
-    bundle = prepare_scoring_bundle(incoming_dir, score_date)
+    bundle = prepare_scoring_bundle(
+        incoming_dir, score_date, input_mode=input_mode
+    )
     snapshot = build_incoming_scoring_snapshot(bundle)
     artifacts = load_production_artifacts()
     scores = score_snapshot_dataframe(
@@ -547,6 +763,7 @@ def run_incoming_scoring(
     summary = scoring_summary(scores, artifacts.variant, score_path.name)
     summary.update(
         {
+            "input_mode": str(input_mode),
             "source_manifest": manifest_copy.name,
             "prepared_snapshot": snapshot_path.name,
             "tier_policy_source": "config.PRODUCTION_TIER_POLICY",

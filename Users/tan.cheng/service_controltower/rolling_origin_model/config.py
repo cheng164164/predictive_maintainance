@@ -13,6 +13,7 @@ Expected local layout::
       rolling_origin_model/
         config.py
         ...scripts...
+        incoming-dir/
 
 All user-controlled settings are kept in this file. Set ``TARGET_SOURCE`` to
 ``"physical_failure"`` or ``"warranty"``. Feature variants may be configured as
@@ -20,7 +21,6 @@ one string or as multiple strings; both forms are normalized automatically.
 """
 from __future__ import annotations
 
-from inspect import Parameter
 from pathlib import Path
 from typing import Iterable
 import json
@@ -118,18 +118,41 @@ CHART_DIR = CHART_ROOT / TARGET_SOURCE
 # ---------------------------------------------------------------------------
 # Production scoring of an incoming three-month source refresh.
 #
-# The incoming directory is expected to contain the most recent source files
-# for the complete active fleet. The production scoring script merges those
-# files with the retained historical sources only where longer memory is
-# required (for example prior target history, PM resets, and fluid LOCF).
+# SCORING_INPUT_MODE controls whether script 10 consumes actual new source
+# extracts or first creates a deterministic mocked refresh from the retained
+# development sources. Both modes use the same preprocessing, model inference,
+# calibration, risk-index calculation, and tier-assignment implementation.
 # ---------------------------------------------------------------------------
-INCOMING_DATA_DIR = PROJECT_ROOT / "incoming_data"
+SUPPORTED_SCORING_INPUT_MODES = ("new_data", "mocked_data")
+SCORING_INPUT_MODE = "mocked_data"
+if SCORING_INPUT_MODE not in SUPPORTED_SCORING_INPUT_MODES:
+    raise ValueError(
+        "SCORING_INPUT_MODE must be one of "
+        f"{SUPPORTED_SCORING_INPUT_MODES}; got {SCORING_INPUT_MODE!r}."
+    )
+
+# The same project-local folder is used for manually supplied new data and for
+# automatically generated mocked data. In mocked mode, canonical source files
+# are regenerated from retained history before scoring.
+INCOMING_DATA_DIR = PROJECT_DIR / "incoming-dir"
 PRODUCTION_SCORING_OUTPUT_DIR = OUTPUT_DIR / "production_scoring"
 PRODUCTION_SCORING_WORK_DIR = OUTPUT_DIR / "production_scoring_work"
 INCOMING_SOURCE_HISTORY_DAYS = 90
-INCOMING_SCORE_DATE = None  # Prefer --score-date YYYY-MM-DD in production.
+INCOMING_SCORE_DATE = None  # Required only for new_data mode when no CLI date is passed.
 INCOMING_REQUIRE_COMPLETE_FLEET_OPERATION = False
 INCOMING_ALLOW_MISSING_TARGET_REFRESH = False
+
+# Mocked scoring writes the preceding source-history window to
+# INCOMING_DATA_DIR. Choose a historical scoring date here to compare different
+# fleet conditions, for example ``"2026-06-01"``. Leave it as ``None`` to use
+# the latest retained operation date. The command-line ``--score-date`` option
+# overrides this setting for one run. Feature construction always uses the
+# left-closed, right-open interval [score_date - LOOKBACK_DAYS, score_date), so
+# records on or after the selected score date and future labels are excluded.
+MOCKED_INCOMING_SCORE_DATE = None
+MOCKED_INCOMING_HISTORY_DAYS = INCOMING_SOURCE_HISTORY_DAYS
+MOCKED_INCOMING_OVERWRITE = True
+MOCKED_INCOMING_MANIFEST_NAME = "mocked_incoming_manifest.json"
 INCOMING_SOURCE_FILE_ALIASES = {
     "fault": ("fault_codes.csv", "fault_codes(6).csv", "fault_codes(5).csv"),
     "fluid": ("fluid_samples.csv", "fluid_samples(10).csv", "fluid_samples(9).csv"),
@@ -221,13 +244,13 @@ XGB_PARAMS = {
     "subsample": 0.8,
     "colsample_bytree": 0.7,
     "min_child_weight": 3,
-    "reg_alpha": 0.05,
-    "reg_lambda": 5.0,
     "objective": "binary:logistic",
-    # Keep aucpr last: XGBoost early stopping monitors the last metric on the
-    # last evaluation set, which is the reserved calibration period.
+    # Keep aucpr last: XGBoost early stopping monitors the last metric
+    # on the last evaluation set, which is the reserved calibration period.
     "eval_metric": ["logloss", "aucpr"],
     "tree_method": "hist",
+    "reg_alpha": 0.05,
+    "reg_lambda": 5.0,
     "early_stopping_rounds": 30,
 }
 
@@ -574,7 +597,7 @@ SUPPORTED_TIER_SELECTION_POLICIES = (
 )
 # A candidate must exceed the historical lower-tail boundary score. With 0.10,
 # approximately 90% of accepted historical anchor boundaries were stronger.
-TIER_SCORE_GATE_QUANTILE = 0.10
+TIER_SCORE_GATE_QUANTILE = 0.1
 # point_quantile uses the empirical lower-tail boundary score.
 # conservative_upper_ci uses the upper 95% bootstrap bound of that quantile,
 # making candidate confirmation more conservative under threshold uncertainty.
@@ -606,25 +629,24 @@ RISK_INDEX_DEFINITION = (
 # ---------------------------------------------------------------------------
 # Approved production model and tier policy.
 #
-# These values are the release-controlled settings used by both the standard
-# latest-scoring script and the incoming-data scoring script. Retraining may
-# generate new candidate parameters and thresholds, but they should be copied
-# here only after validation and stakeholder approval. This makes deployment
-# deterministic and prevents an unreviewed training run from silently changing
-# customer-facing risk tiers.
+# These values are the release-controlled settings used by production scoring.
+# Stage 09 can update them automatically from the final reviewed artifacts. Set
+# RUN_PRODUCTION_SETTINGS_MIGRATION_STEP to False when a retraining workflow
+# should stop before promotion. Keeping the promoted values here makes local and
+# Palantir deployment deterministic and auditable.
 # ---------------------------------------------------------------------------
 PRODUCTION_MODEL_SETTINGS = {
     "variant": "base27_plus_history",
     "algorithm": "xgboost",
     "model_file": "xgboost_base27_plus_history.json",
     "metadata_file": "model_metadata_base27_plus_history.json",
-    "best_iteration": 76,
+    "best_iteration": 136,
     "calibration_method": "platt",
-    "platt_coefficient": 0.7762747621032015,
-    "platt_intercept": -0.4873194660663577,
-    "operating_threshold": 0.247760287346681,
+    "platt_coefficient": 0.7746002927343022,
+    "platt_intercept": -0.48395216806598224,
+    "operating_threshold": 0.23286629007729215,
     "threshold_metric": "f1",
-    "risk_horizon_days": HORIZON_DAYS,
+    "risk_horizon_days": 90,
 }
 
 # Raw fault codes corresponding to the five supervised code features in the
@@ -643,47 +665,79 @@ PRODUCTION_SELECTED_FAULT_CODES = (
 # boundary and then pass the configured risk-index gate. Failed candidates are
 # demoted and tested against the next lower enabled tier.
 PRODUCTION_TIER_POLICY = {
-    "policy_version": 4,
+    "policy_version": 8,
     "algorithm": "xgboost",
     "variant": "base27_plus_history",
-    "candidate_selection": "nested cumulative fixed Top-N boundaries",
+    "candidate_selection": "nested cumulative fixed Top-N boundaries with an explicitly marked Critical maximum-precision N=1..5 fallback",
     "confirmation_rule": "risk_index_only",
-    "confidence_level": TIER_CONFIDENCE_LEVEL,
-    "risk_index_definition": RISK_INDEX_DEFINITION,
-    "risk_horizon_days": HORIZON_DAYS,
+    "confidence_level": 0.95,
+    "risk_index_definition": "100 x calibrated probability of the configured target event within the next 90 days",
+    "risk_horizon_days": 90,
     "tiers": {
         "CRITICAL": {
-            "selected_top_n": 1,
+            "selected_top_n": 5,
             "enabled": True,
             "required_precision": 0.85,
-            "selection_status": "confidence_qualified_fine_scan",
-            "confidence_guarantee_met": True,
-            "final_raw_score_gate": 0.9243537187576294,
-            "final_calibrated_probability_gate": 0.8108767050233519,
-            "final_risk_index_gate": 81.08767050233519,
+            "selection_status": "maximum_precision_fallback_n_1_to_5",
+            "confidence_guarantee_met": False,
+            "final_raw_score_gate": 0.911424994468689,
+            "final_calibrated_probability_gate": 0.8089083128043253,
+            "final_risk_index_gate": 80.89083128043254,
         },
         "HIGH": {
-            "selected_top_n": 40,
+            "selected_top_n": 25,
             "enabled": True,
             "required_precision": 0.75,
             "selection_status": "confidence_qualified",
             "confidence_guarantee_met": True,
-            "final_raw_score_gate": 0.7755436897277832,
-            "final_calibrated_probability_gate": 0.716102567154952,
-            "final_risk_index_gate": 71.6102567154952,
+            "final_raw_score_gate": 0.831486165523529,
+            "final_calibrated_probability_gate": 0.7528818790819498,
+            "final_risk_index_gate": 75.28818790819498,
         },
         "MEDIUM": {
-            "selected_top_n": 100,
+            "selected_top_n": 150,
             "enabled": True,
-            "required_precision": 0.60,
+            "required_precision": 0.6,
             "selection_status": "confidence_qualified",
             "confidence_guarantee_met": True,
-            "final_raw_score_gate": 0.650837779045105,
-            "final_calibrated_probability_gate": 0.619007594066622,
-            "final_risk_index_gate": 61.900759406662196,
+            "final_raw_score_gate": 0.5874443650245667,
+            "final_calibrated_probability_gate": 0.5504908903009332,
+            "final_risk_index_gate": 55.04908903009332,
         },
     },
 }
+
+# Script 09 reads approved tuned parameters, calibration values, selected fault
+# codes, and tier thresholds from the final model artifacts. ``export_only`` is
+# the safe default: it writes a candidate JSON file and a complete candidate
+# config file without changing config.py. ``update_config`` performs the
+# rollback-safe, atomic config.py update after creating the configured backup.
+SUPPORTED_PRODUCTION_SETTINGS_MODES = (
+    "export_only",
+    "update_config",
+)
+PRODUCTION_SETTINGS_MODE = "update_config"
+if PRODUCTION_SETTINGS_MODE not in SUPPORTED_PRODUCTION_SETTINGS_MODES:
+    raise ValueError(
+        "PRODUCTION_SETTINGS_MODE must be one of "
+        f"{SUPPORTED_PRODUCTION_SETTINGS_MODES}; got {PRODUCTION_SETTINGS_MODE!r}."
+    )
+PRODUCTION_SETTINGS_EXPORT_JSON_FILE = (
+    OUTPUT_DIR / "production_settings_candidate.json"
+)
+PRODUCTION_SETTINGS_EXPORT_CONFIG_FILE = (
+    OUTPUT_DIR / "config_candidate.py"
+)
+PRODUCTION_SETTINGS_MIGRATION_UPDATE_XGB_PARAMS = True
+# When False, stage 09 may reuse the approved XGB_PARAMS block if the tuning
+# artifact is absent. Set True only when governance requires every promotion to
+# originate from a newly generated xgboost_tuned_params.json artifact.
+PRODUCTION_SETTINGS_REQUIRE_TUNED_PARAMS_FILE = False
+PRODUCTION_SETTINGS_MIGRATION_CREATE_BACKUP = True
+PRODUCTION_SETTINGS_MIGRATION_BACKUP_DIR = PROJECT_DIR / "config_backups"
+PRODUCTION_SETTINGS_MIGRATION_AUDIT_FILE = (
+    OUTPUT_DIR / "production_settings_migration.json"
+)
 
 # Production scoring validates that the saved model metadata agrees with the
 # release-controlled values above. Set False only for controlled migration or
@@ -703,11 +757,15 @@ OPERATION_CACHE_FORCE_REBUILD = False
 # approved XGBoost parameters are intentionally being reused.
 # ---------------------------------------------------------------------------
 RUN_OPERATION_PREPARATION_STEP = True
-RUN_XGBOOST_TUNING_STEP = True
+RUN_XGBOOST_TUNING_STEP = False
 RUN_ROLLING_ORIGIN_VALIDATION_STEP = True
 RUN_PROBABILITY_CALIBRATION_STEP = True
 RUN_THRESHOLD_SELECTION_STEP = True
 RUN_MULTI_ANCHOR_VALIDATION_STEP = True
 RUN_TIER_POLICY_STEP = True
 RUN_FINAL_MODEL_TRAINING_STEP = True
-RUN_PRODUCTION_SETTINGS_EXPORT_STEP = True
+# Run stage 09 after final model training. Its behavior is controlled by
+# PRODUCTION_SETTINGS_MODE: the default export_only mode writes reviewable
+# candidate files without modifying config.py; update_config performs promotion.
+# Set this flag to False to skip stage 09 entirely.
+RUN_PRODUCTION_SETTINGS_MIGRATION_STEP = True

@@ -35,8 +35,8 @@ def configured_stages() -> tuple[str, ...]:
         stages.append("07_build_tier_policy.py")
     if config.RUN_FINAL_MODEL_TRAINING_STEP:
         stages.append("08_train_final_model.py")
-    if config.RUN_PRODUCTION_SETTINGS_EXPORT_STEP:
-        stages.append("09_export_production_settings.py")
+    if config.RUN_PRODUCTION_SETTINGS_MIGRATION_STEP:
+        stages.append("09_migrate_production_settings.py")
     return tuple(stages)
 
 

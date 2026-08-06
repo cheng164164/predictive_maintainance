@@ -38,7 +38,7 @@ def evaluate_algorithm_comparison(dataframe: pd.DataFrame) -> None:
     skipped_rows: list[dict] = []
 
     for algorithm_name in config.ALGORITHMS:
-        print(f"\nAlgorithm: {algorithm_name}: base27", flush=True)
+        print(f"\nAlgorithm: {algorithm_name}", flush=True)
         try:
             make_algorithm(algorithm_name)
         except ImportError as exc:
